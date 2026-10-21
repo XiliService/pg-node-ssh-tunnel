@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v6.0
+# PG Node SSH Tunnel Manager v6.2
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
-# English Only | Production Ready | Auto-Updater
+# English Only | Production Ready | Auto-Updater & Cronjob
 # ============================================================
 
 set -euo pipefail
@@ -19,11 +19,31 @@ REPO_URL="https://raw.githubusercontent.com/XiliService/pg-node-ssh-tunnel/main/
 CONF_DIR="/etc/pg-tunnel"
 IRAN_CONF="${CONF_DIR}/iran.conf"
 FOREIGN_CONF="${CONF_DIR}/foreign.conf"
+CRON_FILE="/etc/cron.d/pg-tunnel-restart"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}[ERROR] This script must be run as root.${NC}"
         exit 1
+    fi
+}
+
+handle_cron_execution() {
+    if [[ "${1:-}" == "cron-auto-repair" ]]; then
+        check_root
+        if [[ -f "$IRAN_CONF" ]]; then
+            systemctl restart ssh.service 2>/dev/null || true
+            source "$IRAN_CONF"
+            IFS=',' read -ra PORTS <<< "$DATA_PORTS"
+            for port in "${PORTS[@]}"; do
+                port=$(echo "$port" | xargs)
+                iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
+                iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+            done
+        elif [[ -f "$FOREIGN_CONF" ]]; then
+            systemctl restart reverse-tunnel 2>/dev/null || true
+        fi
+        exit 0
     fi
 }
 
@@ -40,7 +60,7 @@ self_install() {
 print_header() {
     clear
     echo -e "${GREEN}============================================================${NC}"
-    echo -e "${CYAN}       PG Node SSH Tunnel Manager v6.0${NC}"
+    echo -e "${CYAN}       PG Node SSH Tunnel Manager v6.2${NC}"
     echo -e "${GREEN}============================================================${NC}"
 }
 
@@ -193,6 +213,14 @@ manage_service() {
         echo -e "\n${YELLOW}SSH Listening Ports:${NC}"
         ss -tlnp | grep ssh || true
     fi
+
+    echo -e "\n${CYAN}=== Auto-Restart Cronjob Status ===${NC}"
+    if [[ -f "$CRON_FILE" ]]; then
+        echo -e "${GREEN}Active Cron Schedule:${NC} $(cat "$CRON_FILE")"
+    else
+        echo -e "${YELLOW}Auto-Restart Cronjob is currently disabled.${NC}"
+    fi
+
     echo
     read -p "Press Enter to return to menu..."
 }
@@ -200,6 +228,7 @@ manage_service() {
 uninstall_all() {
     print_header
     echo -e "${RED}=== Safe Uninstall ===${NC}"
+    rm -f "$CRON_FILE"
     if [[ -f "$FOREIGN_CONF" ]]; then
         systemctl stop reverse-tunnel 2>/dev/null || true
         systemctl disable reverse-tunnel 2>/dev/null || true
@@ -236,22 +265,59 @@ view_logs() {
 
 optimizer() {
     print_header
-    echo -e "${CYAN}=== Network Optimizer ===${NC}"
+    echo -e "${CYAN}=== Network & System Optimizer ===${NC}"
+    echo -e "${YELLOW}Applying kernel TCP tuning, BBR & buffer limits...${NC}"
+    echo
+
     cat > /etc/sysctl.d/99-pg-tunnel-optimize.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 16777216
+net.ipv4.tcp_wmem = 4096 1048576 16777216
+net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 4096
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_mtu_probing = 1
 net.netfilter.nf_conntrack_max = 1048576
 fs.file-max = 2097152
+vm.swappiness = 10
 EOF
+
     modprobe tcp_bbr 2>/dev/null || true
+    modprobe nf_conntrack 2>/dev/null || true
+    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+
+    cat > /etc/security/limits.d/99-pg-tunnel.conf <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+
     sysctl --system >/dev/null 2>&1
+
     echo -e "${GREEN}[OK] Optimizations applied system-wide.${NC}"
-    echo "Congestion Control : $(sysctl -n net.ipv4.tcp_congestion_control)"
+    echo
+    echo -e "${CYAN}--- Active Tuning Status ---${NC}"
+    echo "  TCP Congestion Control  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A')"
+    echo "  Default Queue Discipline: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 'N/A')"
+    echo "  TCP Fast Open           : $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 'N/A')"
+    echo "  System File Limit (Max) : $(sysctl -n fs.file-max 2>/dev/null || echo 'N/A')"
+    echo "  Max Socket Connections  : $(sysctl -n net.core.somaxconn 2>/dev/null || echo 'N/A')"
+    echo "  Max Conntrack Entries   : $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 'N/A')"
+    echo "  TCP Read Memory Max     : $(sysctl -n net.core.rmem_max 2>/dev/null || echo 'N/A') bytes"
+    echo "  TCP Write Memory Max    : $(sysctl -n net.core.wmem_max 2>/dev/null || echo 'N/A') bytes"
+    echo
     read -p "Press Enter to return to menu..."
 }
 
@@ -289,6 +355,47 @@ repair_tunnels() {
     fi
 }
 
+setup_cronjob() {
+    print_header
+    echo -e "${CYAN}=== Auto-Restart Cronjob Configuration ===${NC}"
+    echo "  1) Every 1 Hour"
+    echo "  2) Every 2 Hours"
+    echo "  3) Every 3 Hours"
+    echo "  4) Every 5 Hours"
+    echo "  5) Every 12 Hours"
+    echo "  6) Every 24 Hours (Daily)"
+    echo "  7) Disable Cronjob"
+    echo -e "------------------------------------------------------------"
+    read -p "Select interval option [1-7]: " cron_choice
+
+    local schedule=""
+    case $cron_choice in
+        1) schedule="0 * * * *" ;;
+        2) schedule="0 */2 * * *" ;;
+        3) schedule="0 */3 * * *" ;;
+        4) schedule="0 */5 * * *" ;;
+        5) schedule="0 */12 * * *" ;;
+        6) schedule="0 0 * * *" ;;
+        7)
+            rm -f "$CRON_FILE"
+            echo -e "${GREEN}[OK] Auto-restart cronjob disabled.${NC}"
+            read -p "Press Enter to return to menu..."
+            return
+            ;;
+        *)
+            echo -e "${RED}Invalid option.${NC}"
+            sleep 1
+            return
+            ;;
+    esac
+
+    echo "$schedule root /usr/local/bin/pg-tunnel cron-auto-repair >/dev/null 2>&1" > "$CRON_FILE"
+    chmod 644 "$CRON_FILE"
+    echo -e "${GREEN}[OK] Cronjob scheduled successfully: ($schedule)${NC}"
+    echo
+    read -p "Press Enter to return to menu..."
+}
+
 main_menu() {
     while true; do
         print_header
@@ -299,9 +406,10 @@ main_menu() {
         echo "  5. Network Optimizer"
         echo "  6. Update Script (from GitHub)"
         echo "  7. Repair / Restart Tunnels (Fix Connection)"
+        echo "  8. Setup Auto-Restart Cronjob"
         echo "  0. Exit"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-7]: " choice
+        read -p "Select option [0-8]: " choice
 
         case $choice in
             1)
@@ -319,12 +427,14 @@ main_menu() {
             5) optimizer ;;
             6) update_script ;;
             7) repair_tunnels ;;
+            8) setup_cronjob ;;
             0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
     done
 }
 
+handle_cron_execution "${1:-}"
 check_root
 self_install
 main_menu
