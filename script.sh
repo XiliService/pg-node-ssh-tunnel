@@ -3,6 +3,7 @@
 # ============================================================
 # PG Node SSH Tunnel Manager v6.0
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
+# Script File: script.sh
 # English Only | Production Ready | Auto-Updater
 # ============================================================
 
@@ -14,7 +15,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-REPO_URL="https://raw.githubusercontent.com/XiliService/pg-node-ssh-tunnel/main/pg-tunnel"
+REPO_URL="https://raw.githubusercontent.com/XiliService/pg-node-ssh-tunnel/main/script.sh"
 CONF_DIR="/etc/pg-tunnel"
 IRAN_CONF="${CONF_DIR}/iran.conf"
 FOREIGN_CONF="${CONF_DIR}/foreign.conf"
@@ -310,6 +311,13 @@ main_menu() {
                     1) install_iran ;;
                     2) install_foreign ;;
                     *) echo -e "${RED}Invalid selection.${NC}"; sleep 1 ;;
+                esac
+                ;;
+            2) manage_service ;;
+            3) uninstall_all ;;
+            4) view_logs ;;
+            5) optimizer ;;
+            0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
                 esac
                 ;;
             2) manage_service ;;
