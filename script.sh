@@ -317,13 +317,6 @@ main_menu() {
             3) uninstall_all ;;
             4) view_logs ;;
             5) optimizer ;;
-            0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
-                esac
-                ;;
-            2) manage_service ;;
-            3) uninstall_all ;;
-            4) view_logs ;;
-            5) optimizer ;;
             6) update_script ;;
             7) repair_tunnels ;;
             0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
