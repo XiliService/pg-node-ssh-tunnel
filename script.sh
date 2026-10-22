@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v6.3
+# PG Node SSH Tunnel Manager v6.4
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
-# English Only | Production Ready | Auto-Updater & Cronjob
+# English Only | TLS 1.3 Anti-DPI | Live Monitor & Smart Updater
 # ============================================================
 
 set -euo pipefail
@@ -16,7 +16,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="6.3"
+SCRIPT_VERSION="6.4"
 REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 REPO_URL="https://raw.githubusercontent.com/${REPO_SLUG}/main/script.sh"
 CONF_DIR="/etc/pg-tunnel"
@@ -24,6 +24,12 @@ IRAN_CONF="${CONF_DIR}/iran.conf"
 FOREIGN_CONF="${CONF_DIR}/foreign.conf"
 TRAFFIC_STATE="${CONF_DIR}/traffic.state"
 TRAFFIC_LOCK="${CONF_DIR}/traffic.lock"
+TLS_CERT="${CONF_DIR}/tls.crt"
+TLS_KEY="${CONF_DIR}/tls.key"
+TLS_SERVER_PY="${CONF_DIR}/tls_server.py"
+TLS_CLIENT_PY="${CONF_DIR}/tls_client.py"
+TLS_SERVER_SERVICE="/etc/systemd/system/pg-tls-server.service"
+TUNNEL_SERVICE="/etc/systemd/system/reverse-tunnel.service"
 CRON_FILE="/etc/cron.d/pg-tunnel-restart"
 ACCT_CRON_FILE="/etc/cron.d/pg-tunnel-acct"
 ACCT_SERVICE="/etc/systemd/system/pg-tunnel-acct.service"
@@ -35,6 +41,141 @@ check_root() {
         echo -e "${RED}[ERROR] This script must be run as root.${NC}"
         exit 1
     fi
+}
+
+ensure_packages() {
+    local missing=()
+    local pkg
+    for pkg in "$@"; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            missing+=("$pkg")
+        fi
+    done
+    if (( ${#missing[@]} > 0 )); then
+        echo -e "${YELLOW}Installing missing packages: ${missing[*]}...${NC}"
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+    fi
+}
+
+write_tls_server_script() {
+    mkdir -p "$CONF_DIR"
+    cat > "$TLS_SERVER_PY" <<'EOF'
+#!/usr/bin/env python3
+import asyncio, socket, ssl, sys
+
+CERT, KEY, LPORT, TPORT = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+
+async def pipe(r, w):
+    try:
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+
+async def handle(cr, cw):
+    sock = cw.get_extra_info("socket")
+    if sock:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", TPORT), timeout=10)
+        usock = uw.get_extra_info("socket")
+        if usock:
+            usock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        cw.close()
+        return
+    await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+
+async def main():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(CERT, KEY)
+    srv = await asyncio.start_server(handle, "0.0.0.0", LPORT, ssl=ctx, backlog=512)
+    async with srv:
+        await srv.serve_forever()
+
+asyncio.run(main())
+EOF
+    chmod +x "$TLS_SERVER_PY"
+}
+
+write_tls_client_script() {
+    mkdir -p "$CONF_DIR"
+    cat > "$TLS_CLIENT_PY" <<'EOF'
+#!/usr/bin/env python3
+import os, socket, ssl, sys, threading
+
+HOST, PORT = sys.argv[1], int(sys.argv[2])
+SNI = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "www.microsoft.com"
+BIPS = [x.strip() for x in (sys.argv[4] if len(sys.argv) > 4 else "").split(",") if x.strip()] + [""]
+
+raw = None
+err = None
+for bip in BIPS:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(8)
+        if bip:
+            s.bind((bip, 0))
+        s.connect((HOST, PORT))
+        s.settimeout(None)
+        raw = s
+        break
+    except Exception as e:
+        err = e
+        try:
+            s.close()
+        except Exception:
+            pass
+
+if raw is None:
+    sys.stderr.write(f"TLS connect error: {err}\n")
+    sys.exit(1)
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+tls = ctx.wrap_socket(raw, server_hostname=SNI)
+
+def tx():
+    try:
+        while True:
+            d = os.read(0, 65536)
+            if not d:
+                break
+            tls.sendall(d)
+    except Exception:
+        pass
+    finally:
+        try:
+            tls.close()
+        except Exception:
+            pass
+        os._exit(0)
+
+threading.Thread(target=tx, daemon=True).start()
+try:
+    while True:
+        d = tls.recv(65536)
+        if not d:
+            break
+        v = memoryview(d)
+        while v:
+            v = v[os.write(1, v):]
+except Exception:
+    pass
+finally:
+    os._exit(0)
+EOF
+    chmod +x "$TLS_CLIENT_PY"
 }
 
 get_boot_id() {
@@ -88,7 +229,7 @@ ensure_accounting_rules() {
     command -v iptables >/dev/null 2>&1 || return 0
 
     if [[ -f "$IRAN_CONF" ]]; then
-        local OUT_IP="" DATA_PORTS="" SEC_SSH=""
+        local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI=""
         source "$IRAN_CONF"
         [[ -n "${SEC_SSH:-}" ]] || return 0
 
@@ -106,7 +247,7 @@ ensure_accounting_rules() {
             iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
 
     elif [[ -f "$FOREIGN_CONF" ]]; then
-        local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS=""
+        local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="" BIND_IPS=""
         source "$FOREIGN_CONF"
         [[ -n "${IR_IP:-}" && -n "${SEC_SSH:-}" ]] || return 0
 
@@ -221,7 +362,7 @@ setup_accounting_persistence() {
 Description=PG Tunnel Persistent Traffic Accounting
 DefaultDependencies=no
 After=local-fs.target systemd-sysctl.service netfilter-persistent.service
-Before=network-online.target ssh.service reverse-tunnel.service shutdown.target
+Before=network-online.target ssh.service pg-tls-server.service reverse-tunnel.service shutdown.target
 Conflicts=shutdown.target
 
 [Service]
@@ -245,7 +386,7 @@ EOF
 
 release_iran_tunnel_ports() {
     [[ -f "$IRAN_CONF" ]] || return 0
-    local OUT_IP="" DATA_PORTS="" SEC_SSH=""
+    local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI=""
     source "$IRAN_CONF"
     [[ -n "${DATA_PORTS:-}" ]] || return 0
 
@@ -280,25 +421,36 @@ release_iran_tunnel_ports() {
     fi
 }
 
-fix_legacy_unit_file() {
-    local unit_file="/etc/systemd/system/reverse-tunnel.service"
-    local changed=0
-    if [[ -f "$unit_file" ]]; then
-        if grep -q '^StartLimitIntervalSec=' "$unit_file"; then
-            if ! awk '/^\[Unit\]/{u=1; next} /^\[/{u=0} u && /^StartLimitIntervalSec=/{found=1} END{exit !found}' "$unit_file"; then
-                sed -i '/^StartLimitIntervalSec=/d' "$unit_file"
-                sed -i '/^\[Unit\]/a StartLimitIntervalSec=0' "$unit_file"
+migrate_existing_state() {
+    if [[ -f "$TUNNEL_SERVICE" ]]; then
+        local changed=0
+        if grep -q '^StartLimitIntervalSec=' "$TUNNEL_SERVICE"; then
+            if ! awk '/^\[Unit\]/{u=1; next} /^\[/{u=0} u && /^StartLimitIntervalSec=/{found=1} END{exit !found}' "$TUNNEL_SERVICE"; then
+                sed -i '/^StartLimitIntervalSec=/d' "$TUNNEL_SERVICE"
+                sed -i '/^\[Unit\]/a StartLimitIntervalSec=0' "$TUNNEL_SERVICE"
                 changed=1
             fi
-        fi
-        if grep -q 'ServerAliveInterval=30' "$unit_file"; then
-            sed -i 's/-o ServerAliveInterval=30 -o ServerAliveCountMax=3/-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o TCPKeepAlive=yes/g' "$unit_file"
-            sed -i 's/^RestartSec=8/RestartSec=3/' "$unit_file"
-            changed=1
         fi
         if (( changed == 1 )); then
             systemctl daemon-reload 2>/dev/null || true
         fi
+
+        if [[ -f "$FOREIGN_CONF" ]] && grep -q 'tls_client\.py' "$TUNNEL_SERVICE"; then
+            if ! grep -q '^TLS_SNI=' "$FOREIGN_CONF"; then
+                local parsed_sni=""
+                parsed_sni=$(sed -n 's/.*tls_client\.py [^ ]* [^ ]* \([^ "]*\).*/\1/p' "$TUNNEL_SERVICE" | head -n 1)
+                echo "TLS_SNI=${parsed_sni:-www.microsoft.com}" >> "$FOREIGN_CONF"
+            fi
+            if ! grep -q '^BIND_IPS=' "$FOREIGN_CONF"; then
+                local parsed_bips=""
+                parsed_bips=$(sed -n 's/.*tls_client\.py [^ ]* [^ ]* [^ "]* \([^ "]*\).*/\1/p' "$TUNNEL_SERVICE" | head -n 1)
+                echo "BIND_IPS=${parsed_bips}" >> "$FOREIGN_CONF"
+            fi
+        fi
+    fi
+
+    if [[ -f "$IRAN_CONF" ]] && ! grep -q '^TLS_SNI=' "$IRAN_CONF"; then
+        echo "TLS_SNI=www.microsoft.com" >> "$IRAN_CONF"
     fi
 
     if [[ -f "$FOREIGN_CONF" && -f "$CRON_FILE" ]]; then
@@ -320,7 +472,7 @@ fix_legacy_unit_file() {
 }
 
 bootstrap_existing_accounting() {
-    fix_legacy_unit_file
+    migrate_existing_state
     if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
         setup_accounting_persistence 2>/dev/null || true
     fi
@@ -334,6 +486,9 @@ handle_cli_subcommands() {
             if [[ -f "$IRAN_CONF" ]]; then
                 release_iran_tunnel_ports 2>/dev/null || true
                 systemctl restart ssh.service 2>/dev/null || true
+                if [[ -f "$TLS_SERVER_SERVICE" ]]; then
+                    systemctl restart pg-tls-server.service 2>/dev/null || true
+                fi
                 source "$IRAN_CONF"
                 IFS=',' read -ra PORTS <<< "$DATA_PORTS"
                 for port in "${PORTS[@]}"; do
@@ -372,25 +527,47 @@ self_install() {
 print_header() {
     clear 2>/dev/null || printf '\033[2J\033[H'
     echo -e "${GREEN}============================================================${NC}"
-    echo -e "${CYAN}       PG Node SSH Tunnel Manager v6.3${NC}"
+    echo -e "${CYAN}       PG Node SSH Tunnel Manager v${SCRIPT_VERSION}${NC}"
     echo -e "${GREEN}============================================================${NC}"
 }
 
 install_iran() {
     print_header
-    echo -e "${CYAN}=== Configuring IRAN Server ===${NC}"
+    echo -e "${CYAN}=== Configuring IRAN Server (TLS 1.3 Anti-DPI) ===${NC}"
     echo
 
     read -p "Foreign Server IP (inside Pasarguard Outbounds): " OUT_IP
     read -p "Outbound ports (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
-    read -p "Custom Secondary SSH Port to ADD (e.g. 8543 or 2222): " SEC_SSH
-    SEC_SSH=${SEC_SSH:-2222}
+
+    while true; do
+        read -p "Custom Anti-DPI TLS Port (default 58443, e.g. 58443 or 2053): " SEC_SSH
+        SEC_SSH=${SEC_SSH:-58443}
+        if [[ "$SEC_SSH" == "22" ]]; then
+            echo -e "${RED}[ERROR] Do not use Port 22 for TLS wrapper. Port 22 stays open for SSH.${NC}"
+            continue
+        fi
+        local conflict_proc=""
+        conflict_proc=$(ss -tlnp 2>/dev/null | awk -v p=":${SEC_SSH}$" '$4 ~ p && $0 !~ /tls_server\.py/ {print $0}' || true)
+        if [[ -n "$conflict_proc" ]]; then
+            echo -e "${RED}[WARN] Port ${SEC_SSH} is currently occupied by another process:${NC}"
+            echo "  $conflict_proc"
+            echo -e "${YELLOW}Please pick a free port (e.g. 58443).${NC}"
+            continue
+        fi
+        break
+    done
+
+    read -p "TLS Cover SNI Domain [default: www.microsoft.com]: " TLS_SNI
+    TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
     reset_traffic_accounting
 
-    echo "OUT_IP=$OUT_IP" > "$IRAN_CONF"
-    echo "DATA_PORTS=$DATA_PORTS" >> "$IRAN_CONF"
-    echo "SEC_SSH=$SEC_SSH" >> "$IRAN_CONF"
+    cat > "$IRAN_CONF" <<EOF
+OUT_IP=${OUT_IP}
+DATA_PORTS=${DATA_PORTS}
+SEC_SSH=${SEC_SSH}
+TLS_SNI=${TLS_SNI}
+EOF
 
     apply_iran_configs
 }
@@ -400,22 +577,21 @@ apply_iran_configs() {
         echo -e "${RED}[ERROR] Configuration not found. Run installation first.${NC}"
         sleep 2; return
     fi
+    local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com"
     source "$IRAN_CONF"
+    TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
-    echo -e "${YELLOW}Installing required packages...${NC}"
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent netfilter-persistent openssh-server
+    ensure_packages iptables-persistent netfilter-persistent openssh-server openssl python3
 
-    echo -e "${YELLOW}Disabling ssh.socket and configuring ports...${NC}"
+    echo -e "${YELLOW}Disabling ssh.socket and ensuring SSH listens cleanly on Port 22...${NC}"
     systemctl stop ssh.socket 2>/dev/null || true
     systemctl disable ssh.socket 2>/dev/null || true
     systemctl mask ssh.socket 2>/dev/null || true
     rm -rf /etc/systemd/system/ssh.socket.d/
 
     sed -i '/^Port /d; /^ClientAliveInterval /d; /^ClientAliveCountMax /d; /^TCPKeepAlive /d' /etc/ssh/sshd_config
-    cat >> /etc/ssh/sshd_config <<EOF
+    cat >> /etc/ssh/sshd_config <<'EOF'
 Port 22
-Port ${SEC_SSH}
 TCPKeepAlive yes
 ClientAliveInterval 10
 ClientAliveCountMax 2
@@ -426,6 +602,34 @@ EOF
     systemctl unmask ssh.service 2>/dev/null || true
     systemctl enable ssh.service >/dev/null 2>&1
     systemctl restart ssh.service
+
+    echo -e "${YELLOW}Configuring TLS 1.3 Anti-DPI Wrapper Server on Port ${SEC_SSH} (SNI: ${TLS_SNI})...${NC}"
+    write_tls_server_script
+    if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$TLS_KEY" -out "$TLS_CERT" \
+            -days 3650 -subj "/CN=${TLS_SNI}" >/dev/null 2>&1
+    fi
+
+    cat > "$TLS_SERVER_SERVICE" <<EOF
+[Unit]
+Description=PG Tunnel TLS 1.3 Anti-DPI Wrapper Server
+After=network-online.target ssh.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${TLS_SERVER_PY} ${TLS_CERT} ${TLS_KEY} ${SEC_SSH} 22
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable pg-tls-server.service >/dev/null 2>&1
+    systemctl restart pg-tls-server.service
 
     echo -e "${YELLOW}Applying iptables REDIRECT rules...${NC}"
     IFS=',' read -ra PORTS <<< "$DATA_PORTS"
@@ -438,31 +642,47 @@ EOF
 
     echo -e "${YELLOW}Enabling persistent tunnel traffic accounting...${NC}"
     setup_accounting_persistence
-    netfilter-persistent save >/dev/null 2>&1
+    netfilter-persistent save >/dev/null 2>&1 || true
 
     echo -e "${GREEN}[OK] Iran server configured successfully.${NC}"
-    echo -e "SSH is listening on Port 22 and Custom Port: ${SEC_SSH}"
+    echo -e "SSH Port 22 is active | TLS 1.3 Tunnel listening on Port ${SEC_SSH} (SNI: ${TLS_SNI})"
     echo
     read -p "Press Enter to return to menu..."
 }
 
 install_foreign() {
     print_header
-    echo -e "${CYAN}=== Configuring FOREIGN Server ===${NC}"
+    echo -e "${CYAN}=== Configuring FOREIGN Server (TLS 1.3 Anti-DPI) ===${NC}"
     echo
 
     read -p "Iran Server IP: " IR_IP
-    read -p "Custom Secondary SSH Port on Iran (e.g. 8543 or 2222): " SEC_SSH
-    SEC_SSH=${SEC_SSH:-2222}
+    read -p "Iran Anti-DPI TLS Port (default 58443): " SEC_SSH
+    SEC_SSH=${SEC_SSH:-58443}
     read -p "Node management port (e.g. 62075): " NODE_PORT
-    read -p "Outbound ports to tunnel (comma separated, e.g. 64483,26132): " DATA_PORTS
+    read -p "Outbound ports to tunnel (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+    read -p "TLS Cover SNI Domain [default: www.microsoft.com]: " TLS_SNI
+    TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
+    local host_ips=""
+    host_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth|lo)/ {split($4,a,"/"); out=(out==""?a[1]:out", "a[1])} END{print out}' || true)
+    if [[ -n "$host_ips" ]]; then
+        echo -e "${CYAN}Detected Public IPs on this server:${NC} ${host_ips}"
+    fi
+    read -p "Source Bind IP(s) for tunnel [optional, comma-separated, Enter=Auto]: " BIND_IPS
+    BIND_IPS=$(echo "${BIND_IPS:-}" | tr -d ' ')
+
+    ensure_packages openssh-client python3 iptables
+    write_tls_client_script
     reset_traffic_accounting
 
-    echo "IR_IP=$IR_IP" > "$FOREIGN_CONF"
-    echo "SEC_SSH=$SEC_SSH" >> "$FOREIGN_CONF"
-    echo "NODE_PORT=$NODE_PORT" >> "$FOREIGN_CONF"
-    echo "DATA_PORTS=$DATA_PORTS" >> "$FOREIGN_CONF"
+    cat > "$FOREIGN_CONF" <<EOF
+IR_IP=${IR_IP}
+SEC_SSH=${SEC_SSH}
+NODE_PORT=${NODE_PORT}
+DATA_PORTS=${DATA_PORTS}
+TLS_SNI=${TLS_SNI}
+BIND_IPS=${BIND_IPS}
+EOF
 
     echo -e "${YELLOW}Generating SSH key...${NC}"
     mkdir -p /root/.ssh
@@ -471,9 +691,17 @@ install_foreign() {
         ssh-keygen -t ed25519 -f /root/.ssh/tunnel_key -N "" -q
     fi
 
-    echo -e "${YELLOW}Copying public key to Iran server...${NC}"
+    echo -e "${YELLOW}Copying public key to Iran server over encrypted TLS 1.3 wrapper...${NC}"
     echo -e "${CYAN}Enter Iran Server root password when asked below:${NC}"
-    ssh-copy-id -i /root/.ssh/tunnel_key.pub -p "$SEC_SSH" -o StrictHostKeyChecking=no root@"$IR_IP"
+    local proxy_cmd="/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI}"
+    if [[ -n "$BIND_IPS" ]]; then
+        proxy_cmd+=" ${BIND_IPS}"
+    fi
+    ssh-copy-id -i /root/.ssh/tunnel_key.pub \
+        -o "ProxyCommand=${proxy_cmd}" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        root@"$IR_IP"
 
     apply_foreign_configs
 }
@@ -483,30 +711,35 @@ apply_foreign_configs() {
         echo -e "${RED}[ERROR] Configuration not found. Run installation first.${NC}"
         sleep 2; return
     fi
+    local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS=""
     source "$FOREIGN_CONF"
+    TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
-    if ! command -v iptables >/dev/null 2>&1; then
-        echo -e "${YELLOW}Installing iptables package for traffic accounting...${NC}"
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables
-    fi
+    ensure_packages openssh-client python3 iptables
+    write_tls_client_script
 
     echo -e "${YELLOW}Enabling persistent tunnel traffic accounting...${NC}"
     setup_accounting_persistence
 
-    echo -e "${YELLOW}Creating systemd reverse-tunnel service...${NC}"
-    SSH_CMD="/usr/bin/ssh -R ${NODE_PORT}:localhost:${NODE_PORT}"
+    echo -e "${YELLOW}Creating systemd reverse-tunnel service (SSH over TLS 1.3)...${NC}"
+    local proxy_arg="ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI}"
+    if [[ -n "${BIND_IPS:-}" ]]; then
+        proxy_arg+=" ${BIND_IPS}"
+    fi
+
+    local SSH_CMD="/usr/bin/ssh -R ${NODE_PORT}:localhost:${NODE_PORT}"
     IFS=',' read -ra PORTS <<< "$DATA_PORTS"
     for port in "${PORTS[@]}"; do
         port=$(echo "$port" | xargs)
         SSH_CMD+=" -R ${port}:localhost:${port}"
     done
-    SSH_CMD+=" root@${IR_IP} -p ${SEC_SSH} -N -i /root/.ssh/tunnel_key"
-    SSH_CMD+=" -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no"
+    SSH_CMD+=" root@${IR_IP} -N -i /root/.ssh/tunnel_key"
+    SSH_CMD+=" -o \"${proxy_arg}\""
+    SSH_CMD+=" -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-    cat > /etc/systemd/system/reverse-tunnel.service <<EOF
+    cat > "$TUNNEL_SERVICE" <<EOF
 [Unit]
-Description=Reverse SSH Tunnel to Iran Server
+Description=Reverse SSH Tunnel over TLS 1.3 to Iran Server
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -515,7 +748,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=${SSH_CMD}
 Restart=always
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -525,9 +758,9 @@ EOF
     systemctl enable reverse-tunnel >/dev/null 2>&1
     systemctl restart reverse-tunnel
 
-    sleep 2
+    sleep 3
     if systemctl is-active --quiet reverse-tunnel; then
-        echo -e "${GREEN}[OK] Foreign server configured. Tunnel is active via SSH Port ${SEC_SSH}.${NC}"
+        echo -e "${GREEN}[OK] Foreign server configured. TLS 1.3 Tunnel is active to ${IR_IP}:${SEC_SSH}.${NC}"
     else
         echo -e "${RED}[ERROR] Tunnel service failed to start. Check logs (option 4).${NC}"
     fi
@@ -608,8 +841,8 @@ manage_service() {
         fi
 
         local sys_details=""
-        if [[ -f /etc/systemd/system/reverse-tunnel.service ]]; then
-            local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS=""
+        if [[ -f "$TUNNEL_SERVICE" ]]; then
+            local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS=""
             if [[ -f "$FOREIGN_CONF" ]]; then
                 source "$FOREIGN_CONF"
             fi
@@ -638,15 +871,26 @@ manage_service() {
             local last_log
             last_log=$(journalctl -u reverse-tunnel.service -n 1 --no-pager -o cat 2>/dev/null || true)
             last_log="${last_log:-No recent log entries}"
-            last_log="${last_log:0:54}"
+            last_log="${last_log:0:52}"
 
             sys_details+="  Service State   : ${st_color}${active_st} (${sub_st})${c_nc}${since_ts:+ since ${since_ts:0:27}}${nl}"
             sys_details+="  Process / RAM   : Main PID ${main_pid} | Memory: ${mem_str}${nl}"
-            sys_details+="  Tunnel Target   : root@${IR_IP:-N/A} (SSH Port: ${SEC_SSH:-N/A})${nl}"
-            sys_details+="  Forwarded Ports : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}"
-            sys_details="${sys_details:0:500}${nl}  Latest Log      : ${last_log}"
+            sys_details+="  TLS 1.3 Target  : ${IR_IP:-N/A}:${SEC_SSH:-N/A} (SNI: ${TLS_SNI:-www.microsoft.com})${nl}"
+            sys_details+="  Source / Ports  : Bind ${BIND_IPS:-Auto} | Node ${NODE_PORT:-N/A}, Data ${DATA_PORTS:-N/A}${nl}"
+            sys_details+="  Latest Log      : ${last_log}"
 
         elif [[ -f "$IRAN_CONF" ]]; then
+            local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com"
+            source "$IRAN_CONF"
+            local tls_status="${c_yellow}Not Installed (Raw SSH Mode)${c_nc}"
+            if [[ -f "$TLS_SERVER_SERVICE" ]]; then
+                if systemctl is-active --quiet pg-tls-server.service 2>/dev/null; then
+                    tls_status="${c_green}Active on Port ${SEC_SSH} (SNI: ${TLS_SNI:-www.microsoft.com})${c_nc}"
+                else
+                    tls_status="${c_red}Inactive on Port ${SEC_SSH}${c_nc}"
+                fi
+            fi
+
             local ss_raw pub_ssh_ports tun_local_ports nat_compact
             ss_raw=$(ss -tlnp4 2>/dev/null || ss -tlnp 2>/dev/null || true)
             pub_ssh_ports=$(awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {
@@ -659,7 +903,7 @@ manage_service() {
             } END { print out }' <<< "$ss_raw")
 
             if [[ -n "$tun_local_ports" ]]; then
-                tun_local_ports="${c_green}${tun_local_ports:0:52}${c_nc}"
+                tun_local_ports="${c_green}${tun_local_ports:0:50}${c_nc}"
             else
                 tun_local_ports="${c_red}None (Tunnel Not Connected)${c_nc}"
             fi
@@ -678,8 +922,8 @@ manage_service() {
                 }' || true)
             nat_compact="${nat_compact:-    No rules in nat OUTPUT chain}"
 
-            sys_details+="  SSH Public Ports : ${c_green}${pub_ssh_ports}${c_nc}${nl}"
-            sys_details+="  Tunnel Ports     : ${tun_local_ports}${nl}"
+            sys_details+="  TLS 1.3 Server   : ${tls_status}${nl}"
+            sys_details+="  SSH / Tunnel Prt : SSH [${pub_ssh_ports}] | Local [${tun_local_ports}]${nl}"
             sys_details+="  NAT OUTPUT Rules :${nl}${nat_compact}"
         else
             sys_details+="  ${c_yellow}No tunnel configuration detected on this server yet.${c_nc}"
@@ -736,11 +980,18 @@ uninstall_all() {
     if [[ -f "$FOREIGN_CONF" ]]; then
         systemctl stop reverse-tunnel 2>/dev/null || true
         systemctl disable reverse-tunnel 2>/dev/null || true
-        rm -f /etc/systemd/system/reverse-tunnel.service
+        rm -f "$TUNNEL_SERVICE" "$TLS_CLIENT_PY"
         systemctl daemon-reload
         rm -f "$FOREIGN_CONF"
-        echo -e "${GREEN}[OK] Service and traffic counters removed from Foreign server.${NC}"
+        echo -e "${GREEN}[OK] Service, TLS client, and traffic counters removed from Foreign server.${NC}"
     elif [[ -f "$IRAN_CONF" ]]; then
+        if [[ -f "$TLS_SERVER_SERVICE" ]]; then
+            systemctl stop pg-tls-server.service 2>/dev/null || true
+            systemctl disable pg-tls-server.service 2>/dev/null || true
+            rm -f "$TLS_SERVER_SERVICE"
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        rm -f "$TLS_SERVER_PY" "$TLS_CERT" "$TLS_KEY"
         source "$IRAN_CONF"
         IFS=',' read -ra PORTS <<< "$DATA_PORTS"
         for port in "${PORTS[@]}"; do
@@ -749,7 +1000,7 @@ uninstall_all() {
         done
         netfilter-persistent save >/dev/null 2>&1 || true
         rm -f "$IRAN_CONF"
-        echo -e "${GREEN}[OK] iptables rules and traffic counters removed from Iran server.${NC}"
+        echo -e "${GREEN}[OK] TLS server, iptables rules, and traffic counters removed from Iran server.${NC}"
     else
         echo -e "${YELLOW}No configuration found to uninstall.${NC}"
     fi
@@ -758,11 +1009,14 @@ uninstall_all() {
 
 view_logs() {
     print_header
-    if [[ -f /etc/systemd/system/reverse-tunnel.service ]]; then
-        echo -e "${CYAN}Live Logs (Press Ctrl+C to exit)...${NC}"
+    if [[ -f "$TUNNEL_SERVICE" ]]; then
+        echo -e "${CYAN}Live Foreign Tunnel Logs (Press Ctrl+C to exit)...${NC}"
         journalctl -u reverse-tunnel.service -f --no-pager
+    elif [[ -f "$TLS_SERVER_SERVICE" ]]; then
+        echo -e "${CYAN}Live Iran TLS Wrapper & SSH Logs (Press Ctrl+C to exit)...${NC}"
+        journalctl -u pg-tls-server.service -u ssh.service -f --no-pager
     else
-        echo -e "${RED}Tunnel service not found here (Logs are on Foreign server).${NC}"
+        echo -e "${RED}Tunnel service not found on this server.${NC}"
         read -p "Press Enter to return to menu..."
     fi
 }
@@ -984,12 +1238,11 @@ repair_tunnels() {
     echo -e "${CYAN}=== Repair / Restart Tunnels ===${NC}"
     sync_traffic_state >/dev/null 2>&1 || true
     if [[ -f "$IRAN_CONF" ]]; then
-        echo -e "${YELLOW}Releasing stale tunnel sockets, restarting SSH, and re-applying Iran rules safely...${NC}"
+        echo -e "${YELLOW}Releasing stale tunnel sockets, restarting SSH + TLS 1.3 wrapper, and re-applying rules...${NC}"
         release_iran_tunnel_ports 2>/dev/null || true
-        systemctl restart ssh.service
         apply_iran_configs
     elif [[ -f "$FOREIGN_CONF" ]]; then
-        echo -e "${YELLOW}Restarting Reverse Tunnel service...${NC}"
+        echo -e "${YELLOW}Rebuilding & restarting Reverse SSH over TLS 1.3 service...${NC}"
         apply_foreign_configs
     else
         echo -e "${RED}No previous configuration found to repair.${NC}"
@@ -1046,10 +1299,10 @@ setup_cronjob() {
 main_menu() {
     while true; do
         print_header
-        echo "  1. Install / Configure Tunnel"
-        echo "  2. Check Status / Rules"
+        echo "  1. Install / Configure Tunnel (TLS 1.3 Anti-DPI)"
+        echo "  2. Check Status / Rules & Live Speed"
         echo "  3. Uninstall Safely"
-        echo "  4. View Tunnel Logs (Foreign)"
+        echo "  4. View Tunnel Logs"
         echo "  5. Network Optimizer"
         echo "  6. Update Script (from GitHub)"
         echo "  7. Repair / Restart Tunnels (Fix Connection)"
