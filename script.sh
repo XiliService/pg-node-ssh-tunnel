@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.1
+# PG Node SSH Tunnel Manager v7.2
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -10,11 +10,12 @@
 # v7.1: Latency-Aware IP Selection + Bufferbloat Tuning (notsent_lowat + RPS)
 #       + TOFU Host-Key Pinning + Unprivileged Sandboxed TLS Wrapper
 #       + Zero-Downtime Secret Rotation + Per-IP Accounting + Backup/Restore
+# v7.2: Streamlined main menu (frequently-used items) + Other Options submenu
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.1"
+SCRIPT_VERSION="7.2"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1296,7 +1297,7 @@ EOF
             echo -e "${GREEN}[OK] Rotation active (no restart needed; new connections use the new key).${NC}"
             echo -e "Now run ${CYAN}Install (Option 1 -> 2)${NC} on the FOREIGN server and paste this new secret:"
             echo -e "  ${YELLOW}${new_secret}${NC}"
-            echo "After the Foreign server is updated, run Option 10 -> 2 here to drop the old key."
+            echo "After the Foreign server is updated, run Other Options -> Rotate TLS Secret -> 2) Finalize here to drop the old key."
             ;;
         2)
             if [[ -z "${TLS_SECRET_OLD:-}" ]]; then
@@ -1374,7 +1375,7 @@ backup_restore_menu() {
             systemctl daemon-reload 2>/dev/null || true
             echo
             echo -e "${GREEN}[OK] Configuration restored.${NC}"
-            echo -e "${YELLOW}Now run Option 7 (Repair / Restart) to bring the tunnels back up.${NC}"
+            echo -e "${YELLOW}Now run Option 6 (Repair / Restart) to bring the tunnels back up.${NC}"
             ;;
         0) return ;;
         *) echo -e "${RED}Invalid option.${NC}"; sleep 1; return ;;
@@ -2441,7 +2442,7 @@ EOF
         echo
         echo -e "${GREEN}[OK] Foreign server active & connected over TLS 1.3 (${IR_IP}:${SEC_SSH}, SNI: ${TLS_SNI}).${NC}"
     else
-        echo -e "${RED}[ERROR] Tunnel channels failed to connect. Check logs (Option 4) or verify Secret/Port.${NC}"
+        echo -e "${RED}[ERROR] Tunnel channels failed to connect. Check logs (Other Options -> 1) or verify Secret/Port.${NC}"
     fi
     echo
     read -p "Press Enter to return to menu..."
@@ -2572,7 +2573,7 @@ manage_service() {
             if [[ "$kcc" == "bbr" && "$kqd" == "fq" ]]; then
                 frame+="  Kernel Tuning      : ${c_green}${kcc} / ${kqd} / notsent_lowat=${knl}${c_nc}${clr_eol}${nl}"
             else
-                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 5)${c_nc}${clr_eol}${nl}"
+                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 4)${c_nc}${clr_eol}${nl}"
             fi
             frame+="  --- Parallel Channels ---${clr_eol}${nl}"
             if [[ -f "$MGMT_SERVICE" ]]; then
@@ -2652,7 +2653,7 @@ manage_service() {
             if [[ "$kcc" == "bbr" && "$kqd" == "fq" ]]; then
                 frame+="  Kernel Tuning      : ${c_green}${kcc} / ${kqd} / notsent_lowat=${knl}${c_nc}${clr_eol}${nl}"
             else
-                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 5)${c_nc}${clr_eol}${nl}"
+                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 4)${c_nc}${clr_eol}${nl}"
             fi
             local ip_pairs ip_ip ip_bytes
             ip_pairs=$(iptables -t mangle -L PG_TUNNEL_IN -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8, $2}' | sort -k2 -rn | head -4 || true)
@@ -3092,23 +3093,44 @@ setup_cronjob() {
     read -p "Press Enter to return to menu..."
 }
 
+other_options_menu() {
+    while true; do
+        print_header
+        echo -e "${CYAN}=== Other Options ===${NC}"
+        echo
+        echo "  1. View Tunnel Logs"
+        echo "  2. Setup Auto-Restart Cronjob"
+        echo "  3. SSH Brute-Force Shield (Port 22)"
+        echo "  4. Rotate TLS Secret (Iran, Zero Downtime)"
+        echo "  5. Backup / Restore Configs"
+        echo "  0. Back to Main Menu"
+        echo -e "------------------------------------------------------------"
+        read -p "Select option [0-5]: " other_choice
+        case $other_choice in
+            1) view_logs ;;
+            2) setup_cronjob ;;
+            3) brute_force_shield_menu ;;
+            4) rotate_tls_secret ;;
+            5) backup_restore_menu ;;
+            0) return ;;
+            *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         print_header
         echo "  1. Install / Configure Tunnel"
         echo "  2. Check Status / Rules & Live Speed"
         echo "  3. Uninstall Safely"
-        echo "  4. View Tunnel Logs"
-        echo "  5. Network Optimizer"
-        echo "  6. Update Script (from GitHub)"
-        echo "  7. Repair / Restart Tunnels (Fix Connection)"
-        echo "  8. Setup Auto-Restart Cronjob"
-        echo "  9. SSH Brute-Force Shield (Port 22)"
-        echo " 10. Rotate TLS Secret (Iran, Zero Downtime)"
-        echo " 11. Backup / Restore Configs"
+        echo "  4. Network Optimizer"
+        echo "  5. Update Script (from GitHub)"
+        echo "  6. Repair / Restart Tunnels (Fix Connection)"
+        echo "  7. Other Options"
         echo "  0. Exit"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-11]: " choice
+        read -p "Select option [0-7]: " choice
 
         case $choice in
             1)
@@ -3122,14 +3144,10 @@ main_menu() {
                 ;;
             2) manage_service ;;
             3) uninstall_all ;;
-            4) view_logs ;;
-            5) optimizer ;;
-            6) update_script ;;
-            7) repair_tunnels ;;
-            8) setup_cronjob ;;
-            9) brute_force_shield_menu ;;
-            10) rotate_tls_secret ;;
-            11) backup_restore_menu ;;
+            4) optimizer ;;
+            5) update_script ;;
+            6) repair_tunnels ;;
+            7) other_options_menu ;;
             0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
