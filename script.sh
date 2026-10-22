@@ -1,15 +1,17 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v6.6
+# PG Node SSH Tunnel Manager v7.0
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
+# v7.0: WebSocket-101 Camouflage + Record Morphing + Parallel Multi-Channel
+#       + HW AES-GCM + End-to-End Watchdog + Port-22 Brute-Force Shield
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="6.6"
+SCRIPT_VERSION="7.0"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -35,6 +37,13 @@ ACCT_CRON_FILE="/etc/cron.d/pg-tunnel-acct"
 ACCT_SERVICE="/etc/systemd/system/pg-tunnel-acct.service"
 TLS_SERVER_SERVICE="/etc/systemd/system/pg-tls-server.service"
 TUNNEL_SERVICE="/etc/systemd/system/reverse-tunnel.service"
+MGMT_SERVICE="/etc/systemd/system/pg-tunnel-mgmt.service"
+DATA_SERVICE_GLOB="/etc/systemd/system/pg-tunnel-data-*.service"
+WATCHDOG_SH="${CONF_DIR}/watchdog.sh"
+WATCHDOG_SERVICE="/etc/systemd/system/pg-tunnel-watchdog.service"
+WATCHDOG_STATE="${CONF_DIR}/watchdog.state"
+SSHBF_DISABLED_FILE="${CONF_DIR}/sshbf.disabled"
+SSH_CIPHERS="aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -260,11 +269,12 @@ write_tls_server_script() {
     mkdir -p "$CONF_DIR"
     cat > "$TLS_SERVER_PY" <<'EOF'
 #!/usr/bin/env python3
-import asyncio, email.utils, hmac, os, re, signal, socket, ssl, subprocess, sys, time
+import asyncio, base64, email.utils, hashlib, hmac, os, random, re, signal, socket, ssl, subprocess, sys, time
 
 CERT, KEY, LPORT, TPORT = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 CONF_PATH = os.environ.get("PG_IRAN_CONF", "/etc/pg-tunnel/iran.conf")
 AUTH_LOCK = asyncio.Lock()
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 def load_runtime_conf():
     cfg = {
@@ -361,6 +371,53 @@ async def pipe(r, w):
         except Exception:
             pass
 
+async def mpipe(r, w):
+    # Traffic-morphing pipe: emits randomly-sized TLS records for bulk data
+    # and coalesces small packets (SSH keepalives / handshakes) inside a short
+    # random time window, removing fixed-length / fixed-interval signatures.
+    buf = bytearray()
+    eof = False
+    hold_until = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if not buf:
+                hold_until = 0.0
+            elif hold_until and (len(buf) >= 2048 or now >= hold_until):
+                hold_until = 0.0
+            if buf and (len(buf) >= 2048 or not hold_until):
+                n = len(buf) if len(buf) <= 2048 else random.randint(1024, 16384)
+                w.write(bytes(buf[:n]))
+                del buf[:n]
+                await w.drain()
+                continue
+            if eof:
+                if buf:
+                    w.write(bytes(buf))
+                    await w.drain()
+                break
+            tmo = max(0.0, hold_until - time.monotonic()) if hold_until else 30.0
+            try:
+                data = await asyncio.wait_for(r.read(65536), timeout=tmo)
+            except asyncio.TimeoutError:
+                data = None
+            if data is None:
+                hold_until = 0.0
+                continue
+            if data == b"":
+                eof = True
+                continue
+            buf.extend(data)
+            if 0 < len(buf) < 512 and not hold_until:
+                hold_until = time.monotonic() + random.uniform(0.002, 0.015)
+    except Exception:
+        pass
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+
 async def serve_fallback(cr, cw, initial_buf, fb_port):
     try:
         ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", fb_port), timeout=3.0)
@@ -396,6 +453,9 @@ async def handle(cr, cw):
     buf = bytearray()
     authed = False
     role = "tunnel"
+    owned_port = 0
+    proto2 = False
+    ws_key = ""
     rest = b""
 
     try:
@@ -417,6 +477,15 @@ async def handle(cr, cw):
                             got_auth = v.strip()
                         elif kl == "x-role":
                             role = v.strip().lower()
+                        elif kl == "x-port":
+                            try:
+                                owned_port = int(v.strip())
+                            except ValueError:
+                                owned_port = 0
+                        elif kl == "x-proto":
+                            proto2 = v.strip() == "2"
+                        elif kl == "sec-websocket-key":
+                            ws_key = v.strip()
                 if secret and hmac.compare_digest(got_auth, secret):
                     authed = True
                 elif not secret and got_auth == "":
@@ -458,9 +527,45 @@ async def handle(cr, cw):
         await serve_fallback(cr, cw, bytes(buf), fb_port)
         return
 
+    if proto2:
+        # Real WebSocket-style 101 Switching Protocols response (v7.0 clients).
+        accept = ""
+        if ws_key:
+            try:
+                accept = base64.b64encode(
+                    hashlib.sha1((ws_key + WS_GUID).encode("ascii")).digest()
+                ).decode("ascii")
+            except Exception:
+                accept = ""
+        pad = "".join(
+            random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            for _ in range(random.randint(24, 80))
+        )
+        lines = [
+            "HTTP/1.1 101 Switching Protocols",
+            "Server: nginx",
+            "Date: " + email.utils.formatdate(usegmt=True),
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+        ]
+        if accept:
+            lines.append("Sec-WebSocket-Accept: " + accept)
+        lines.append("X-Pad: " + pad)
+        try:
+            cw.write(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            await cw.drain()
+        except Exception:
+            try:
+                cw.close()
+            except Exception:
+                pass
+            return
+
     async with AUTH_LOCK:
         if role == "tunnel":
             await asyncio.get_running_loop().run_in_executor(None, release_zombie_ports, cleanup_ports)
+        elif owned_port:
+            await asyncio.get_running_loop().run_in_executor(None, release_zombie_ports, [owned_port])
         try:
             ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", TPORT), timeout=8.0)
             tune_socket(uw.get_extra_info("socket"))
@@ -471,7 +576,7 @@ async def handle(cr, cw):
             cw.close()
             return
 
-    await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+    await asyncio.gather(mpipe(cr, uw), mpipe(ur, cw))
 
 async def cert_reloader(ctx):
     last_mtime = 0.0
@@ -516,10 +621,21 @@ write_tls_client_script() {
     mkdir -p "$CONF_DIR"
     cat > "$TLS_CLIENT_PY" <<'EOF'
 #!/usr/bin/env python3
-import os, secrets, selectors, socket, ssl, sys, time
+import base64, os, random, selectors, socket, ssl, sys, time
 
 CONF_PATH = os.environ.get("PG_FOREIGN_CONF", "/etc/pg-tunnel/foreign.conf")
 LAST_IP_FILE = os.environ.get("PG_LAST_IP_FILE", "/etc/pg-tunnel/last_good_ip")
+
+WS_PATHS = [
+    "/ws", "/websocket", "/socket.io/?EIO=4&transport=websocket",
+    "/api/v2/stream", "/v1/realtime/sync", "/cdn-cgi/trace",
+    "/graphql", "/hub", "/live", "/events",
+]
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
 
 def load_conf():
     cfg = {}
@@ -541,23 +657,25 @@ SNI = (sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else cfg.get("TLS_SNI", 
 RAW_BIPS = sys.argv[4] if len(sys.argv) > 4 else cfg.get("BIND_IPS", "")
 SECRET = sys.argv[5] if len(sys.argv) > 5 else cfg.get("TLS_SECRET", "")
 ROLE = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "tunnel"
+PREFER = (sys.argv[7] if len(sys.argv) > 7 else "").strip()
+OWN_PORT = (sys.argv[8] if len(sys.argv) > 8 else "").strip()
 
 bips = []
-for x in RAW_BIPS.split(","):
+
+def _add_bip(x):
     x = x.strip()
     if x and x not in bips:
         bips.append(x)
-if "" not in bips:
-    bips.append("")
 
+_add_bip(PREFER)
 try:
     with open(LAST_IP_FILE, "r", encoding="utf-8") as lf:
-        last_good = lf.read().strip()
-    if last_good in bips:
-        bips.remove(last_good)
-        bips.insert(0, last_good)
+        _add_bip(lf.read().strip())
 except Exception:
     pass
+for x in RAW_BIPS.split(","):
+    _add_bip(x)
+bips.append("")
 
 def establish_connection(bip):
     deadline = time.monotonic() + 7.0
@@ -608,16 +726,28 @@ def establish_connection(bip):
                 if out:
                     s.sendall(out)
 
-        pad = secrets.token_urlsafe(secrets.randbelow(96) + 32)
-        req = (
-            f"GET /ws HTTP/1.1\r\n"
-            f"Host: {SNI}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"X-Auth: {SECRET}\r\n"
-            f"X-Role: {ROLE}\r\n"
-            f"X-Pad: {pad}\r\n\r\n"
-        ).encode("ascii")
+        pad = "".join(
+            random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            for _ in range(random.randint(32, 128))
+        )
+        path = random.choice(WS_PATHS)
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req_lines = [
+            "GET " + path + " HTTP/1.1",
+            "Host: " + SNI,
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key: " + ws_key,
+            "Sec-WebSocket-Version: 13",
+            "User-Agent: " + random.choice(UA_POOL),
+            "X-Auth: " + SECRET,
+            "X-Role: " + ROLE,
+            "X-Proto: 2",
+        ]
+        if OWN_PORT.isdigit():
+            req_lines.append("X-Port: " + OWN_PORT)
+        req_lines.append("X-Pad: " + pad)
+        req = ("\r\n".join(req_lines) + "\r\n\r\n").encode("ascii")
         off = 0
         while off < len(req):
             off += sslobj.write(memoryview(req)[off:])
@@ -646,7 +776,38 @@ def establish_connection(bip):
                 if out:
                     s.sendall(out)
 
-        if not first_plain.startswith(b"SSH-"):
+        head = bytes(first_plain)
+        if head.startswith(b"SSH-"):
+            pass  # Legacy (v6.x) server: raw SSH passthrough, no 101 response.
+        elif head.startswith(b"HTTP/1.1"):
+            while b"\r\n\r\n" not in head:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("WebSocket upgrade response timeout")
+                s.settimeout(rem)
+                try:
+                    chunk = sslobj.read(65536)
+                    if not chunk:
+                        raise EOFError("EOF during 101 response")
+                    head += chunk
+                except ssl.SSLWantReadError:
+                    data = s.recv(65536)
+                    if not data:
+                        raise EOFError("EOF during 101 response")
+                    in_bio.write(data)
+                except ssl.SSLWantWriteError:
+                    out = out_bio.read()
+                    if out:
+                        s.sendall(out)
+            status_line = head.split(b"\r\n", 1)[0]
+            status_code = status_line.split(b" ")[1] if b" " in status_line else b""
+            if status_code != b"101":
+                raise RuntimeError("Upstream rejected handshake (status " + status_code.decode("latin1", "ignore") + ")")
+            body = head.split(b"\r\n\r\n", 1)[1]
+            if body and not body.startswith(b"SSH-"):
+                raise RuntimeError("Invalid upstream stream after 101")
+            first_plain = bytearray(body)
+        else:
             raise RuntimeError("Invalid upstream response (rejected secret or blocked)")
 
         return s, sslobj, in_bio, out_bio, first_plain
@@ -694,6 +855,8 @@ raw_eof = False
 ssl_eof = False
 stdin_eof = False
 MAX_BUF = 262144
+pending = bytearray()
+flush_at = 0.0
 
 def pump_ssl():
     global ssl_eof
@@ -716,10 +879,45 @@ def pump_ssl():
 
 pump_ssl()
 
+def try_flush_pending(force=False):
+    # Morphing writer: coalesces small payloads inside a short random time
+    # window and emits randomly-sized TLS records for bulk streams, removing
+    # fixed-length / fixed-interval traffic signatures on the wire.
+    global pending, flush_at
+    if not pending:
+        flush_at = 0.0
+        return
+    now = time.monotonic()
+    if not force and len(pending) < 2048 and flush_at and now < flush_at:
+        return
+    flush_at = 0.0
+    while pending:
+        n = len(pending) if len(pending) <= 2048 else random.randint(1024, 16384)
+        chunk = bytes(pending[:n])
+        off = 0
+        while off < len(chunk):
+            try:
+                off += sslobj.write(memoryview(chunk)[off:])
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                out = out_bio.read()
+                if out:
+                    cipher_out.extend(out)
+                if off:
+                    del pending[:off]
+                return
+            except OSError:
+                os._exit(0)
+        del pending[:n]
+    out = out_bio.read()
+    if out:
+        cipher_out.extend(out)
+
 try:
     while not (ssl_eof and not plain_out):
-        if stdin_eof and not cipher_out and raw_eof and ssl_eof:
+        if stdin_eof and not pending and not cipher_out and raw_eof and ssl_eof:
             break
+
+        try_flush_pending()
 
         ev_raw = 0
         if not raw_eof and len(plain_out) < MAX_BUF:
@@ -727,7 +925,7 @@ try:
         if cipher_out:
             ev_raw |= selectors.EVENT_WRITE
 
-        ev_in = selectors.EVENT_READ if (not stdin_eof and len(cipher_out) < MAX_BUF) else 0
+        ev_in = selectors.EVENT_READ if (not stdin_eof and len(cipher_out) < MAX_BUF and len(pending) < MAX_BUF) else 0
         ev_out = selectors.EVENT_WRITE if plain_out else 0
 
         for fd, ev in ((raw, ev_raw), (in_fd, ev_in), (out_fd, ev_out)):
@@ -741,7 +939,10 @@ try:
                 if ev != 0:
                     sel.register(fd, ev)
 
-        events = sel.select(timeout=5.0)
+        sel_tmo = 5.0
+        if pending and flush_at:
+            sel_tmo = min(5.0, max(0.001, flush_at - time.monotonic()))
+        events = sel.select(timeout=sel_tmo)
         for key, mask in events:
             fd = key.fileobj
             if fd is raw:
@@ -771,6 +972,7 @@ try:
                     d = os.read(in_fd, 65536)
                     if not d:
                         stdin_eof = True
+                        try_flush_pending(force=True)
                         try:
                             sslobj.unwrap()
                         except Exception:
@@ -781,9 +983,11 @@ try:
                         if not cipher_out:
                             os._exit(0)
                     else:
-                        off = 0
-                        while off < len(d):
-                            off += sslobj.write(memoryview(d)[off:])
+                        pending.extend(d)
+                        if len(pending) >= 2048:
+                            try_flush_pending(force=True)
+                        elif not flush_at:
+                            flush_at = time.monotonic() + random.uniform(0.002, 0.015)
                 except BlockingIOError:
                     pass
                 except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
@@ -806,6 +1010,151 @@ finally:
     os._exit(0)
 EOF
     chmod +x "$TLS_CLIENT_PY"
+}
+
+write_watchdog_script() {
+    mkdir -p "$CONF_DIR"
+    cat > "$WATCHDOG_SH" <<'EOF'
+#!/bin/bash
+# PG Tunnel End-to-End Watchdog (Iran side)
+# Monitors reverse-forward listeners + TLS sessions and self-heals the
+# TLS wrapper when the tunnel is fully wedged. Conservative by design:
+# healthy or partially-healthy states never trigger a restart.
+set -u
+CONF="/etc/pg-tunnel/iran.conf"
+STATE_FILE="/etc/pg-tunnel/watchdog.state"
+[ -r "$CONF" ] || exit 0
+OUT_IP=""; NODE_PORT="62075"; DATA_PORTS=""; SEC_SSH=""; TLS_SNI=""; TLS_SECRET=""
+# shellcheck disable=SC1090
+source "$CONF"
+PORTS="${NODE_PORT:-62075},${DATA_PORTS:-}"
+SEC_SSH="${SEC_SSH:-2087}"
+MISS=0
+LAST_TLS_RESTART=0
+
+write_state() {
+    printf '%s|%s\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')" > "$STATE_FILE" 2>/dev/null || true
+}
+
+while true; do
+    LISTEN=0
+    EST=0
+    IFS=',' read -ra _pp <<< "$PORTS"
+    for _p in "${_pp[@]}"; do
+        _p="$(echo "$_p" | xargs)"
+        [ -n "$_p" ] || continue
+        if ss -tln 2>/dev/null | awk -v ep="127\\.0\\.0\\.1:${_p}$|\\[::1\\]:${_p}$" '$4 ~ ep {f=1} END{exit !f}'; then
+            LISTEN=$(( LISTEN + 1 ))
+        fi
+    done
+    EST=$(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {n++} END{print n+0}')
+
+    if (( LISTEN > 0 )); then
+        MISS=0
+        write_state "OK listeners=${LISTEN} tls_sessions=${EST}"
+    else
+        MISS=$(( MISS + 1 ))
+        write_state "DEGRADED cycles=${MISS} tls_sessions=${EST}"
+        if (( MISS >= 4 && EST == 0 )); then
+            _now=$(date +%s)
+            if (( _now - LAST_TLS_RESTART >= 600 )); then
+                LAST_TLS_RESTART=$_now
+                MISS=0
+                write_state "RESTARTING_TLS_WRAPPER"
+                systemctl restart pg-tls-server.service >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    sleep 15
+done
+EOF
+    chmod +x "$WATCHDOG_SH"
+}
+
+enable_brute_force_shield() {
+    command -v iptables >/dev/null 2>&1 || { echo -e "${YELLOW}[WARN] iptables not available; brute-force shield skipped.${NC}"; return 1; }
+
+    iptables -N PG_SSHBF_PROBE 2>/dev/null || true
+    if ! iptables -A PG_SSHBF_PROBE -m recent --name PG_TEST --set 2>/dev/null; then
+        iptables -X PG_SSHBF_PROBE 2>/dev/null || true
+        echo -e "${YELLOW}[WARN] iptables 'recent' module unavailable; brute-force shield skipped.${NC}"
+        return 1
+    fi
+    iptables -X PG_SSHBF_PROBE 2>/dev/null || true
+
+    iptables -N PG_SSHBF 2>/dev/null || true
+    iptables -F PG_SSHBF
+    iptables -A PG_SSHBF -i lo -j RETURN
+    iptables -A PG_SSHBF -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+    iptables -A PG_SSHBF -p tcp --syn -m recent --name PG_SSHBF --update --seconds 60 --hitcount 8 -j DROP
+    iptables -A PG_SSHBF -p tcp --syn -m recent --name PG_SSHBF --set -j RETURN
+    if ! iptables -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; then
+        iptables -I INPUT 1 -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -N PG_SSHBF 2>/dev/null || true
+        ip6tables -F PG_SSHBF
+        ip6tables -A PG_SSHBF -i lo -j RETURN
+        ip6tables -A PG_SSHBF -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+        ip6tables -A PG_SSHBF -p tcp --syn -m recent --name PG_SSHBF --update --seconds 60 --hitcount 8 -j DROP 2>/dev/null || true
+        ip6tables -A PG_SSHBF -p tcp --syn -m recent --name PG_SSHBF --set -j RETURN 2>/dev/null || true
+        if ! ip6tables -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; then
+            ip6tables -I INPUT 1 -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$SSHBF_DISABLED_FILE"
+    netfilter-persistent save >/dev/null 2>&1 || true
+    echo -e "${GREEN}[OK] SSH brute-force shield active on port 22 (max 8 new connections / 60s per source IP).${NC}"
+    return 0
+}
+
+disable_brute_force_shield() {
+    local i=0
+    while (( i < 10 )) && iptables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; do
+        i=$(( i + 1 ))
+    done
+    iptables -F PG_SSHBF 2>/dev/null || true
+    iptables -X PG_SSHBF 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+        i=0
+        while (( i < 10 )) && ip6tables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; do
+            i=$(( i + 1 ))
+        done
+        ip6tables -F PG_SSHBF 2>/dev/null || true
+        ip6tables -X PG_SSHBF 2>/dev/null || true
+    fi
+    mkdir -p "$CONF_DIR"
+    touch "$SSHBF_DISABLED_FILE"
+    netfilter-persistent save >/dev/null 2>&1 || true
+    echo -e "${YELLOW}[OK] SSH brute-force shield disabled and rules removed.${NC}"
+}
+
+brute_force_shield_menu() {
+    print_header
+    echo -e "${CYAN}=== SSH Brute-Force Shield (Port 22) ===${NC}"
+    echo
+    local st="${YELLOW}Disabled${NC}"
+    if iptables -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; then
+        local tracked=0
+        [[ -r /proc/net/xt_recent/PG_SSHBF ]] && tracked=$(grep -c "^src=" /proc/net/xt_recent/PG_SSHBF 2>/dev/null || echo 0)
+        st="${GREEN}Active (limit: 8 new connections / 60s per IP | tracked sources: ${tracked})${NC}"
+    fi
+    echo -e "  Current Status : ${st}"
+    echo
+    echo "  1) Enable Shield (kernel-level rate limit on port 22)"
+    echo "  2) Disable Shield (remove rules)"
+    echo "  0) Back to Menu"
+    echo -e "------------------------------------------------------------"
+    read -p "Select option [0-2]: " sf_choice
+    case "$sf_choice" in
+        1) enable_brute_force_shield || true ;;
+        2) disable_brute_force_shield ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+    esac
+    read -p "Press Enter to return to menu..."
 }
 
 get_boot_id() {
@@ -903,11 +1252,13 @@ ensure_accounting_rules() {
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        if ! iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null; then
+        if ! iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
+           [[ "$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | wc -l)" != "1" ]]; then
             iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN
         fi
-        if ! iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null; then
+        if ! iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
+           [[ "$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | wc -l)" != "1" ]]; then
             iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN
         fi
@@ -1134,6 +1485,9 @@ handle_cli_subcommands() {
                 if [[ -f "$TLS_SERVER_SERVICE" ]] && ! systemctl is-active --quiet pg-tls-server.service; then
                     systemctl restart pg-tls-server.service 2>/dev/null || true
                 fi
+                if [[ -f "$WATCHDOG_SERVICE" ]] && ! systemctl is-active --quiet pg-tunnel-watchdog.service; then
+                    systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
+                fi
                 IFS=',' read -ra PORTS <<< "$DATA_PORTS"
                 for port in "${PORTS[@]}"; do
                     port=$(echo "$port" | xargs)
@@ -1145,7 +1499,20 @@ handle_cli_subcommands() {
                 sync_traffic_state >/dev/null 2>&1 || true
             elif [[ -f "$FOREIGN_CONF" ]]; then
                 ensure_accounting_rules 2>/dev/null || true
-                if ! systemctl is-active --quiet reverse-tunnel; then
+                if [[ -f "$MGMT_SERVICE" ]]; then
+                    if ! systemctl is-active --quiet pg-tunnel-mgmt; then
+                        systemctl restart pg-tunnel-mgmt 2>/dev/null || true
+                    fi
+                    local cu_file cu_name
+                    for cu_file in $DATA_SERVICE_GLOB; do
+                        [[ -f "$cu_file" ]] || continue
+                        cu_name=$(basename "$cu_file" .service)
+                        if ! systemctl is-active --quiet "$cu_name"; then
+                            systemctl restart "$cu_name" 2>/dev/null || true
+                        fi
+                    done
+                fi
+                if [[ -f "$TUNNEL_SERVICE" ]] && ! systemctl is-active --quiet reverse-tunnel; then
                     systemctl restart reverse-tunnel 2>/dev/null || true
                 fi
                 sync_traffic_state >/dev/null 2>&1 || true
@@ -1381,6 +1748,30 @@ EOF
     systemctl enable pg-tls-server.service >/dev/null 2>&1
     systemctl restart pg-tls-server.service
 
+    echo -e "${YELLOW}Enabling end-to-end watchdog & port-22 brute-force shield...${NC}"
+    write_watchdog_script
+    cat > "$WATCHDOG_SERVICE" <<EOF
+[Unit]
+Description=PG Tunnel End-to-End Watchdog (Listener + TLS Session Monitor)
+After=network-online.target pg-tls-server.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/bin/bash ${WATCHDOG_SH}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable pg-tunnel-watchdog.service >/dev/null 2>&1
+    systemctl restart pg-tunnel-watchdog.service
+
+    if [[ ! -f "$SSHBF_DISABLED_FILE" ]]; then
+        enable_brute_force_shield || true
+    fi
+
     echo -e "${YELLOW}Applying targeted iptables NAT REDIRECT rules...${NC}"
     IFS=',' read -ra PORTS <<< "$DATA_PORTS"
     for port in "${PORTS[@]}"; do
@@ -1554,12 +1945,26 @@ EOF
     if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$IR_IP" "true" >/dev/null 2>&1; then
         echo -e "${GREEN}[OK] SSH public key already verified over TLS 1.3 + Secret!${NC}"
     else
-        echo -e "${CYAN}Enter Iran Server root password once to authorize SSH key over TLS 1.3:${NC}"
-        ssh-copy-id -i /root/.ssh/tunnel_key.pub \
-            -o "$proxy_opt" \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            root@"$IR_IP"
+        local key_ok=0 attempt=0
+        for attempt in 1 2 3; do
+            echo -e "${CYAN}Enter Iran Server root password once to authorize SSH key over TLS 1.3 (attempt ${attempt}/3):${NC}"
+            if ssh-copy-id -i /root/.ssh/tunnel_key.pub \
+                -o "$proxy_opt" \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=20 \
+                root@"$IR_IP"; then
+                key_ok=1
+                break
+            fi
+            echo -e "${YELLOW}[WARN] ssh-copy-id attempt ${attempt} failed (wrong password or transient timeout).${NC}"
+            sleep 2
+        done
+        if (( key_ok == 0 )); then
+            echo -e "${RED}[ERROR] Could not authorize the SSH key after 3 attempts. Check the Iran root password / TLS settings, then re-run Install.${NC}"
+            read -p "Press Enter to return to menu..."
+            return
+        fi
     fi
 
     apply_foreign_configs
@@ -1578,28 +1983,32 @@ apply_foreign_configs() {
     write_tls_client_script
     setup_accounting_persistence
 
-    echo -e "${YELLOW}Creating systemd reverse-tunnel service (TLS 1.3 + Secret + Failover)...${NC}"
-    local SSH_CMD="/usr/bin/ssh -R ${NODE_PORT}:localhost:${NODE_PORT}"
-    IFS=',' read -ra PORTS <<< "$DATA_PORTS"
-    for port in "${PORTS[@]}"; do
-        port=$(echo "$port" | xargs)
-        [[ -n "$port" ]] || continue
-        SSH_CMD+=" -R ${port}:localhost:${port}"
-    done
-    SSH_CMD+=" root@${IR_IP} -N -i /root/.ssh/tunnel_key"
-    SSH_CMD+=" -o \"ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' tunnel\""
-    SSH_CMD+=" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    echo -e "${YELLOW}Creating parallel multi-channel reverse tunnel services (TLS 1.3 + Secret + Failover)...${NC}"
 
-    cat > "$TUNNEL_SERVICE" <<EOF
+    if [[ -f "$TUNNEL_SERVICE" ]]; then
+        systemctl stop reverse-tunnel 2>/dev/null || true
+        systemctl disable reverse-tunnel 2>/dev/null || true
+        rm -f "$TUNNEL_SERVICE"
+        echo -e "  -> Legacy single-tunnel service decommissioned (split into independent parallel channels)."
+    fi
+
+    local bind_pool=() n_bips=0 idx=0 prefer=""
+    if [[ -n "${BIND_IPS:-}" ]]; then
+        IFS=',' read -ra bind_pool <<< "$BIND_IPS"
+        n_bips=${#bind_pool[@]}
+    fi
+    local proxy_base="/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}'"
+
+    cat > "$MGMT_SERVICE" <<EOF
 [Unit]
-Description=Reverse SSH Tunnel over TLS 1.3 to Iran Server
+Description=PG Tunnel Management Channel (Node Port ${NODE_PORT}) over TLS 1.3
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=${SSH_CMD}
+ExecStart=/usr/bin/ssh -R ${NODE_PORT}:127.0.0.1:${NODE_PORT} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} mgmt '' ${NODE_PORT}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no -c ${SSH_CIPHERS}
 Restart=always
 RestartSec=3
 
@@ -1607,15 +2016,80 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable reverse-tunnel >/dev/null 2>&1
-    systemctl restart reverse-tunnel
+    local new_units=() port="" unit_file="" unit_name=""
+    IFS=',' read -ra PORTS <<< "$DATA_PORTS"
+    for port in "${PORTS[@]}"; do
+        port=$(echo "$port" | xargs)
+        [[ -n "$port" ]] || continue
+        prefer=""
+        if (( n_bips > 0 )); then
+            prefer=$(echo "${bind_pool[$(( idx % n_bips ))]}" | xargs)
+        fi
+        unit_file="/etc/systemd/system/pg-tunnel-data-${port}.service"
+        cat > "$unit_file" <<EOF
+[Unit]
+Description=PG Tunnel Data Channel (Port ${port}) over TLS 1.3
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
-    sleep 2.5
-    if systemctl is-active --quiet reverse-tunnel; then
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -R ${port}:127.0.0.1:${port} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} data '${prefer}' ${port}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no -c ${SSH_CIPHERS}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        new_units+=("pg-tunnel-data-${port}")
+        idx=$(( idx + 1 ))
+    done
+
+    local f="" base="" keep=0
+    for f in $DATA_SERVICE_GLOB; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f" .service)
+        keep=0
+        for unit_name in ${new_units[@]+"${new_units[@]}"}; do
+            [[ "$base" == "$unit_name" ]] && keep=1
+        done
+        if (( keep == 0 )); then
+            systemctl stop "$base" 2>/dev/null || true
+            systemctl disable "$base" 2>/dev/null || true
+            rm -f "$f"
+        fi
+    done
+
+    systemctl daemon-reload
+    systemctl enable pg-tunnel-mgmt >/dev/null 2>&1
+    systemctl restart pg-tunnel-mgmt
+    for unit_name in ${new_units[@]+"${new_units[@]}"}; do
+        systemctl enable "$unit_name" >/dev/null 2>&1
+        systemctl restart "$unit_name"
+    done
+
+    sleep 3
+    echo
+    echo -e "${CYAN}--- Parallel Channel Status ---${NC}"
+    if systemctl is-active --quiet pg-tunnel-mgmt; then
+        echo -e "  mgmt (Node ${NODE_PORT}) : ${GREEN}ACTIVE${NC}"
+    else
+        echo -e "  mgmt (Node ${NODE_PORT}) : ${RED}FAILED${NC}"
+    fi
+    for unit_name in ${new_units[@]+"${new_units[@]}"}; do
+        if systemctl is-active --quiet "$unit_name"; then
+            echo -e "  data (${unit_name#pg-tunnel-data-}) : ${GREEN}ACTIVE${NC}"
+        else
+            echo -e "  data (${unit_name#pg-tunnel-data-}) : ${RED}FAILED${NC}"
+        fi
+    done
+
+    if systemctl is-active --quiet pg-tunnel-mgmt || [[ ${#new_units[@]} -gt 0 ]]; then
+        echo
         echo -e "${GREEN}[OK] Foreign server active & connected over TLS 1.3 (${IR_IP}:${SEC_SSH}, SNI: ${TLS_SNI}).${NC}"
     else
-        echo -e "${RED}[ERROR] Tunnel service failed to connect. Check logs (Option 4) or verify Secret/Port.${NC}"
+        echo -e "${RED}[ERROR] Tunnel channels failed to connect. Check logs (Option 4) or verify Secret/Port.${NC}"
     fi
     echo
     read -p "Press Enter to return to menu..."
@@ -1728,34 +2202,49 @@ manage_service() {
         frame+="------------------------------------------------------------${clr_eol}${nl}"
 
         frame+="${c_cyan}=== System & Anti-DPI Status ===${c_nc}${clr_eol}${nl}"
-        if [[ -f "$TUNNEL_SERVICE" ]]; then
+        if [[ -f "$MGMT_SERVICE" || -f "$TUNNEL_SERVICE" ]]; then
             local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
             [[ -f "$FOREIGN_CONF" ]] && source "$FOREIGN_CONF"
-            local active_state sub_state active_since main_pid mem_bytes mem_mb last_log active_ip auth_tag
-            active_state=$(systemctl show reverse-tunnel -p ActiveState --value 2>/dev/null || echo "unknown")
-            sub_state=$(systemctl show reverse-tunnel -p SubState --value 2>/dev/null || echo "unknown")
-            active_since=$(systemctl show reverse-tunnel -p ActiveEnterTimestamp --value 2>/dev/null || echo "N/A")
-            main_pid=$(systemctl show reverse-tunnel -p MainPID --value 2>/dev/null || echo "0")
-            mem_bytes=$(systemctl show reverse-tunnel -p MemoryCurrent --value 2>/dev/null || echo "0")
-            mem_mb="N/A"
-            if [[ "$mem_bytes" =~ ^[0-9]+$ ]] && (( mem_bytes > 0 && mem_bytes < 1099511627776 )); then
-                mem_mb=$(awk -v m="$mem_bytes" 'BEGIN { printf "%.1f MB", m / 1048576.0 }')
-            fi
+            local active_ip auth_tag last_log ch_state ch_file ch_unit
             active_ip="Default"
             [[ -f "$LAST_GOOD_IP_FILE" ]] && active_ip=$(cat "$LAST_GOOD_IP_FILE" 2>/dev/null | xargs || echo "Default")
             auth_tag="Legacy"
-            [[ -n "${TLS_SECRET:-}" ]] && auth_tag="Secret+Camo"
-            last_log=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
-
-            if [[ "$active_state" == "active" ]]; then
-                frame+="  Service State      : ${c_green}${active_state} (${sub_state})${c_nc} since ${active_since:-N/A}${clr_eol}${nl}"
-            else
-                frame+="  Service State      : ${c_red}${active_state} (${sub_state})${c_nc}${clr_eol}${nl}"
-            fi
-            frame+="  Process / RAM      : Main PID ${main_pid} | Memory: ${mem_mb}${clr_eol}${nl}"
+            [[ -n "${TLS_SECRET:-}" ]] && auth_tag="Secret+WS-Camo"
             frame+="  TLS 1.3 Target     : ${IR_IP:-N/A}:${SEC_SSH:-N/A} | SNI: ${TLS_SNI} [${auth_tag}]${clr_eol}${nl}"
-            frame+="  Active Bind IP     : ${c_green}${active_ip}${c_nc} (Pool: ${BIND_IPS:-Default})${clr_eol}${nl}"
+            frame+="  Bind IP Pool       : ${BIND_IPS:-Default} (Last Good: ${active_ip})${clr_eol}${nl}"
             frame+="  Tunnel Ports       : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}${clr_eol}${nl}"
+            frame+="  --- Parallel Channels ---${clr_eol}${nl}"
+            if [[ -f "$MGMT_SERVICE" ]]; then
+                ch_state=$(systemctl is-active pg-tunnel-mgmt 2>/dev/null || true)
+                [[ -z "$ch_state" ]] && ch_state="unknown"
+                if [[ "$ch_state" == "active" ]]; then
+                    frame+="  Channel mgmt       : ${c_green}${ch_state}${c_nc} (Node Port ${NODE_PORT:-N/A})${clr_eol}${nl}"
+                else
+                    frame+="  Channel mgmt       : ${c_red}${ch_state}${c_nc} (Node Port ${NODE_PORT:-N/A})${clr_eol}${nl}"
+                fi
+                for ch_file in $DATA_SERVICE_GLOB; do
+                    [[ -f "$ch_file" ]] || continue
+                    ch_unit=$(basename "$ch_file" .service)
+                    ch_state=$(systemctl is-active "$ch_unit" 2>/dev/null || true)
+                    [[ -z "$ch_state" ]] && ch_state="unknown"
+                    if [[ "$ch_state" == "active" ]]; then
+                        frame+="  Channel data       : ${c_green}${ch_state}${c_nc} (Port ${ch_unit#pg-tunnel-data-})${clr_eol}${nl}"
+                    else
+                        frame+="  Channel data       : ${c_red}${ch_state}${c_nc} (Port ${ch_unit#pg-tunnel-data-})${clr_eol}${nl}"
+                    fi
+                done
+            fi
+            if [[ -f "$TUNNEL_SERVICE" ]]; then
+                ch_state=$(systemctl is-active reverse-tunnel 2>/dev/null || true)
+                [[ -z "$ch_state" ]] && ch_state="unknown"
+                if [[ "$ch_state" == "active" ]]; then
+                    frame+="  Channel legacy     : ${c_green}${ch_state}${c_nc} (single-tunnel, pre-v7)${clr_eol}${nl}"
+                else
+                    frame+="  Channel legacy     : ${c_red}${ch_state}${c_nc} (single-tunnel, pre-v7)${clr_eol}${nl}"
+                fi
+            fi
+            last_log=$(journalctl -u pg-tunnel-mgmt --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
+            [[ -z "$last_log" && -f "$TUNNEL_SERVICE" ]] && last_log=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
             [[ -n "$last_log" ]] && frame+="  Latest Log         : ${last_log}${clr_eol}${nl}"
         else
             local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com" TLS_SECRET=""
@@ -1773,11 +2262,24 @@ manage_service() {
             ssh_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
             tunnel_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
             frame+="  SSH / Tunnel Ports : SSH [${ssh_ports}] | Local [${tunnel_ports}]${clr_eol}${nl}"
+            local wd_status="Inactive" wd_line="N/A" shield_status="Disabled" est_count=0
+            if systemctl is-active --quiet pg-tunnel-watchdog.service 2>/dev/null; then
+                wd_status="Active"
+            fi
+            [[ -r "$WATCHDOG_STATE" ]] && wd_line=$(cut -d'|' -f1 "$WATCHDOG_STATE" 2>/dev/null | xargs || true)
+            [[ -z "$wd_line" ]] && wd_line="N/A"
+            if iptables -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; then
+                shield_status="Active on Port 22 (8/60s)"
+            fi
+            est_count=$(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {n++} END{print n+0}')
+            frame+="  End-to-End Watchdog : ${wd_status} (${wd_line})${clr_eol}${nl}"
+            frame+="  Brute-Force Shield  : ${shield_status}${clr_eol}${nl}"
+            frame+="  TLS Client Sessions : ${est_count}${clr_eol}${nl}"
             frame+="  NAT OUTPUT Rules   :${clr_eol}${nl}"
             local nat_summary
             nat_summary=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
-                NR > 2 && NF >= 9 {
-                    rule = "    #" $1 " " $4 " -> " $9
+                NR > 2 && NF >= 10 {
+                    rule = "    #" $1 " " $4 " -> " $10
                     if ($4 == "REDIRECT") rule = rule ":" $12 " => :" $NF
                     print rule " (pkts:" $2 ", " $3 ")"
                 }' | head -n 6 || true)
@@ -1838,16 +2340,40 @@ uninstall_all() {
     if [[ -f "$FOREIGN_CONF" ]]; then
         systemctl stop reverse-tunnel 2>/dev/null || true
         systemctl disable reverse-tunnel 2>/dev/null || true
-        rm -f "$TUNNEL_SERVICE" "$TLS_CLIENT_PY" "$LAST_GOOD_IP_FILE"
+        systemctl stop pg-tunnel-mgmt 2>/dev/null || true
+        systemctl disable pg-tunnel-mgmt 2>/dev/null || true
+        local du_file du_name
+        for du_file in $DATA_SERVICE_GLOB; do
+            [[ -f "$du_file" ]] || continue
+            du_name=$(basename "$du_file" .service)
+            systemctl stop "$du_name" 2>/dev/null || true
+            systemctl disable "$du_name" 2>/dev/null || true
+            rm -f "$du_file"
+        done
+        rm -f "$TUNNEL_SERVICE" "$MGMT_SERVICE" "$TLS_CLIENT_PY" "$LAST_GOOD_IP_FILE"
         systemctl daemon-reload
         rm -f "$FOREIGN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
-        echo -e "${GREEN}[OK] Reverse TLS tunnel service & accounting removed from Foreign server.${NC}"
+        echo -e "${GREEN}[OK] Reverse TLS tunnel channels & accounting removed from Foreign server.${NC}"
     elif [[ -f "$IRAN_CONF" ]]; then
         local OUT_IP="" NODE_PORT="" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
         source "$IRAN_CONF"
         systemctl stop pg-tls-server.service 2>/dev/null || true
         systemctl disable pg-tls-server.service 2>/dev/null || true
+        systemctl stop pg-tunnel-watchdog.service 2>/dev/null || true
+        systemctl disable pg-tunnel-watchdog.service 2>/dev/null || true
         rm -f "$TLS_SERVER_SERVICE" "$TLS_SERVER_PY" "$TLS_CERT" "$TLS_KEY"
+        rm -f "$WATCHDOG_SERVICE" "$WATCHDOG_SH" "$WATCHDOG_STATE"
+        local s_i=0
+        while (( s_i < 10 )) && iptables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null; do
+            s_i=$(( s_i + 1 ))
+        done
+        iptables -F PG_SSHBF 2>/dev/null || true
+        iptables -X PG_SSHBF 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -D INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null || true
+            ip6tables -F PG_SSHBF 2>/dev/null || true
+            ip6tables -X PG_SSHBF 2>/dev/null || true
+        fi
         systemctl daemon-reload
         release_iran_tunnel_ports 2>/dev/null || true
         IFS=',' read -ra PORTS <<< "$DATA_PORTS"
@@ -1869,12 +2395,20 @@ uninstall_all() {
 
 view_logs() {
     print_header
-    if [[ -f "$TUNNEL_SERVICE" ]]; then
-        echo -e "${CYAN}Live Foreign Tunnel Logs (Press Ctrl+C to return)...${NC}"
-        journalctl -u reverse-tunnel.service -n 30 -f --no-pager || true
+    if [[ -f "$MGMT_SERVICE" || -f "$TUNNEL_SERVICE" ]]; then
+        echo -e "${CYAN}Live Foreign Tunnel Logs - All Channels (Press Ctrl+C to return)...${NC}"
+        local log_units="-u pg-tunnel-mgmt"
+        local lu_file lu_name
+        for lu_file in $DATA_SERVICE_GLOB; do
+            [[ -f "$lu_file" ]] || continue
+            lu_name=$(basename "$lu_file" .service)
+            log_units+=" -u ${lu_name}"
+        done
+        [[ -f "$TUNNEL_SERVICE" ]] && log_units+=" -u reverse-tunnel"
+        journalctl ${log_units} -n 30 -f --no-pager || true
     elif [[ -f "$TLS_SERVER_SERVICE" ]]; then
         echo -e "${CYAN}Live Iran TLS 1.3 & SSH Logs (Press Ctrl+C to return)...${NC}"
-        journalctl -u pg-tls-server.service -u ssh.service -n 30 -f --no-pager || true
+        journalctl -u pg-tls-server.service -u pg-tunnel-watchdog.service -u ssh.service -n 30 -f --no-pager || true
     else
         echo -e "${RED}No active tunnel service found on this server.${NC}"
         read -p "Press Enter to return to menu..."
@@ -2154,9 +2688,10 @@ main_menu() {
         echo "  6. Update Script (from GitHub)"
         echo "  7. Repair / Restart Tunnels (Fix Connection)"
         echo "  8. Setup Auto-Restart Cronjob"
+        echo "  9. SSH Brute-Force Shield (Port 22)"
         echo "  0. Exit"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-8]: " choice
+        read -p "Select option [0-9]: " choice
 
         case $choice in
             1)
@@ -2175,6 +2710,7 @@ main_menu() {
             6) update_script ;;
             7) repair_tunnels ;;
             8) setup_cronjob ;;
+            9) brute_force_shield_menu ;;
             0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
