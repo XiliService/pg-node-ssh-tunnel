@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v6.5
+# PG Node SSH Tunnel Manager v6.6
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="6.5"
+SCRIPT_VERSION="6.6"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -58,6 +58,75 @@ ensure_packages() {
     fi
 }
 
+is_valid_ipv4() {
+    local ip="${1:-}"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 ))
+}
+
+is_valid_port() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 ))
+}
+
+normalize_ports_csv() {
+    local raw="${1:-}"
+    local out="" p
+    IFS=',' read -ra _arr <<< "$raw"
+    for p in "${_arr[@]}"; do
+        p=$(echo "$p" | xargs)
+        [[ -z "$p" ]] && continue
+        if ! is_valid_port "$p"; then
+            return 1
+        fi
+        out="${out:+${out},}${p}"
+    done
+    [[ -n "$out" ]] || return 1
+    echo "$out"
+}
+
+detect_public_ipv4s() {
+    ip -4 addr show scope global 2>/dev/null | awk '
+        /inet / {
+            ip = $2
+            sub(/\/.*/, "", ip)
+            if (ip ~ /^10\./ || ip ~ /^127\./ || ip ~ /^169\.254\./ || ip ~ /^192\.168\./) next
+            if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) next
+            if (ip ~ /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./) next
+            if (!seen[ip]++) print ip
+        }
+    ' | paste -sd, - || true
+}
+
+normalize_bind_ips_csv() {
+    local raw="${1:-}"
+    raw=$(echo "$raw" | xargs)
+    if [[ -z "$raw" ]]; then
+        echo ""
+        return 0
+    fi
+    local local_all
+    local_all=$(ip -4 addr show 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2}' || true)
+    local out="" ip
+    IFS=',' read -ra _ips <<< "$raw"
+    for ip in "${_ips[@]}"; do
+        ip=$(echo "$ip" | xargs)
+        [[ -z "$ip" ]] && continue
+        if ! is_valid_ipv4 "$ip"; then
+            echo -e "${RED}[ERROR] Invalid IPv4 address: '${ip}'.${NC}" >&2
+            return 1
+        fi
+        if [[ -n "$local_all" ]] && ! grep -qxF "$ip" <<< "$local_all"; then
+            echo -e "${RED}[ERROR] IP '${ip}' is not assigned to any interface on this server.${NC}" >&2
+            return 1
+        fi
+        out="${out:+${out},}${ip}"
+    done
+    echo "$out"
+}
+
 generate_secret() {
     openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
@@ -74,7 +143,6 @@ pick_free_https_port() {
 }
 
 auto_detect_real_cert() {
-    # Output format on match: DOMAIN|CERT_PATH|KEY_PATH
     local crt key pub1 pub2 subj iss san dom
     local candidates=()
 
@@ -763,26 +831,36 @@ get_chain_bytes() {
 format_traffic_size() {
     local bytes="${1:-0}"
     awk -v b="$bytes" 'BEGIN {
-        mb = (b + 0.0) / 1048576.0
+        kb = (b + 0.0) / 1024.0
+        mb = kb / 1024.0
         gb = mb / 1024.0
         if (mb >= 1024.0 || sprintf("%.2f", mb) == "1024.00") {
             printf "%.2f GB", gb
-        } else {
+        } else if (mb >= 1.0) {
             printf "%.2f MB", mb
+        } else {
+            printf "%.2f KB", kb
         }
     }'
 }
 
-format_speed_mbs() {
+format_live_speed() {
     local delta_bytes="${1:-0}"
     local delta_ns="${2:-1000000000}"
     awk -v db="$delta_bytes" -v dns="$delta_ns" 'BEGIN {
         if (db <= 0 || dns <= 0) {
-            printf "0.00 MB/s"
+            printf "0.00 KB/s  (0.00 Mbps)"
         } else {
             sec = (dns + 0.0) / 1000000000.0
-            mbs = ((db + 0.0) / 1048576.0) / sec
-            printf "%.2f MB/s", mbs
+            bps = (db + 0.0) / sec
+            kbs = bps / 1024.0
+            mbs = kbs / 1024.0
+            mbps = (bps * 8.0) / 1000000.0
+            if (mbs >= 1.0) {
+                printf "%.2f MB/s  (%.2f Mbps)", mbs, mbps
+            } else {
+                printf "%.2f KB/s  (%.2f Mbps)", kbs, mbps
+            }
         }
     }'
 }
@@ -803,10 +881,14 @@ ensure_accounting_rules() {
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
+        if ! iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null; then
+            iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN
-        iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
+        fi
+        if ! iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null; then
+            iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
+        fi
 
     elif [[ -f "$FOREIGN_CONF" ]]; then
         local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="" BIND_IPS="" TLS_SECRET=""
@@ -821,10 +903,14 @@ ensure_accounting_rules() {
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
+        if ! iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null; then
+            iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN
-        iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
+        fi
+        if ! iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null; then
+            iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
             iptables -t mangle -A PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN
+        fi
     fi
 }
 
@@ -1111,30 +1197,56 @@ install_iran() {
         cur_secret="${TLS_SECRET:-}"
     fi
 
-    if [[ -n "$cur_out_ip" ]]; then
-        read -p "Foreign Server IP (PasarGuard Outbound IP) [default: ${cur_out_ip}]: " OUT_IP
-        OUT_IP=${OUT_IP:-$cur_out_ip}
-    else
-        read -p "Foreign Server IP (PasarGuard Outbound IP): " OUT_IP
-    fi
+    while true; do
+        if [[ -n "$cur_out_ip" ]]; then
+            read -p "Foreign Server IP (PasarGuard Outbound IP) [default: ${cur_out_ip}]: " OUT_IP
+            OUT_IP=${OUT_IP:-$cur_out_ip}
+        else
+            read -p "Foreign Server IP (PasarGuard Outbound IP): " OUT_IP
+        fi
+        OUT_IP=$(echo "$OUT_IP" | xargs)
+        if is_valid_ipv4 "$OUT_IP"; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Required: please enter a valid IPv4 address (e.g. 147.90.59.178).${NC}"
+    done
 
-    read -p "Node management port [default: ${cur_node_port}]: " NODE_PORT
-    NODE_PORT=${NODE_PORT:-$cur_node_port}
+    while true; do
+        read -p "Node management port [default: ${cur_node_port}]: " NODE_PORT
+        NODE_PORT=${NODE_PORT:-$cur_node_port}
+        NODE_PORT=$(echo "$NODE_PORT" | xargs)
+        if is_valid_port "$NODE_PORT"; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Please enter a valid port number (1-65535).${NC}"
+    done
 
-    if [[ -n "$cur_data_ports" ]]; then
-        read -p "Outbound data ports (comma separated) [default: ${cur_data_ports}]: " DATA_PORTS
-        DATA_PORTS=${DATA_PORTS:-$cur_data_ports}
-    else
-        read -p "Outbound data ports (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
-    fi
+    while true; do
+        if [[ -n "$cur_data_ports" ]]; then
+            read -p "Outbound data ports (comma separated) [default: ${cur_data_ports}]: " DATA_PORTS
+            DATA_PORTS=${DATA_PORTS:-$cur_data_ports}
+        else
+            read -p "Outbound data ports (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+        fi
+        if DATA_PORTS=$(normalize_ports_csv "$DATA_PORTS"); then
+            break
+        fi
+        echo -e "${RED}[ERROR] Outbound data ports cannot be empty. Enter valid port numbers separated by commas.${NC}"
+    done
 
     local suggested_port
     suggested_port=$(pick_free_https_port)
+    [[ -n "$cur_sec" ]] && suggested_port="$cur_sec"
     while true; do
         read -p "Anti-DPI HTTPS Port [recommended free port: ${suggested_port}]: " SEC_SSH
         SEC_SSH=${SEC_SSH:-$suggested_port}
+        SEC_SSH=$(echo "$SEC_SSH" | xargs)
+        if ! is_valid_port "$SEC_SSH"; then
+            echo -e "${RED}[ERROR] Invalid port number. Enter a value between 1 and 65535.${NC}"
+            continue
+        fi
         if [[ "$SEC_SSH" == "22" || "$SEC_SSH" == "80" || "$SEC_SSH" == "443" ]]; then
-            echo -e "${RED}[ERROR] Do not use port ${SEC_SSH} (reserved for SSH/Caddy/Xray). Pick e.g. ${suggested_port}.${NC}"
+            echo -e "${RED}[ERROR] Do not use port ${SEC_SSH} (reserved for SSH/Caddy/Xray).${NC}"
             continue
         fi
         local conflict_proc=""
@@ -1142,7 +1254,7 @@ install_iran() {
         if [[ -n "$conflict_proc" ]]; then
             echo -e "${RED}[WARN] Port ${SEC_SSH} is currently occupied by another process:${NC}"
             echo "  $conflict_proc"
-            echo -e "${YELLOW}Please pick a free port (recommended: ${suggested_port}).${NC}"
+            echo -e "${YELLOW}Please pick another free port (e.g. 2087, 2083, 9443).${NC}"
             continue
         fi
         break
@@ -1158,8 +1270,15 @@ install_iran() {
     fi
 
     local default_sni="${det_dom:-${cur_sni:-www.microsoft.com}}"
-    read -p "TLS Cover Domain (SNI) [default: ${default_sni}]: " TLS_SNI
-    TLS_SNI=${TLS_SNI:-$default_sni}
+    while true; do
+        read -p "TLS Cover Domain (SNI) [default: ${default_sni}]: " TLS_SNI
+        TLS_SNI=${TLS_SNI:-$default_sni}
+        TLS_SNI=$(echo "$TLS_SNI" | xargs)
+        if [[ -n "$TLS_SNI" && "$TLS_SNI" == *.* ]]; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Please enter a valid domain name.${NC}"
+    done
 
     if [[ -n "$det_dom" && "$TLS_SNI" == "$det_dom" ]]; then
         CERT_SRC="$det_crt"
@@ -1167,10 +1286,20 @@ install_iran() {
     fi
 
     local default_secret="${cur_secret:-$(generate_secret)}"
-    read -p "Anti-Prober Secret Key [Enter = ${default_secret}]: " TLS_SECRET
-    TLS_SECRET=${TLS_SECRET:-$default_secret}
+    while true; do
+        read -p "Anti-Prober Secret Key [Enter = ${default_secret}]: " TLS_SECRET
+        TLS_SECRET=${TLS_SECRET:-$default_secret}
+        TLS_SECRET=$(echo "$TLS_SECRET" | xargs)
+        if [[ -n "$TLS_SECRET" ]]; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Secret key cannot be empty.${NC}"
+    done
 
-    if [[ -z "$cur_sec" || "$SEC_SSH" != "$cur_sec" ]]; then
+    if [[ ! -f "$IRAN_CONF" ]]; then
+        reset_traffic_accounting
+    elif [[ "$SEC_SSH" != "$cur_sec" ]]; then
+        sync_traffic_state >/dev/null 2>&1 || true
         cleanup_accounting_rules
     fi
 
@@ -1266,7 +1395,8 @@ EOF
     netfilter-persistent save >/dev/null 2>&1 || true
 
     local pub_ir_ip
-    pub_ir_ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}' || echo "<IRAN_IP>")
+    pub_ir_ip=$(detect_public_ipv4s | cut -d',' -f1)
+    pub_ir_ip=${pub_ir_ip:-"<IRAN_IP>"}
 
     echo
     echo -e "${GREEN}[OK] Iran server configured successfully ($(get_cert_badge) certificate active).${NC}"
@@ -1301,50 +1431,104 @@ install_foreign() {
         cur_bips="${BIND_IPS:-}"
     fi
 
-    if [[ -n "$cur_ir_ip" ]]; then
-        read -p "Iran Server IP [default: ${cur_ir_ip}]: " IR_IP
-        IR_IP=${IR_IP:-$cur_ir_ip}
-    else
-        read -p "Iran Server IP: " IR_IP
-    fi
+    while true; do
+        if [[ -n "$cur_ir_ip" ]]; then
+            read -p "Iran Server IP [default: ${cur_ir_ip}]: " IR_IP
+            IR_IP=${IR_IP:-$cur_ir_ip}
+        else
+            read -p "Iran Server IP: " IR_IP
+        fi
+        IR_IP=$(echo "$IR_IP" | xargs)
+        if is_valid_ipv4 "$IR_IP"; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Required: please enter a valid Iran Server IPv4 address.${NC}"
+    done
 
-    read -p "Anti-DPI HTTPS Port on Iran [default: ${cur_sec}]: " SEC_SSH
-    SEC_SSH=${SEC_SSH:-$cur_sec}
+    while true; do
+        read -p "Anti-DPI HTTPS Port on Iran [default: ${cur_sec}]: " SEC_SSH
+        SEC_SSH=${SEC_SSH:-$cur_sec}
+        SEC_SSH=$(echo "$SEC_SSH" | xargs)
+        if is_valid_port "$SEC_SSH"; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Please enter a valid port number (1-65535).${NC}"
+    done
 
-    local sni_prompt="${cur_sni:-www.microsoft.com}"
-    read -p "TLS SNI Domain (from Iran summary) [default: ${sni_prompt}]: " TLS_SNI
-    TLS_SNI=${TLS_SNI:-$sni_prompt}
+    while true; do
+        if [[ -n "$cur_sni" ]]; then
+            read -p "TLS SNI Domain (from Iran summary) [default: ${cur_sni}]: " TLS_SNI
+            TLS_SNI=${TLS_SNI:-$cur_sni}
+        else
+            read -p "TLS SNI Domain (paste from Iran summary): " TLS_SNI
+        fi
+        TLS_SNI=$(echo "$TLS_SNI" | xargs)
+        if [[ -n "$TLS_SNI" && "$TLS_SNI" == *.* ]]; then
+            break
+        fi
+        echo -e "${RED}[ERROR] TLS SNI Domain cannot be empty (paste exact domain shown on Iran server).${NC}"
+    done
 
-    if [[ -n "$cur_secret" ]]; then
-        read -p "TLS Secret Key (from Iran summary) [default: ${cur_secret}]: " TLS_SECRET
-        TLS_SECRET=${TLS_SECRET:-$cur_secret}
-    else
-        read -p "TLS Secret Key (paste from Iran summary): " TLS_SECRET
-    fi
+    while true; do
+        if [[ -n "$cur_secret" ]]; then
+            read -p "TLS Secret Key (from Iran summary) [default: ${cur_secret}]: " TLS_SECRET
+            TLS_SECRET=${TLS_SECRET:-$cur_secret}
+        else
+            read -p "TLS Secret Key (paste from Iran summary): " TLS_SECRET
+        fi
+        TLS_SECRET=$(echo "$TLS_SECRET" | xargs)
+        if [[ -n "$TLS_SECRET" ]]; then
+            break
+        fi
+        echo -e "${RED}[ERROR] TLS Secret Key cannot be empty (paste exact key shown on Iran server).${NC}"
+    done
 
-    read -p "Node management port [default: ${cur_node}]: " NODE_PORT
-    NODE_PORT=${NODE_PORT:-$cur_node}
+    while true; do
+        read -p "Node management port [default: ${cur_node}]: " NODE_PORT
+        NODE_PORT=${NODE_PORT:-$cur_node}
+        NODE_PORT=$(echo "$NODE_PORT" | xargs)
+        if is_valid_port "$NODE_PORT"; then
+            break
+        fi
+        echo -e "${RED}[ERROR] Please enter a valid port number (1-65535).${NC}"
+    done
 
-    if [[ -n "$cur_data" ]]; then
-        read -p "Outbound data ports to tunnel [default: ${cur_data}]: " DATA_PORTS
-        DATA_PORTS=${DATA_PORTS:-$cur_data}
-    else
-        read -p "Outbound data ports to tunnel (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
-    fi
+    while true; do
+        if [[ -n "$cur_data" ]]; then
+            read -p "Outbound data ports to tunnel [default: ${cur_data}]: " DATA_PORTS
+            DATA_PORTS=${DATA_PORTS:-$cur_data}
+        else
+            read -p "Outbound data ports to tunnel (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+        fi
+        if DATA_PORTS=$(normalize_ports_csv "$DATA_PORTS"); then
+            break
+        fi
+        echo -e "${RED}[ERROR] Outbound data ports cannot be empty. Enter valid port numbers separated by commas.${NC}"
+    done
 
     local detected_ips
-    detected_ips=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2}' | paste -sd, - || true)
+    detected_ips=$(detect_public_ipv4s)
     if [[ -n "$detected_ips" ]]; then
         echo -e "${CYAN}Detected Public IPv4s on this server:${NC} ${detected_ips}"
     fi
-    if [[ -n "$cur_bips" ]]; then
-        read -p "Source Bind IPs for failover [default: ${cur_bips}]: " BIND_IPS
-        BIND_IPS=${BIND_IPS:-$cur_bips}
-    else
-        read -p "Optional Clean Source Bind IPs (comma separated, Enter = Auto/Default): " BIND_IPS
-    fi
+    while true; do
+        if [[ -n "$cur_bips" ]]; then
+            read -p "Source Bind IPs for failover [default: ${cur_bips}]: " BIND_IPS
+            BIND_IPS=${BIND_IPS:-$cur_bips}
+        else
+            read -p "Optional Clean Source Bind IPs (comma separated, Enter = Auto/Default): " BIND_IPS
+        fi
+        if BIND_IPS=$(normalize_bind_ips_csv "$BIND_IPS"); then
+            break
+        fi
+    done
 
-    cleanup_accounting_rules
+    if [[ ! -f "$FOREIGN_CONF" ]]; then
+        reset_traffic_accounting
+    elif [[ "$SEC_SSH" != "$cur_sec" || "$IR_IP" != "$cur_ir_ip" ]]; then
+        sync_traffic_state >/dev/null 2>&1 || true
+        cleanup_accounting_rules
+    fi
     rm -f "$LAST_GOOD_IP_FILE"
 
     cat > "$FOREIGN_CONF" <<EOF
@@ -1367,7 +1551,7 @@ EOF
     fi
 
     local proxy_opt="ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' probe"
-    if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$IR_IP" "true" >/dev/null 2>&1; then
+    if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$IR_IP" "true" >/dev/null 2>&1; then
         echo -e "${GREEN}[OK] SSH public key already verified over TLS 1.3 + Secret!${NC}"
     else
         echo -e "${CYAN}Enter Iran Server root password once to authorize SSH key over TLS 1.3:${NC}"
@@ -1404,7 +1588,7 @@ apply_foreign_configs() {
     done
     SSH_CMD+=" root@${IR_IP} -N -i /root/.ssh/tunnel_key"
     SSH_CMD+=" -o \"ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' tunnel\""
-    SSH_CMD+=" -o ConnectTimeout=12 -o TCPKeepAlive=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    SSH_CMD+=" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
     cat > "$TUNNEL_SERVICE" <<EOF
 [Unit]
@@ -1438,19 +1622,33 @@ EOF
 }
 
 manage_service() {
+    local c_green=$'\033[0;32m'
+    local c_red=$'\033[0;31m'
+    local c_yellow=$'\033[1;33m'
+    local c_cyan=$'\033[0;36m'
+    local c_nc=$'\033[0m'
+    local clr_eol=$'\033[K'
+    local nl=$'\n'
+
     local is_configured=0
-    if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
+    local is_foreign=0
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        is_configured=1
+        is_foreign=1
+        ensure_accounting_rules
+    elif [[ -f "$IRAN_CONF" ]]; then
         is_configured=1
         ensure_accounting_rules
     fi
 
-    local prev_rx=0 prev_tx=0 prev_ns=0
-    local cur_rx=0 cur_tx=0 cur_ns=0
+    local prev_krx=0 prev_ktx=0 prev_ns=0
+    local cur_krx=0 cur_ktx=0 cur_ns=0
     local state_line="" created_at="Not configured"
     if (( is_configured == 1 )); then
-        state_line=$(sync_traffic_state)
-        IFS='|' read -r prev_rx prev_tx created_at <<< "$state_line"
+        prev_krx=$(get_chain_bytes "PG_TUNNEL_IN")
+        prev_ktx=$(get_chain_bytes "PG_TUNNEL_OUT")
         prev_ns=$(date +%s%N)
+        sleep 0.25
     fi
 
     printf '\033[?1049h\033[?25l\033[2J\033[H'
@@ -1466,25 +1664,38 @@ manage_service() {
     while true; do
         local dl_bytes=0 ul_bytes=0 dl_delta=0 ul_delta=0 elapsed_ns=1000000000
         if (( is_configured == 1 )); then
-            state_line=$(sync_traffic_state)
-            IFS='|' read -r cur_rx cur_tx created_at <<< "$state_line"
+            cur_krx=$(get_chain_bytes "PG_TUNNEL_IN")
+            cur_ktx=$(get_chain_bytes "PG_TUNNEL_OUT")
             cur_ns=$(date +%s%N)
+
+            state_line=$(sync_traffic_state)
+            local raw_saved_rx=0 raw_saved_tx=0
+            IFS='|' read -r raw_saved_rx raw_saved_tx created_at <<< "$state_line"
 
             elapsed_ns=$(( cur_ns - prev_ns ))
             (( elapsed_ns <= 0 )) && elapsed_ns=1000000000
 
-            local delta_rx=$(( cur_rx - prev_rx ))
-            local delta_tx=$(( cur_tx - prev_tx ))
+            local delta_rx=$(( cur_krx - prev_krx ))
+            local delta_tx=$(( cur_ktx - prev_ktx ))
             (( delta_rx < 0 )) && delta_rx=0
             (( delta_tx < 0 )) && delta_tx=0
 
-            dl_bytes="$cur_rx"
-            ul_bytes="$cur_tx"
-            dl_delta="$delta_rx"
-            ul_delta="$delta_tx"
+            if (( is_foreign == 1 )); then
+                # On Foreign server: TX to Iran = User Download, RX from Iran = User Upload
+                dl_bytes="$raw_saved_tx"
+                ul_bytes="$raw_saved_rx"
+                dl_delta="$delta_tx"
+                ul_delta="$delta_rx"
+            else
+                # On Iran server: RX from Foreign = User Download, TX to Foreign = User Upload
+                dl_bytes="$raw_saved_rx"
+                ul_bytes="$raw_saved_tx"
+                dl_delta="$delta_rx"
+                ul_delta="$delta_tx"
+            fi
 
-            prev_rx="$cur_rx"
-            prev_tx="$cur_tx"
+            prev_krx="$cur_krx"
+            prev_ktx="$cur_ktx"
             prev_ns="$cur_ns"
         fi
 
@@ -1492,20 +1703,31 @@ manage_service() {
         dl_total=$(format_traffic_size "$dl_bytes")
         ul_total=$(format_traffic_size "$ul_bytes")
         sum_total=$(format_traffic_size "$(( dl_bytes + ul_bytes ))")
-        dl_speed=$(format_speed_mbs "$dl_delta" "$elapsed_ns")
-        ul_speed=$(format_speed_mbs "$ul_delta" "$elapsed_ns")
+        dl_speed=$(format_live_speed "$dl_delta" "$elapsed_ns")
+        ul_speed=$(format_live_speed "$ul_delta" "$elapsed_ns")
 
-        local screen_buf=""
-        screen_buf+="${GREEN}============================================================${NC}\033[K\n"
-        screen_buf+="${CYAN}  PG Node SSH Tunnel Manager v${SCRIPT_VERSION}         [Live $(date '+%H:%M:%S')]${NC}\033[K\n"
-        screen_buf+="${GREEN}============================================================${NC}\033[K\n"
-        screen_buf+="${CYAN}=== Tunnel Traffic & Speed (Since: ${created_at}) ===${NC}\033[K\n"
-        screen_buf+=$(printf "  ${GREEN}Download Used${NC}      : %-12s |  ${GREEN}Download Speed${NC} : %s\033[K\n" "$dl_total" "$dl_speed")
-        screen_buf+=$(printf "  ${YELLOW}Upload Used${NC}        : %-12s |  ${YELLOW}Upload Speed${NC}   : %s\033[K\n" "$ul_total" "$ul_speed")
-        screen_buf+=$(printf "  ${CYAN}Total Traffic Used${NC} : %-12s\033[K\n" "$sum_total")
-        screen_buf+="------------------------------------------------------------\033[K\n"
+        local r_dl_spd="" r_ul_spd="" r_dl_tot="" r_ul_tot="" r_sum_tot=""
+        printf -v r_dl_spd  "  Download Speed     : %s%s%s%s" "$c_green" "$dl_speed" "$c_nc" "$clr_eol"
+        printf -v r_ul_spd  "  Upload Speed       : %s%s%s%s" "$c_yellow" "$ul_speed" "$c_nc" "$clr_eol"
+        printf -v r_dl_tot  "  Download Used      : %s%s%s%s" "$c_green" "$dl_total" "$c_nc" "$clr_eol"
+        printf -v r_ul_tot  "  Upload Used        : %s%s%s%s" "$c_yellow" "$ul_total" "$c_nc" "$clr_eol"
+        printf -v r_sum_tot "  Total Traffic Used : %s%s%s%s" "$c_cyan" "$sum_total" "$c_nc" "$clr_eol"
 
-        screen_buf+="${CYAN}=== System & Anti-DPI Status ===${NC}\033[K\n"
+        local frame=""
+        frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
+        frame+="${c_cyan}  PG Node SSH Tunnel Manager v${SCRIPT_VERSION}         [Live $(date '+%H:%M:%S')]${c_nc}${clr_eol}${nl}"
+        frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
+        frame+="${c_cyan}=== Live Tunnel Speed ===${c_nc}${clr_eol}${nl}"
+        frame+="${r_dl_spd}${nl}"
+        frame+="${r_ul_spd}${nl}"
+        frame+="------------------------------------------------------------${clr_eol}${nl}"
+        frame+="${c_cyan}=== Cumulative Traffic Usage (Since: ${created_at}) ===${c_nc}${clr_eol}${nl}"
+        frame+="${r_dl_tot}${nl}"
+        frame+="${r_ul_tot}${nl}"
+        frame+="${r_sum_tot}${nl}"
+        frame+="------------------------------------------------------------${clr_eol}${nl}"
+
+        frame+="${c_cyan}=== System & Anti-DPI Status ===${c_nc}${clr_eol}${nl}"
         if [[ -f "$TUNNEL_SERVICE" ]]; then
             local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
             [[ -f "$FOREIGN_CONF" ]] && source "$FOREIGN_CONF"
@@ -1526,32 +1748,32 @@ manage_service() {
             last_log=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
 
             if [[ "$active_state" == "active" ]]; then
-                screen_buf+="  Service State   : ${GREEN}${active_state} (${sub_state})${NC} since ${active_since:-N/A}\033[K\n"
+                frame+="  Service State      : ${c_green}${active_state} (${sub_state})${c_nc} since ${active_since:-N/A}${clr_eol}${nl}"
             else
-                screen_buf+="  Service State   : ${RED}${active_state} (${sub_state})${NC}\033[K\n"
+                frame+="  Service State      : ${c_red}${active_state} (${sub_state})${c_nc}${clr_eol}${nl}"
             fi
-            screen_buf+="  Process / RAM   : Main PID ${main_pid} | Memory: ${mem_mb}\033[K\n"
-            screen_buf+="  TLS 1.3 Target  : ${IR_IP:-N/A}:${SEC_SSH:-N/A} | SNI: ${TLS_SNI} [${auth_tag}]\033[K\n"
-            screen_buf+="  Active Bind IP  : ${GREEN}${active_ip}${NC} (Pool: ${BIND_IPS:-Default})\033[K\n"
-            screen_buf+="  Tunnel Ports    : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}\033[K\n"
-            [[ -n "$last_log" ]] && screen_buf+="  Latest Log      : ${last_log}\033[K\n"
+            frame+="  Process / RAM      : Main PID ${main_pid} | Memory: ${mem_mb}${clr_eol}${nl}"
+            frame+="  TLS 1.3 Target     : ${IR_IP:-N/A}:${SEC_SSH:-N/A} | SNI: ${TLS_SNI} [${auth_tag}]${clr_eol}${nl}"
+            frame+="  Active Bind IP     : ${c_green}${active_ip}${c_nc} (Pool: ${BIND_IPS:-Default})${clr_eol}${nl}"
+            frame+="  Tunnel Ports       : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}${clr_eol}${nl}"
+            [[ -n "$last_log" ]] && frame+="  Latest Log         : ${last_log}${clr_eol}${nl}"
         else
             local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com" TLS_SECRET=""
             [[ -f "$IRAN_CONF" ]] && source "$IRAN_CONF"
-            local tls_status="${RED}Inactive${NC}" cert_badge auth_mode="Legacy"
+            local tls_status="${c_red}Inactive${c_nc}" cert_badge auth_mode="Legacy"
             cert_badge=$(get_cert_badge)
             [[ -n "${TLS_SECRET:-}" ]] && auth_mode="Trojan-Auth+WebCamo"
             if systemctl is-active --quiet pg-tls-server.service 2>/dev/null; then
-                tls_status="${GREEN}Active on Port ${SEC_SSH} (${cert_badge}, ${auth_mode})${NC}"
+                tls_status="${c_green}Active on Port ${SEC_SSH} (${cert_badge}, ${auth_mode})${c_nc}"
             fi
-            screen_buf+="  TLS 1.3 Server  : ${tls_status}\033[K\n"
-            screen_buf+="  Cover Domain    : ${TLS_SNI:-N/A}\033[K\n"
+            frame+="  TLS 1.3 Server     : ${tls_status}${clr_eol}${nl}"
+            frame+="  Cover Domain       : ${TLS_SNI:-N/A}${clr_eol}${nl}"
 
             local ssh_ports tunnel_ports
             ssh_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
             tunnel_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
-            screen_buf+="  SSH / Tunnel Prt: SSH [${ssh_ports}] | Local [${tunnel_ports}]\033[K\n"
-            screen_buf+="  NAT OUTPUT Rules:\033[K\n"
+            frame+="  SSH / Tunnel Ports : SSH [${ssh_ports}] | Local [${tunnel_ports}]${clr_eol}${nl}"
+            frame+="  NAT OUTPUT Rules   :${clr_eol}${nl}"
             local nat_summary
             nat_summary=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
                 NR > 2 && NF >= 9 {
@@ -1560,32 +1782,39 @@ manage_service() {
                     print rule " (pkts:" $2 ", " $3 ")"
                 }' | head -n 6 || true)
             if [[ -n "$nat_summary" ]]; then
+                local nline
                 while IFS= read -r nline; do
-                    screen_buf+="${nline}\033[K\n"
+                    frame+="${nline}${clr_eol}${nl}"
                 done <<< "$nat_summary"
             else
-                screen_buf+="    (No active NAT OUTPUT rules)\033[K\n"
+                frame+="    (No active NAT OUTPUT rules)${clr_eol}${nl}"
             fi
         fi
 
-        screen_buf+="${CYAN}=== Smart Auto-Heal Cronjob ===${NC}\033[K\n"
+        frame+="${c_cyan}=== Smart Auto-Heal Cronjob ===${c_nc}${clr_eol}${nl}"
         if [[ -f "$CRON_FILE" ]]; then
             local cron_sched
             cron_sched=$(awk '{print $1" "$2" "$3" "$4" "$5}' "$CRON_FILE" 2>/dev/null || echo "Active")
-            screen_buf+="  Schedule : ${GREEN}Active (${cron_sched})${NC}\033[K\n"
+            frame+="  Schedule           : ${c_green}Active (${cron_sched})${c_nc}${clr_eol}${nl}"
         else
-            screen_buf+="  Schedule : ${YELLOW}Disabled${NC}\033[K\n"
+            frame+="  Schedule           : ${c_yellow}Disabled${c_nc}${clr_eol}${nl}"
         fi
-        screen_buf+="------------------------------------------------------------\033[K\n"
-        screen_buf+="${YELLOW}Updating every 1s... Press [Enter] or [q] to return to menu.${NC}\033[K\n"
-        screen_buf+="\033[J"
+        frame+="------------------------------------------------------------${clr_eol}${nl}"
+        frame+="${c_yellow}Updating every 1s... Press [Enter] or [q] to return to menu.${c_nc}${clr_eol}"
 
-        printf '\033[H%b' "$screen_buf"
+        printf '\033[H%s\033[J' "$frame"
 
-        local key=""
+        local key="" t_wait_start t_wait_end
+        t_wait_start=$(date +%s%N)
         if IFS= read -r -s -n 1 -t 1 key; then
-            if [[ -z "$key" || "$key" == "q" || "$key" == "Q" || "$key" == "0" ]]; then
+            if [[ -z "$key" || "$key" == $'\r' || "$key" == $'\n' || "$key" == "q" || "$key" == "Q" || "$key" == "0" ]]; then
+                read -r -s -t 0.02 -n 100 _ 2>/dev/null || true
                 break
+            fi
+        else
+            t_wait_end=$(date +%s%N)
+            if (( t_wait_end - t_wait_start < 200000000 )); then
+                sleep 1
             fi
         fi
     done
