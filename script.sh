@@ -28,7 +28,7 @@ CRON_FILE="/etc/cron.d/pg-tunnel-restart"
 ACCT_CRON_FILE="/etc/cron.d/pg-tunnel-acct"
 ACCT_SERVICE="/etc/systemd/system/pg-tunnel-acct.service"
 
-trap '[[ -t 1 ]] && printf "\033[?25h" || true' EXIT
+trap '[[ -t 1 ]] && printf "\033[?25h\033[?1049l" || true' EXIT
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -488,11 +488,12 @@ manage_service() {
     local c_cyan="${esc}[0;36m"
     local c_nc="${esc}[0m"
 
-    printf '\033[2J\033[H\033[?25l'
+    printf '\033[?1049h\033[2J\033[H\033[?25l'
 
     while [[ "$stop_live" -eq 0 ]]; do
-        local now_ns cur_rx=0 cur_tx=0 total_bytes=0 delta_ns=1000000000 delta_rx=0 delta_tx=0
+        local now_ns live_clock cur_rx=0 cur_tx=0 total_bytes=0 delta_ns=1000000000 delta_rx=0 delta_tx=0
         now_ns=$(date +%s%N)
+        live_clock=$(date '+%H:%M:%S')
         delta_ns=$(( now_ns - prev_ns ))
         if (( delta_ns <= 0 )); then
             delta_ns=1
@@ -527,41 +528,108 @@ manage_service() {
 
         local cron_info
         if [[ -f "$CRON_FILE" ]]; then
-            cron_info="${c_green}Active Cron Schedule:${c_nc} $(cat "$CRON_FILE")"
+            local cron_sched
+            cron_sched=$(awk '{print $1,$2,$3,$4,$5}' "$CRON_FILE" 2>/dev/null || echo "enabled")
+            cron_info="  Schedule : ${c_green}Active (${cron_sched})${c_nc}"
         else
-            cron_info="${c_yellow}Auto-Restart Cronjob is currently disabled.${c_nc}"
+            cron_info="  Schedule : ${c_yellow}Disabled${c_nc}"
         fi
 
         local sys_details=""
         if [[ -f /etc/systemd/system/reverse-tunnel.service ]]; then
-            sys_details+="${c_yellow}Foreign Reverse Tunnel Service Status:${c_nc}${nl}"
-            sys_details+="$(systemctl status reverse-tunnel --no-pager -l 2>&1 || true)"
+            local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS=""
+            if [[ -f "$FOREIGN_CONF" ]]; then
+                source "$FOREIGN_CONF"
+            fi
+            local svc_props active_st="unknown" sub_st="" main_pid="0" mem_bytes="" since_ts=""
+            svc_props=$(systemctl show reverse-tunnel.service --no-page -p ActiveState,SubState,MainPID,MemoryCurrent,ActiveEnterTimestamp 2>/dev/null || true)
+            while IFS='=' read -r k v; do
+                case "$k" in
+                    ActiveState) active_st="$v" ;;
+                    SubState) sub_st="$v" ;;
+                    MainPID) main_pid="$v" ;;
+                    MemoryCurrent) mem_bytes="$v" ;;
+                    ActiveEnterTimestamp) since_ts="$v" ;;
+                esac
+            done <<< "$svc_props"
+
+            local mem_str st_color="$c_red"
+            if [[ "$active_st" == "active" ]]; then
+                st_color="$c_green"
+            elif [[ "$active_st" == "activating" ]]; then
+                st_color="$c_yellow"
+            fi
+            mem_str=$(awk -v m="${mem_bytes:-}" 'BEGIN {
+                if (m ~ /^[0-9]+$/ && (m + 0.0) < 1099511627776.0) printf "%.1f MB", (m + 0.0) / 1048576.0
+                else printf "N/A"
+            }')
+            local last_log
+            last_log=$(journalctl -u reverse-tunnel.service -n 1 --no-pager -o cat 2>/dev/null || true)
+            last_log="${last_log:-No recent log entries}"
+            last_log="${last_log:0:54}"
+
+            sys_details+="  Service State   : ${st_color}${active_st} (${sub_st})${c_nc}${since_ts:+ since ${since_ts:0:27}}${nl}"
+            sys_details+="  Process / RAM   : Main PID ${main_pid} | Memory: ${mem_str}${nl}"
+            sys_details+="  Tunnel Target   : root@${IR_IP:-N/A} (SSH Port: ${SEC_SSH:-N/A})${nl}"
+            sys_details+="  Forwarded Ports : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}"
+            sys_details="${sys_details:0:500}${nl}  Latest Log      : ${last_log}"
+
         elif [[ -f "$IRAN_CONF" ]]; then
-            sys_details+="${c_yellow}Iran iptables NAT Rules (OUTPUT):${c_nc}${nl}"
-            sys_details+="$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>&1 || true)${nl}${nl}"
-            sys_details+="${c_yellow}SSH Listening Ports:${c_nc}${nl}"
-            sys_details+="$(ss -tlnp 2>/dev/null | grep ssh || true)"
+            local ss_raw pub_ssh_ports tun_local_ports nat_compact
+            ss_raw=$(ss -tlnp4 2>/dev/null || ss -tlnp 2>/dev/null || true)
+            pub_ssh_ports=$(awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {
+                n = split($4, a, ":"); p = a[n]
+                if (!seen[p]++) out = (out == "" ? p : out ", " p)
+            } END { print (out == "" ? "None" : out) }' <<< "$ss_raw")
+            tun_local_ports=$(awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {
+                n = split($4, a, ":"); p = a[n]
+                if (!seen[p]++) out = (out == "" ? p : out ", " p)
+            } END { print out }' <<< "$ss_raw")
+
+            if [[ -n "$tun_local_ports" ]]; then
+                tun_local_ports="${c_green}${tun_local_ports:0:52}${c_nc}"
+            else
+                tun_local_ports="${c_red}None (Tunnel Not Connected)${c_nc}"
+            fi
+
+            nat_compact=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
+                NR > 2 && NF >= 9 && count < 6 {
+                    count++
+                    num = $1; pkts = $2; bytes = $3; tgt = $4
+                    dst = ($6 == "--" && NF >= 10) ? $10 : $9
+                    dpt = ""; rpt = ""
+                    for (i = 9; i <= NF; i++) {
+                        if ($i ~ /^dpt:/) { sub(/^dpt:/, "", $i); dpt = ":" $i }
+                        if ($i == "ports" && (i + 1) <= NF) { rpt = " => :" $(i + 1) }
+                    }
+                    printf "    #%s %-8s -> %s%s%s (pkts:%s, %s)\n", num, tgt, dst, dpt, rpt, pkts, bytes
+                }' || true)
+            nat_compact="${nat_compact:-    No rules in nat OUTPUT chain}"
+
+            sys_details+="  SSH Public Ports : ${c_green}${pub_ssh_ports}${c_nc}${nl}"
+            sys_details+="  Tunnel Ports     : ${tun_local_ports}${nl}"
+            sys_details+="  NAT OUTPUT Rules :${nl}${nat_compact}"
         else
-            sys_details+="${c_yellow}No tunnel configuration detected on this server yet.${c_nc}"
+            sys_details+="  ${c_yellow}No tunnel configuration detected on this server yet.${c_nc}"
         fi
 
         local frame=""
         frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
-        frame+="${c_cyan}       PG Node SSH Tunnel Manager v6.3${c_nc}${clr_eol}${nl}"
+        frame+="$(printf "  ${c_cyan}PG Node SSH Tunnel Manager v%s${c_nc}         ${c_yellow}[Live %s]${c_nc}" "$SCRIPT_VERSION" "$live_clock")${clr_eol}${nl}"
         frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
-        frame+="${c_cyan}=== Tunnel Traffic & Live Speed (Since: ${created_at}) ===${c_nc}${clr_eol}${nl}"
-        frame+=$(printf "  Download Used      : ${c_green}%-12s${c_nc} |  Live Download Speed : ${c_cyan}%s${c_nc}${clr_eol}" "$dl_used" "$dl_speed")$'\n'
-        frame+=$(printf "  Upload Used        : ${c_green}%-12s${c_nc} |  Live Upload Speed   : ${c_cyan}%s${c_nc}${clr_eol}" "$ul_used" "$ul_speed")$'\n'
+        frame+="${c_cyan}=== Tunnel Traffic & Speed (Since: ${created_at}) ===${c_nc}${clr_eol}${nl}"
+        frame+=$(printf "  Download Used      : ${c_green}%-12s${c_nc} |  Download Speed : ${c_cyan}%s${c_nc}${clr_eol}" "$dl_used" "$dl_speed")$'\n'
+        frame+=$(printf "  Upload Used        : ${c_green}%-12s${c_nc} |  Upload Speed   : ${c_cyan}%s${c_nc}${clr_eol}" "$ul_used" "$ul_speed")$'\n'
         frame+=$(printf "  Total Traffic Used : ${c_yellow}%s${c_nc}${clr_eol}" "$total_used")$'\n'
         frame+="------------------------------------------------------------${clr_eol}${nl}"
-        frame+="${c_cyan}=== System Status ===${c_nc}${clr_eol}${nl}"
+        frame+="${c_cyan}=== System & Rules Status ===${c_nc}${clr_eol}${nl}"
         while IFS= read -r line; do
             frame+="${line}${clr_eol}${nl}"
         done <<< "$sys_details"
-        frame+="${clr_eol}${nl}${c_cyan}=== Auto-Restart Cronjob Status ===${c_nc}${clr_eol}${nl}"
+        frame+="${c_cyan}=== Auto-Restart Cronjob ===${c_nc}${clr_eol}${nl}"
         frame+="${cron_info}${clr_eol}${nl}"
         frame+="------------------------------------------------------------${clr_eol}${nl}"
-        frame+="${c_yellow}Live updating every 1s... Press [Enter] or [q] to return to menu.${c_nc}${clr_eol}${nl}"
+        frame+="${c_yellow}Updating every 1s... Press [Enter] or [q] to return to menu.${c_nc}${clr_eol}"
 
         printf '\033[H%s\033[J' "$frame"
 
@@ -575,7 +643,7 @@ manage_service() {
     done
 
     trap - INT
-    printf '\033[?25h'
+    printf '\033[?25h\033[?1049l'
 }
 
 uninstall_all() {
