@@ -243,7 +243,19 @@ EOF
     fi
 }
 
+fix_legacy_unit_file() {
+    local unit_file="/etc/systemd/system/reverse-tunnel.service"
+    if [[ -f "$unit_file" ]] && grep -q '^StartLimitIntervalSec=' "$unit_file"; then
+        if ! awk '/^\[Unit\]/{u=1; next} /^\[/{u=0} u && /^StartLimitIntervalSec=/{found=1} END{exit !found}' "$unit_file"; then
+            sed -i '/^StartLimitIntervalSec=/d' "$unit_file"
+            sed -i '/^\[Unit\]/a StartLimitIntervalSec=0' "$unit_file"
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+}
+
 bootstrap_existing_accounting() {
+    fix_legacy_unit_file
     if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
         setup_accounting_persistence 2>/dev/null || true
     fi
@@ -425,13 +437,13 @@ apply_foreign_configs() {
 Description=Reverse SSH Tunnel to Iran Server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${SSH_CMD}
 Restart=always
 RestartSec=8
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
