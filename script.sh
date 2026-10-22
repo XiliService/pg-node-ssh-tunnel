@@ -1,17 +1,20 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.0
+# PG Node SSH Tunnel Manager v7.1
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
 # v7.0: WebSocket-101 Camouflage + Record Morphing + Parallel Multi-Channel
 #       + HW AES-GCM + End-to-End Watchdog + Port-22 Brute-Force Shield
+# v7.1: Latency-Aware IP Selection + Bufferbloat Tuning (notsent_lowat + RPS)
+#       + TOFU Host-Key Pinning + Unprivileged Sandboxed TLS Wrapper
+#       + Zero-Downtime Secret Rotation + Per-IP Accounting + Backup/Restore
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.0"
+SCRIPT_VERSION="7.1"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -43,6 +46,9 @@ WATCHDOG_SH="${CONF_DIR}/watchdog.sh"
 WATCHDOG_SERVICE="/etc/systemd/system/pg-tunnel-watchdog.service"
 WATCHDOG_STATE="${CONF_DIR}/watchdog.state"
 SSHBF_DISABLED_FILE="${CONF_DIR}/sshbf.disabled"
+KNOWN_HOSTS_FILE="${CONF_DIR}/known_hosts"
+PEER_IPS_FILE="${CONF_DIR}/peer_ips"
+NET_TUNE_SERVICE="/etc/systemd/system/pg-tunnel-net-tune.service"
 SSH_CIPHERS="aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
 
 check_root() {
@@ -279,6 +285,8 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 def load_runtime_conf():
     cfg = {
         "TLS_SECRET": "",
+        "TLS_SECRET_OLD": "",
+        "TLS_SECRET_OLD_UNTIL": "0",
         "NODE_PORT": "62075",
         "DATA_PORTS": "",
         "FALLBACK_PORT": "80",
@@ -302,7 +310,14 @@ def load_runtime_conf():
             if p not in (22, LPORT) and p not in ports:
                 ports.append(p)
     fb = int(cfg["FALLBACK_PORT"]) if cfg.get("FALLBACK_PORT", "").isdigit() else 80
-    return cfg.get("TLS_SECRET", ""), ports, fb, cfg.get("CERT_SRC", ""), cfg.get("KEY_SRC", "")
+    secret_old = cfg.get("TLS_SECRET_OLD", "")
+    try:
+        old_until = int(cfg.get("TLS_SECRET_OLD_UNTIL", "0"))
+    except ValueError:
+        old_until = 0
+    if not secret_old or (old_until and time.time() >= old_until):
+        secret_old = ""
+    return cfg.get("TLS_SECRET", ""), secret_old, ports, fb, cfg.get("CERT_SRC", ""), cfg.get("KEY_SRC", "")
 
 def release_zombie_ports(ports):
     if not ports:
@@ -449,7 +464,7 @@ async def serve_fallback(cr, cw, initial_buf, fb_port):
 
 async def handle(cr, cw):
     tune_socket(cw.get_extra_info("socket"))
-    secret, cleanup_ports, fb_port, _, _ = load_runtime_conf()
+    secret, secret_old, cleanup_ports, fb_port, _, _ = load_runtime_conf()
     buf = bytearray()
     authed = False
     role = "tunnel"
@@ -487,6 +502,8 @@ async def handle(cr, cw):
                         elif kl == "sec-websocket-key":
                             ws_key = v.strip()
                 if secret and hmac.compare_digest(got_auth, secret):
+                    authed = True
+                elif secret_old and hmac.compare_digest(got_auth, secret_old):
                     authed = True
                 elif not secret and got_auth == "":
                     authed = True
@@ -582,7 +599,7 @@ async def cert_reloader(ctx):
     last_mtime = 0.0
     while True:
         try:
-            _, _, _, cert_src, key_src = load_runtime_conf()
+            _, _, _, _, cert_src, key_src = load_runtime_conf()
             if cert_src and key_src and os.path.isfile(cert_src) and os.path.isfile(key_src):
                 mt = max(os.path.getmtime(cert_src), os.path.getmtime(key_src))
                 if last_mtime == 0.0:
@@ -660,22 +677,65 @@ ROLE = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "tunnel"
 PREFER = (sys.argv[7] if len(sys.argv) > 7 else "").strip()
 OWN_PORT = (sys.argv[8] if len(sys.argv) > 8 else "").strip()
 
-bips = []
-
-def _add_bip(x):
+pool = []
+for x in RAW_BIPS.split(","):
     x = x.strip()
-    if x and x not in bips:
-        bips.append(x)
+    if x and x not in pool:
+        pool.append(x)
 
-_add_bip(PREFER)
+last_good = ""
 try:
     with open(LAST_IP_FILE, "r", encoding="utf-8") as lf:
-        _add_bip(lf.read().strip())
+        _lg = lf.read().strip()
+        if _lg and _lg in pool:
+            last_good = _lg
 except Exception:
     pass
-for x in RAW_BIPS.split(","):
-    _add_bip(x)
-bips.append("")
+
+def probe_latency(bip, timeout=2.5):
+    # Quick TCP-only latency probe used to rank failover candidates.
+    # Runs only when the preferred source IP is not set or has failed,
+    # so healthy connections pay zero extra cost.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        if bip:
+            s.bind((bip, 0))
+        t0 = time.monotonic()
+        s.connect((HOST, PORT))
+        return time.monotonic() - t0
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+attempts = []
+if PREFER:
+    attempts.append(PREFER)
+
+rest = [b for b in ([last_good] + pool) if b and b not in attempts]
+if len(rest) > 1:
+    scored = []
+    for b in rest:
+        lat = probe_latency(b)
+        if lat is not None:
+            scored.append((lat, b))
+    if scored:
+        scored.sort(key=lambda x: x[0])
+        # Hysteresis: stick to last_good unless the best candidate is
+        # meaningfully faster (>= 20% lower connect latency).
+        if not PREFER and last_good:
+            lg_idx = next((i for i, (l, b) in enumerate(scored) if b == last_good), None)
+            if lg_idx is not None:
+                best_lat, best_bip = scored[0]
+                if best_bip != last_good and best_lat > scored[lg_idx][0] * 0.8:
+                    scored.insert(0, scored.pop(lg_idx))
+        rest = [b for _, b in scored]
+attempts.extend(rest)
+attempts.append("")
 
 def establish_connection(bip):
     deadline = time.monotonic() + 7.0
@@ -821,7 +881,7 @@ def establish_connection(bip):
 raw = None
 err = None
 chosen_bip = ""
-for bip in bips:
+for bip in attempts:
     try:
         raw, sslobj, in_bio, out_bio, plain_out = establish_connection(bip)
         chosen_bip = bip
@@ -830,7 +890,7 @@ for bip in bips:
         err = e
 
 if raw is None:
-    sys.stderr.write(f"TLS tunnel connect failed across {bips}: {err}\n")
+    sys.stderr.write(f"TLS tunnel connect failed across {attempts}: {err}\n")
     sys.exit(1)
 
 if chosen_bip:
@@ -1157,6 +1217,171 @@ brute_force_shield_menu() {
     read -p "Press Enter to return to menu..."
 }
 
+ensure_network_tuning() {
+    # Best-effort hot re-apply of critical tunnel tuning (BBR + fq +
+    # bufferbloat limit + RPS). Called by cron auto-heal and the boot
+    # oneshot unit so a provider reset or module reload never silently
+    # degrades the tunnel.
+    modprobe tcp_bbr 2>/dev/null || true
+    local cur
+    cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    [[ "$cur" == "bbr" ]] || sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    cur=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    [[ "$cur" == "fq" ]] || sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    cur=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)
+    [[ "$cur" == "131072" ]] || sysctl -w net.ipv4.tcp_notsent_lowat=131072 >/dev/null 2>&1 || true
+    local q
+    for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
+        [[ -w "$q" ]] || continue
+        if [[ "$(cat "$q" 2>/dev/null || true)" == "00000000" ]]; then
+            echo ffffffff > "$q" 2>/dev/null || true
+        fi
+    done
+    return 0
+}
+
+rotate_tls_secret() {
+    print_header
+    echo -e "${CYAN}=== Rotate TLS Secret (Zero Downtime) ===${NC}"
+    echo
+    if [[ ! -f "$IRAN_CONF" ]]; then
+        echo -e "${RED}[ERROR] This option must be used on the IRAN server (iran.conf not found).${NC}"
+        read -p "Press Enter to return to menu..."
+        return
+    fi
+    local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET="" FALLBACK_PORT="80" CERT_SRC="" KEY_SRC="" TLS_SECRET_OLD="" TLS_SECRET_OLD_UNTIL=""
+    source "$IRAN_CONF"
+    echo "  Current Secret : ${TLS_SECRET:-<none>}"
+    if [[ -n "${TLS_SECRET_OLD:-}" ]]; then
+        echo "  Rotation State : old secret still accepted (window active)"
+    fi
+    echo
+    echo "  1) Rotate Now    (new secret active immediately; old stays valid 24h)"
+    echo "  2) Finalize      (drop old secret now, after Foreign server updated)"
+    echo "  0) Back to Menu"
+    echo -e "------------------------------------------------------------"
+    read -p "Select option [0-2]: " rot_choice
+    case "$rot_choice" in
+        1)
+            local new_secret=""
+            read -p "New secret [Enter = auto-generate]: " custom
+            custom=$(echo "$custom" | xargs)
+            if [[ -n "$custom" ]]; then
+                new_secret="$custom"
+            else
+                new_secret=$(generate_secret)
+            fi
+            if [[ -z "$new_secret" ]]; then
+                echo -e "${RED}[ERROR] Could not build a new secret.${NC}"
+                sleep 1
+                return
+            fi
+            local until_epoch=$(( $(date +%s) + 86400 ))
+            cat > "$IRAN_CONF" <<EOF
+OUT_IP=${OUT_IP}
+NODE_PORT=${NODE_PORT:-62075}
+DATA_PORTS=${DATA_PORTS}
+SEC_SSH=${SEC_SSH}
+TLS_SNI=${TLS_SNI}
+TLS_SECRET=${new_secret}
+TLS_SECRET_OLD=${TLS_SECRET}
+TLS_SECRET_OLD_UNTIL=${until_epoch}
+FALLBACK_PORT=${FALLBACK_PORT:-80}
+CERT_SRC=${CERT_SRC}
+KEY_SRC=${KEY_SRC}
+EOF
+            chown root:pg-tunnel "$IRAN_CONF" 2>/dev/null || true
+            chmod 640 "$IRAN_CONF" 2>/dev/null || true
+            echo
+            echo -e "${GREEN}[OK] Rotation active (no restart needed; new connections use the new key).${NC}"
+            echo -e "Now run ${CYAN}Install (Option 1 -> 2)${NC} on the FOREIGN server and paste this new secret:"
+            echo -e "  ${YELLOW}${new_secret}${NC}"
+            echo "After the Foreign server is updated, run Option 10 -> 2 here to drop the old key."
+            ;;
+        2)
+            if [[ -z "${TLS_SECRET_OLD:-}" ]]; then
+                echo -e "${YELLOW}No rotation in progress (old secret not set).${NC}"
+            else
+                cat > "$IRAN_CONF" <<EOF
+OUT_IP=${OUT_IP}
+NODE_PORT=${NODE_PORT:-62075}
+DATA_PORTS=${DATA_PORTS}
+SEC_SSH=${SEC_SSH}
+TLS_SNI=${TLS_SNI}
+TLS_SECRET=${TLS_SECRET}
+FALLBACK_PORT=${FALLBACK_PORT:-80}
+CERT_SRC=${CERT_SRC}
+KEY_SRC=${KEY_SRC}
+EOF
+                chown root:pg-tunnel "$IRAN_CONF" 2>/dev/null || true
+                chmod 640 "$IRAN_CONF" 2>/dev/null || true
+                echo -e "${GREEN}[OK] Old secret dropped. Only the current secret is accepted now.${NC}"
+            fi
+            ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; return ;;
+    esac
+    read -p "Press Enter to return to menu..."
+}
+
+backup_restore_menu() {
+    print_header
+    echo -e "${CYAN}=== Backup / Restore Configuration ===${NC}"
+    echo
+    echo "  1) Create Backup Now  (configs + services + cron -> /root/pg-tunnel-backup-<ts>.tar.gz)"
+    echo "  2) Restore From Backup File"
+    echo "  0) Back to Menu"
+    echo -e "------------------------------------------------------------"
+    read -p "Select option [0-2]: " br_choice
+    case "$br_choice" in
+        1)
+            local ts out f items=()
+            ts=$(date '+%Y%m%d-%H%M%S')
+            out="/root/pg-tunnel-backup-${ts}.tar.gz"
+            items=("etc/pg-tunnel")
+            for f in "$MGMT_SERVICE" "$TLS_SERVER_SERVICE" "$WATCHDOG_SERVICE" "$NET_TUNE_SERVICE" "$CRON_FILE" "$TUNNEL_SERVICE"; do
+                [[ -f "$f" ]] && items+=("${f#/}")
+            done
+            for f in $DATA_SERVICE_GLOB; do
+                [[ -f "$f" ]] && items+=("${f#/}")
+            done
+            if tar czf "$out" -C / "${items[@]}"; then
+                chmod 600 "$out" 2>/dev/null || true
+                echo
+                echo -e "${GREEN}[OK] Backup created: ${out}${NC}"
+                echo -e "${YELLOW}Note: SSH keys (/root/.ssh) are intentionally not included.${NC}"
+            else
+                echo -e "${RED}[ERROR] Backup failed.${NC}"
+            fi
+            ;;
+        2)
+            local bfile bad
+            read -p "Path to backup file: " bfile
+            bfile=$(echo "$bfile" | xargs)
+            if [[ ! -f "$bfile" ]]; then
+                echo -e "${RED}[ERROR] File not found: ${bfile}${NC}"
+                sleep 1
+                return
+            fi
+            bad=$(tar tzf "$bfile" 2>/dev/null | grep -vE '^etc/(pg-tunnel(/.*)?|systemd/system/(pg-tunnel-[a-z0-9-]+|reverse-tunnel|pg-tls-server)\.service|cron\.d/pg-tunnel-restart)$' || true)
+            if [[ -n "$bad" ]]; then
+                echo -e "${RED}[ERROR] Backup contains unexpected paths - aborted for safety:${NC}"
+                echo "$bad" | head -5
+                sleep 1
+                return
+            fi
+            tar xzf "$bfile" -C /
+            systemctl daemon-reload 2>/dev/null || true
+            echo
+            echo -e "${GREEN}[OK] Configuration restored.${NC}"
+            echo -e "${YELLOW}Now run Option 7 (Repair / Restart) to bring the tunnels back up.${NC}"
+            ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid option.${NC}"; sleep 1; return ;;
+    esac
+    read -p "Press Enter to return to menu..."
+}
+
 get_boot_id() {
     if [[ -r /proc/sys/kernel/random/boot_id ]]; then
         cat /proc/sys/kernel/random/boot_id
@@ -1218,51 +1443,141 @@ ensure_accounting_rules() {
     command -v iptables >/dev/null 2>&1 || return 0
 
     if [[ -f "$IRAN_CONF" ]]; then
-        local OUT_IP="" NODE_PORT="" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+        local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
         source "$IRAN_CONF"
         [[ -n "${SEC_SSH:-}" ]] || return 0
 
         iptables -t mangle -N PG_TUNNEL_IN 2>/dev/null || true
         iptables -t mangle -N PG_TUNNEL_OUT 2>/dev/null || true
-
         iptables -t mangle -C INPUT -j PG_TUNNEL_IN 2>/dev/null || \
             iptables -t mangle -I INPUT 1 -j PG_TUNNEL_IN
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        if ! iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null; then
+        # Discover live TLS peer IPs (one per parallel channel / bind IP)
+        local live_peers=() p stored=() s merged=() dup
+        while read -r p; do
+            [[ "$p" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            live_peers+=("$p")
+        done < <(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {sub(/:[0-9]+$/, "", $4); if ($4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $4}' | sort -u)
+        if [[ -f "$PEER_IPS_FILE" ]]; then
+            while read -r s; do
+                [[ "$s" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                stored+=("$s")
+            done < "$PEER_IPS_FILE"
+        fi
+        for p in ${live_peers[@]+"${live_peers[@]}"} ${stored[@]+"${stored[@]}"}; do
+            dup=0
+            for s in ${merged[@]+"${merged[@]}"}; do
+                [[ "$s" == "$p" ]] && dup=1
+            done
+            (( dup == 0 )) && merged+=("$p")
+            (( ${#merged[@]} >= 8 )) && break
+        done
+        if (( ${#merged[@]} > 0 )); then
+            mkdir -p "$CONF_DIR"
+            printf '%s\n' "${merged[@]}" > "${PEER_IPS_FILE}.tmp.$$"
+            mv -f "${PEER_IPS_FILE}.tmp.$$" "$PEER_IPS_FILE"
+        fi
+
+        # Per-peer rules first (first-match counters), catch-all last.
+        # Rebuild only when the desired rule set differs (stale/duplicate safe).
+        local want_n=$(( ${#merged[@]} + 1 )) have_n rebuild=0
+        have_n=$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | grep -c '^-A ' || true)
+        if [[ "$have_n" != "$want_n" ]]; then
+            rebuild=1
+        else
+            for p in ${merged[@]+"${merged[@]}"}; do
+                iptables -t mangle -C PG_TUNNEL_IN -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+            done
+            iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+        fi
+        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
+            for p in ${merged[@]+"${merged[@]}"}; do
+                iptables -t mangle -A PG_TUNNEL_IN -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN
+            done
             iptables -t mangle -A PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN
         fi
-        if ! iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null; then
+
+        rebuild=0
+        have_n=$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | grep -c '^-A ' || true)
+        if [[ "$have_n" != "$want_n" ]]; then
+            rebuild=1
+        else
+            for p in ${merged[@]+"${merged[@]}"}; do
+                iptables -t mangle -C PG_TUNNEL_OUT -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+            done
+            iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+        fi
+        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
+            for p in ${merged[@]+"${merged[@]}"}; do
+                iptables -t mangle -A PG_TUNNEL_OUT -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN
+            done
             iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
         fi
 
     elif [[ -f "$FOREIGN_CONF" ]]; then
-        local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="" BIND_IPS="" TLS_SECRET=""
+        local IR_IP="" SEC_SSH="" NODE_PORT="62075" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
         source "$FOREIGN_CONF"
         [[ -n "${IR_IP:-}" && -n "${SEC_SSH:-}" ]] || return 0
 
         iptables -t mangle -N PG_TUNNEL_IN 2>/dev/null || true
         iptables -t mangle -N PG_TUNNEL_OUT 2>/dev/null || true
-
         iptables -t mangle -C INPUT -j PG_TUNNEL_IN 2>/dev/null || \
             iptables -t mangle -I INPUT 1 -j PG_TUNNEL_IN
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        if ! iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
-           [[ "$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | wc -l)" != "1" ]]; then
+        local bips_list=() b
+        for b in ${BIND_IPS//,/ }; do
+            b=$(echo "$b" | xargs)
+            [[ "$b" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            local seen=0
+            for s in ${bips_list[@]+"${bips_list[@]}"}; do
+                [[ "$s" == "$b" ]] && seen=1
+            done
+            (( seen == 0 )) && bips_list+=("$b")
+        done
+
+        local want_n=$(( ${#bips_list[@]} + 1 )) have_n rebuild=0
+        have_n=$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | grep -c '^-A ' || true)
+        if [[ "$have_n" != "$want_n" ]]; then
+            rebuild=1
+        else
+            for b in ${bips_list[@]+"${bips_list[@]}"}; do
+                iptables -t mangle -C PG_TUNNEL_IN -d "$b" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+            done
+            iptables -t mangle -C PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+        fi
+        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
+            for b in ${bips_list[@]+"${bips_list[@]}"}; do
+                iptables -t mangle -A PG_TUNNEL_IN -d "$b" -p tcp --sport "$SEC_SSH" -j RETURN
+            done
             iptables -t mangle -A PG_TUNNEL_IN -s "$IR_IP" -p tcp --sport "$SEC_SSH" -j RETURN
         fi
-        if ! iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
-           [[ "$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | wc -l)" != "1" ]]; then
+
+        rebuild=0
+        have_n=$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | grep -c '^-A ' || true)
+        if [[ "$have_n" != "$want_n" ]]; then
+            rebuild=1
+        else
+            for b in ${bips_list[@]+"${bips_list[@]}"}; do
+                iptables -t mangle -C PG_TUNNEL_OUT -s "$b" -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+            done
+            iptables -t mangle -C PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
+        fi
+        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
+            for b in ${bips_list[@]+"${bips_list[@]}"}; do
+                iptables -t mangle -A PG_TUNNEL_OUT -s "$b" -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN
+            done
             iptables -t mangle -A PG_TUNNEL_OUT -d "$IR_IP" -p tcp --dport "$SEC_SSH" -j RETURN
         fi
     fi
+
 }
 
 cleanup_accounting_rules() {
@@ -1473,9 +1788,21 @@ bootstrap_existing_accounting() {
 
 handle_cli_subcommands() {
     case "${1:-}" in
+        ensure-tuning)
+            check_root
+            ensure_network_tuning >/dev/null 2>&1 || true
+            exit 0
+            ;;
+        reset-hostkey)
+            check_root
+            rm -f "$KNOWN_HOSTS_FILE"
+            echo "[OK] Pinned SSH host keys cleared. They will be re-pinned on the next connection."
+            exit 0
+            ;;
         cron-auto-repair)
             check_root
             sync_traffic_state >/dev/null 2>&1 || true
+            ensure_network_tuning >/dev/null 2>&1 || true
             if [[ -f "$IRAN_CONF" ]]; then
                 local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
                 source "$IRAN_CONF"
@@ -1728,6 +2055,15 @@ apply_iran_configs() {
         fi
     fi
 
+    echo -e "${YELLOW}Hardening TLS wrapper (dedicated unprivileged user + systemd sandbox)...${NC}"
+    if ! id -u pg-tunnel >/dev/null 2>&1; then
+        useradd -r -s /usr/sbin/nologin -d /nonexistent pg-tunnel 2>/dev/null || true
+    fi
+    chown pg-tunnel:pg-tunnel "$TLS_CERT" "$TLS_KEY" 2>/dev/null || true
+    chmod 600 "$TLS_KEY" 2>/dev/null || true
+    chown root:pg-tunnel "$IRAN_CONF" 2>/dev/null || true
+    chmod 640 "$IRAN_CONF" 2>/dev/null || true
+
     cat > "$TLS_SERVER_SERVICE" <<EOF
 [Unit]
 Description=PG Tunnel Trojan-Style TLS 1.3 Anti-DPI Server
@@ -1736,9 +2072,19 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+User=pg-tunnel
+Group=pg-tunnel
 ExecStart=/usr/bin/python3 ${TLS_SERVER_PY} ${TLS_CERT} ${TLS_KEY} ${SEC_SSH} 22
 Restart=always
 RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/pg-tunnel
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 
 [Install]
 WantedBy=multi-user.target
@@ -1942,7 +2288,7 @@ EOF
     fi
 
     local proxy_opt="ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' probe"
-    if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$IR_IP" "true" >/dev/null 2>&1; then
+    if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} root@"$IR_IP" "true" >/dev/null 2>&1; then
         echo -e "${GREEN}[OK] SSH public key already verified over TLS 1.3 + Secret!${NC}"
     else
         local key_ok=0 attempt=0
@@ -1950,8 +2296,8 @@ EOF
             echo -e "${CYAN}Enter Iran Server root password once to authorize SSH key over TLS 1.3 (attempt ${attempt}/3):${NC}"
             if ssh-copy-id -i /root/.ssh/tunnel_key.pub \
                 -o "$proxy_opt" \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
+                -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} \
                 -o ConnectTimeout=20 \
                 root@"$IR_IP"; then
                 key_ok=1
@@ -2008,9 +2354,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -R ${NODE_PORT}:127.0.0.1:${NODE_PORT} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} mgmt '' ${NODE_PORT}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no -c ${SSH_CIPHERS}
+ExecStart=/usr/bin/ssh -R ${NODE_PORT}:127.0.0.1:${NODE_PORT} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} mgmt '' ${NODE_PORT}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -o Compression=no -c ${SSH_CIPHERS}
 Restart=always
 RestartSec=3
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -2035,9 +2384,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ssh -R ${port}:127.0.0.1:${port} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} data '${prefer}' ${port}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no -c ${SSH_CIPHERS}
+ExecStart=/usr/bin/ssh -R ${port}:127.0.0.1:${port} root@${IR_IP} -N -i /root/.ssh/tunnel_key -o "ProxyCommand=${proxy_base} data '${prefer}' ${port}" -o ConnectTimeout=15 -o TCPKeepAlive=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -o Compression=no -c ${SSH_CIPHERS}
 Restart=always
 RestartSec=3
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -2213,6 +2565,15 @@ manage_service() {
             frame+="  TLS 1.3 Target     : ${IR_IP:-N/A}:${SEC_SSH:-N/A} | SNI: ${TLS_SNI} [${auth_tag}]${clr_eol}${nl}"
             frame+="  Bind IP Pool       : ${BIND_IPS:-Default} (Last Good: ${active_ip})${clr_eol}${nl}"
             frame+="  Tunnel Ports       : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}${clr_eol}${nl}"
+            local kcc kqd knl
+            kcc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+            kqd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+            knl=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
+            if [[ "$kcc" == "bbr" && "$kqd" == "fq" ]]; then
+                frame+="  Kernel Tuning      : ${c_green}${kcc} / ${kqd} / notsent_lowat=${knl}${c_nc}${clr_eol}${nl}"
+            else
+                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 5)${c_nc}${clr_eol}${nl}"
+            fi
             frame+="  --- Parallel Channels ---${clr_eol}${nl}"
             if [[ -f "$MGMT_SERVICE" ]]; then
                 ch_state=$(systemctl is-active pg-tunnel-mgmt 2>/dev/null || true)
@@ -2242,6 +2603,15 @@ manage_service() {
                 else
                     frame+="  Channel legacy     : ${c_red}${ch_state}${c_nc} (single-tunnel, pre-v7)${clr_eol}${nl}"
                 fi
+            fi
+            local ip_pairs ip_ip ip_bytes
+            ip_pairs=$(iptables -t mangle -L PG_TUNNEL_OUT -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8, $2}' | sort -k2 -rn | head -4 || true)
+            if [[ -n "$ip_pairs" ]]; then
+                frame+="  --- Per-IP Channel Usage ---${clr_eol}${nl}"
+                while IFS=' ' read -r ip_ip ip_bytes; do
+                    [[ -n "$ip_ip" ]] || continue
+                    frame+="    ${ip_ip} : $(format_traffic_size "$ip_bytes")${clr_eol}${nl}"
+                done <<< "$ip_pairs"
             fi
             last_log=$(journalctl -u pg-tunnel-mgmt --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
             [[ -z "$last_log" && -f "$TUNNEL_SERVICE" ]] && last_log=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
@@ -2275,6 +2645,24 @@ manage_service() {
             frame+="  End-to-End Watchdog : ${wd_status} (${wd_line})${clr_eol}${nl}"
             frame+="  Brute-Force Shield  : ${shield_status}${clr_eol}${nl}"
             frame+="  TLS Client Sessions : ${est_count}${clr_eol}${nl}"
+            local kcc kqd knl
+            kcc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+            kqd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+            knl=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
+            if [[ "$kcc" == "bbr" && "$kqd" == "fq" ]]; then
+                frame+="  Kernel Tuning      : ${c_green}${kcc} / ${kqd} / notsent_lowat=${knl}${c_nc}${clr_eol}${nl}"
+            else
+                frame+="  Kernel Tuning      : ${c_yellow}${kcc} / ${kqd} / notsent_lowat=${knl} (run Option 5)${c_nc}${clr_eol}${nl}"
+            fi
+            local ip_pairs ip_ip ip_bytes
+            ip_pairs=$(iptables -t mangle -L PG_TUNNEL_IN -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8, $2}' | sort -k2 -rn | head -4 || true)
+            if [[ -n "$ip_pairs" ]]; then
+                frame+="  --- Per-IP Channel Usage ---${clr_eol}${nl}"
+                while IFS=' ' read -r ip_ip ip_bytes; do
+                    [[ -n "$ip_ip" ]] || continue
+                    frame+="    ${ip_ip} : $(format_traffic_size "$ip_bytes")${clr_eol}${nl}"
+                done <<< "$ip_pairs"
+            fi
             frame+="  NAT OUTPUT Rules   :${clr_eol}${nl}"
             local nat_summary
             nat_summary=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
@@ -2329,6 +2717,8 @@ uninstall_all() {
     print_header
     echo -e "${RED}=== Safe Uninstall ===${NC}"
     rm -f "$CRON_FILE" "$ACCT_CRON_FILE"
+    systemctl disable pg-tunnel-net-tune.service >/dev/null 2>&1 || true
+    rm -f "$NET_TUNE_SERVICE"
 
     if [[ -f "$ACCT_SERVICE" ]]; then
         systemctl disable pg-tunnel-acct.service >/dev/null 2>&1 || true
@@ -2350,7 +2740,7 @@ uninstall_all() {
             systemctl disable "$du_name" 2>/dev/null || true
             rm -f "$du_file"
         done
-        rm -f "$TUNNEL_SERVICE" "$MGMT_SERVICE" "$TLS_CLIENT_PY" "$LAST_GOOD_IP_FILE"
+        rm -f "$TUNNEL_SERVICE" "$MGMT_SERVICE" "$TLS_CLIENT_PY" "$LAST_GOOD_IP_FILE" "$KNOWN_HOSTS_FILE" "$PEER_IPS_FILE"
         systemctl daemon-reload
         rm -f "$FOREIGN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
         echo -e "${GREEN}[OK] Reverse TLS tunnel channels & accounting removed from Foreign server.${NC}"
@@ -2383,7 +2773,7 @@ uninstall_all() {
             iptables -t nat -D OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
         done
         netfilter-persistent save >/dev/null 2>&1 || true
-        rm -f "$IRAN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
+        rm -f "$IRAN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK" "$PEER_IPS_FILE"
         echo -e "${GREEN}[OK] TLS 1.3 server, iptables rules & accounting removed safely from Iran server.${NC}"
     else
         rm -f "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
@@ -2440,6 +2830,7 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 131072
 net.netfilter.nf_conntrack_max = 1048576
 fs.file-max = 2097152
 vm.swappiness = 10
@@ -2458,6 +2849,23 @@ EOF
 
     sysctl --system >/dev/null 2>&1
 
+    ensure_network_tuning
+
+    cat > "$NET_TUNE_SERVICE" <<'EOF'
+[Unit]
+Description=PG Tunnel Network Tuning (BBR/fq verify + RPS)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-tunnel ensure-tuning
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable pg-tunnel-net-tune.service >/dev/null 2>&1 || true
+
     echo -e "${GREEN}[OK] Optimizations applied system-wide.${NC}"
     echo
     echo -e "${CYAN}--- Active Tuning Status ---${NC}"
@@ -2469,6 +2877,13 @@ EOF
     echo "  Max Conntrack Entries   : $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 'N/A')"
     echo "  TCP Read Memory Max     : $(sysctl -n net.core.rmem_max 2>/dev/null || echo 'N/A') bytes"
     echo "  TCP Write Memory Max    : $(sysctl -n net.core.wmem_max 2>/dev/null || echo 'N/A') bytes"
+    echo "  TCP Notsent Lowat       : $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo 'N/A') bytes (bufferbloat guard)"
+    local _rps=0 _q
+    for _q in /sys/class/net/*/queues/rx-*/rps_cpus; do
+        [[ -r "$_q" ]] || continue
+        [[ "$(cat "$_q" 2>/dev/null || true)" != "00000000" ]] && _rps=$((_rps + 1))
+    done
+    echo "  RPS-Enabled RX Queues   : ${_rps}"
     echo
     read -p "Press Enter to return to menu..."
 }
@@ -2689,9 +3104,11 @@ main_menu() {
         echo "  7. Repair / Restart Tunnels (Fix Connection)"
         echo "  8. Setup Auto-Restart Cronjob"
         echo "  9. SSH Brute-Force Shield (Port 22)"
+        echo " 10. Rotate TLS Secret (Iran, Zero Downtime)"
+        echo " 11. Backup / Restore Configs"
         echo "  0. Exit"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-9]: " choice
+        read -p "Select option [0-11]: " choice
 
         case $choice in
             1)
@@ -2711,6 +3128,8 @@ main_menu() {
             7) repair_tunnels ;;
             8) setup_cronjob ;;
             9) brute_force_shield_menu ;;
+            10) rotate_tls_secret ;;
+            11) backup_restore_menu ;;
             0) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
