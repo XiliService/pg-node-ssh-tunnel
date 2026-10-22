@@ -1,14 +1,18 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v6.4
+# PG Node SSH Tunnel Manager v6.5
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
-# English Only | TLS 1.3 Anti-DPI | Live Monitor & Smart Updater
+# English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
 # ============================================================
 
 set -euo pipefail
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SCRIPT_VERSION="6.5"
+GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
+GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -16,25 +20,21 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="6.4"
-REPO_SLUG="XiliService/pg-node-ssh-tunnel"
-REPO_URL="https://raw.githubusercontent.com/${REPO_SLUG}/main/script.sh"
 CONF_DIR="/etc/pg-tunnel"
 IRAN_CONF="${CONF_DIR}/iran.conf"
 FOREIGN_CONF="${CONF_DIR}/foreign.conf"
 TRAFFIC_STATE="${CONF_DIR}/traffic.state"
 TRAFFIC_LOCK="${CONF_DIR}/traffic.lock"
+LAST_GOOD_IP_FILE="${CONF_DIR}/last_good_ip"
 TLS_CERT="${CONF_DIR}/tls.crt"
 TLS_KEY="${CONF_DIR}/tls.key"
 TLS_SERVER_PY="${CONF_DIR}/tls_server.py"
 TLS_CLIENT_PY="${CONF_DIR}/tls_client.py"
-TLS_SERVER_SERVICE="/etc/systemd/system/pg-tls-server.service"
-TUNNEL_SERVICE="/etc/systemd/system/reverse-tunnel.service"
 CRON_FILE="/etc/cron.d/pg-tunnel-restart"
 ACCT_CRON_FILE="/etc/cron.d/pg-tunnel-acct"
 ACCT_SERVICE="/etc/systemd/system/pg-tunnel-acct.service"
-
-trap '[[ -t 1 ]] && printf "\033[?25h\033[?1049l" || true' EXIT
+TLS_SERVER_SERVICE="/etc/systemd/system/pg-tls-server.service"
+TUNNEL_SERVICE="/etc/systemd/system/reverse-tunnel.service"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -52,9 +52,139 @@ ensure_packages() {
         fi
     done
     if (( ${#missing[@]} > 0 )); then
-        echo -e "${YELLOW}Installing missing packages: ${missing[*]}...${NC}"
+        echo -e "${YELLOW}Installing required packages (${missing[*]})...${NC}"
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+    fi
+}
+
+generate_secret() {
+    openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+pick_free_https_port() {
+    local cand
+    for cand in 2087 2083 9443 2095 8880 52443; do
+        if ! ss -tlnp 2>/dev/null | awk -v p=":${cand}$" '$4 ~ p && $0 !~ /tls_server\.py/ {found=1} END{exit !found}'; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo "2087"
+}
+
+auto_detect_real_cert() {
+    # Output format on match: DOMAIN|CERT_PATH|KEY_PATH
+    local crt key pub1 pub2 subj iss san dom
+    local candidates=()
+
+    if [[ -d /etc/letsencrypt/live ]]; then
+        while IFS= read -r -d '' crt; do
+            candidates+=("$crt")
+        done < <(find /etc/letsencrypt/live -maxdepth 3 -name "fullchain.pem" -print0 2>/dev/null || true)
+    fi
+
+    if [[ -d /var/lib/docker/volumes ]]; then
+        while IFS= read -r -d '' crt; do
+            candidates+=("$crt")
+        done < <(find /var/lib/docker/volumes -maxdepth 8 -type f -name "*.crt" -print0 2>/dev/null || true)
+    fi
+
+    if [[ -d /root/.acme.sh ]]; then
+        while IFS= read -r -d '' crt; do
+            candidates+=("$crt")
+        done < <(find /root/.acme.sh -maxdepth 4 -type f -name "fullchain.cer" -print0 2>/dev/null || true)
+    fi
+
+    for crt in "${candidates[@]}"; do
+        key=""
+        case "$crt" in
+            */fullchain.pem)
+                [[ -f "${crt%/fullchain.pem}/privkey.pem" ]] && key="${crt%/fullchain.pem}/privkey.pem"
+                ;;
+            */fullchain.cer)
+                local base_dir="${crt%/fullchain.cer}"
+                local found_k
+                found_k=$(find "$base_dir" -maxdepth 1 -type f -name "*.key" 2>/dev/null | head -n 1 || true)
+                [[ -n "$found_k" ]] && key="$found_k"
+                ;;
+            *.crt)
+                [[ -f "${crt%.crt}.key" ]] && key="${crt%.crt}.key"
+                ;;
+        esac
+        [[ -n "$key" && -f "$key" ]] || continue
+
+        openssl x509 -in "$crt" -noout -checkend 86400 >/dev/null 2>&1 || continue
+
+        subj=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null || true)
+        iss=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null || true)
+        [[ -n "$subj" && -n "$iss" && "${subj#subject=}" != "${iss#issuer=}" ]] || continue
+
+        pub1=$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null || true)
+        pub2=$(openssl pkey -in "$key" -pubout 2>/dev/null || true)
+        [[ -n "$pub1" && "$pub1" == "$pub2" ]] || continue
+
+        san=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null || true)
+        dom=$(echo "$san" | tr ',' '\n' | sed -n 's/.*DNS:\([^[:space:],]*\).*/\1/p' | grep -v '^\*\.' | head -n 1 || true)
+        if [[ -z "$dom" ]]; then
+            dom=$(echo "$subj" | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/[:space:]]*\).*/\1/p' | head -n 1 || true)
+        fi
+        dom="${dom#\*.}"
+        if [[ -n "$dom" && "$dom" == *.* ]]; then
+            printf '%s|%s|%s\n' "$dom" "$crt" "$key"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_cert_badge() {
+    if [[ ! -f "$TLS_CERT" ]]; then
+        echo "Missing"
+        return 0
+    fi
+    local subj iss
+    subj=$(openssl x509 -in "$TLS_CERT" -noout -subject 2>/dev/null || true)
+    iss=$(openssl x509 -in "$TLS_CERT" -noout -issuer 2>/dev/null || true)
+    if [[ -n "$subj" && -n "$iss" && "${subj#subject=}" != "${iss#issuer=}" ]]; then
+        echo "CA-Signed"
+    else
+        echo "Self-Signed"
+    fi
+}
+
+configure_iran_sshd_safe() {
+    systemctl stop ssh.socket 2>/dev/null || true
+    systemctl disable ssh.socket 2>/dev/null || true
+    systemctl mask ssh.socket 2>/dev/null || true
+    rm -rf /etc/systemd/system/ssh.socket.d/
+
+    mkdir -p /run/sshd
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local tmp_sshd="/etc/ssh/sshd_config.pgtmp.$$"
+        {
+            echo "Port 22"
+            echo "MaxStartups 150:30:300"
+            echo "LoginGraceTime 20"
+            echo "TCPKeepAlive yes"
+            echo "ClientAliveInterval 20"
+            echo "ClientAliveCountMax 3"
+            grep -vE '^[[:space:]]*(Port|MaxStartups|LoginGraceTime|TCPKeepAlive|ClientAliveInterval|ClientAliveCountMax)[[:space:]]+' /etc/ssh/sshd_config || true
+        } > "$tmp_sshd"
+        if sshd -t -f "$tmp_sshd" 2>/dev/null; then
+            mv -f "$tmp_sshd" /etc/ssh/sshd_config
+        else
+            rm -f "$tmp_sshd"
+        fi
+    fi
+
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl unmask ssh.service 2>/dev/null || true
+    systemctl enable ssh.service >/dev/null 2>&1 || true
+    if systemctl is-active --quiet ssh.service; then
+        systemctl reload ssh.service 2>/dev/null || systemctl restart ssh.service
+    else
+        systemctl restart ssh.service
     fi
 }
 
@@ -62,9 +192,93 @@ write_tls_server_script() {
     mkdir -p "$CONF_DIR"
     cat > "$TLS_SERVER_PY" <<'EOF'
 #!/usr/bin/env python3
-import asyncio, socket, ssl, sys
+import asyncio, email.utils, hmac, os, re, signal, socket, ssl, subprocess, sys, time
 
 CERT, KEY, LPORT, TPORT = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+CONF_PATH = os.environ.get("PG_IRAN_CONF", "/etc/pg-tunnel/iran.conf")
+AUTH_LOCK = asyncio.Lock()
+
+def load_runtime_conf():
+    cfg = {
+        "TLS_SECRET": "",
+        "NODE_PORT": "62075",
+        "DATA_PORTS": "",
+        "FALLBACK_PORT": "80",
+        "CERT_SRC": "",
+        "KEY_SRC": "",
+    }
+    try:
+        with open(CONF_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip("\x22\x27")
+    except Exception:
+        pass
+    ports = []
+    for raw in (cfg.get("NODE_PORT", "") + "," + cfg.get("DATA_PORTS", "")).split(","):
+        raw = raw.strip()
+        if raw.isdigit():
+            p = int(raw)
+            if p not in (22, LPORT) and p not in ports:
+                ports.append(p)
+    fb = int(cfg["FALLBACK_PORT"]) if cfg.get("FALLBACK_PORT", "").isdigit() else 80
+    return cfg.get("TLS_SECRET", ""), ports, fb, cfg.get("CERT_SRC", ""), cfg.get("KEY_SRC", "")
+
+def release_zombie_ports(ports):
+    if not ports:
+        return
+    port_re = "|".join(str(p) for p in ports)
+    pat = re.compile(rf"^(?:127\.0\.0\.1|\[::1\]):(?:{port_re})$")
+    try:
+        out = subprocess.check_output(["ss", "-tlnp"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
+    pids = set()
+    for line in out.splitlines():
+        if "sshd" not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 4 and pat.match(parts[3]):
+            for m in re.finditer(r"pid=(\d+)", line):
+                pids.add(int(m.group(1)))
+    if not pids:
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    deadline = time.monotonic() + 0.8
+    while time.monotonic() < deadline:
+        busy = False
+        for p in ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                busy = True
+            finally:
+                s.close()
+            if busy:
+                break
+        if not busy:
+            break
+        time.sleep(0.02)
+
+def tune_socket(sock):
+    if not sock:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 20)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except Exception:
+        pass
 
 async def pipe(r, w):
     try:
@@ -79,24 +293,148 @@ async def pipe(r, w):
         except Exception:
             pass
 
-async def handle(cr, cw):
-    sock = cw.get_extra_info("socket")
-    if sock:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+async def serve_fallback(cr, cw, initial_buf, fb_port):
     try:
-        ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", TPORT), timeout=10)
-        usock = uw.get_extra_info("socket")
-        if usock:
-            usock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except Exception:
-        cw.close()
+        ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", fb_port), timeout=3.0)
+        if initial_buf:
+            uw.write(initial_buf)
+            await uw.drain()
+        await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
         return
+    except Exception:
+        pass
+    body = b"<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>200 OK</h1></body></html>\r\n"
+    hdr = (
+        f"HTTP/1.1 200 OK\r\n"
+        f"Server: nginx\r\n"
+        f"Date: {email.utils.formatdate(usegmt=True)}\r\n"
+        f"Content-Type: text/html; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii")
+    try:
+        cw.write(hdr + body)
+        await cw.drain()
+    except Exception:
+        pass
+    try:
+        cw.close()
+    except Exception:
+        pass
+
+async def handle(cr, cw):
+    tune_socket(cw.get_extra_info("socket"))
+    secret, cleanup_ports, fb_port, _, _ = load_runtime_conf()
+    buf = bytearray()
+    authed = False
+    role = "tunnel"
+    rest = b""
+
+    try:
+        while len(buf) < 8192:
+            chunk = await asyncio.wait_for(cr.read(4096), timeout=10.0)
+            if not chunk:
+                cw.close()
+                return
+            buf.extend(chunk)
+            if b"\r\n\r\n" in buf:
+                hdr_bytes, rest = bytes(buf).split(b"\r\n\r\n", 1)
+                hdr_text = hdr_bytes.decode("latin1", errors="ignore")
+                got_auth = ""
+                for line in hdr_text.split("\r\n")[1:]:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        kl = k.strip().lower()
+                        if kl == "x-auth":
+                            got_auth = v.strip()
+                        elif kl == "x-role":
+                            role = v.strip().lower()
+                if secret and hmac.compare_digest(got_auth, secret):
+                    authed = True
+                elif not secret and got_auth == "":
+                    authed = True
+                break
+            if not secret and buf.startswith(b"SSH-2.0-"):
+                authed = True
+                role = "legacy"
+                rest = bytes(buf)
+                break
+            if len(buf) >= 2048 and b"HTTP/" not in buf[:64]:
+                break
+    except asyncio.TimeoutError:
+        hdr = (
+            f"HTTP/1.1 408 Request Timeout\r\n"
+            f"Server: nginx\r\n"
+            f"Date: {email.utils.formatdate(usegmt=True)}\r\n"
+            f"Content-Length: 0\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("ascii")
+        try:
+            cw.write(hdr)
+            await cw.drain()
+        except Exception:
+            pass
+        try:
+            cw.close()
+        except Exception:
+            pass
+        return
+    except Exception:
+        try:
+            cw.close()
+        except Exception:
+            pass
+        return
+
+    if not authed:
+        await serve_fallback(cr, cw, bytes(buf), fb_port)
+        return
+
+    async with AUTH_LOCK:
+        if role == "tunnel":
+            await asyncio.get_running_loop().run_in_executor(None, release_zombie_ports, cleanup_ports)
+        try:
+            ur, uw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", TPORT), timeout=8.0)
+            tune_socket(uw.get_extra_info("socket"))
+            if rest:
+                uw.write(rest)
+                await uw.drain()
+        except Exception:
+            cw.close()
+            return
+
     await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+
+async def cert_reloader(ctx):
+    last_mtime = 0.0
+    while True:
+        try:
+            _, _, _, cert_src, key_src = load_runtime_conf()
+            if cert_src and key_src and os.path.isfile(cert_src) and os.path.isfile(key_src):
+                mt = max(os.path.getmtime(cert_src), os.path.getmtime(key_src))
+                if last_mtime == 0.0:
+                    last_mtime = mt
+                elif mt > last_mtime:
+                    with open(cert_src, "rb") as fc, open(CERT, "wb") as dc:
+                        dc.write(fc.read())
+                    with open(key_src, "rb") as fk, open(KEY, "wb") as dk:
+                        dk.write(fk.read())
+                    os.chmod(KEY, 0o600)
+                    ctx.load_cert_chain(CERT, KEY)
+                    last_mtime = mt
+        except Exception:
+            pass
+        await asyncio.sleep(3600)
 
 async def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.set_alpn_protocols(["http/1.1"])
+    except Exception:
+        pass
     ctx.load_cert_chain(CERT, KEY)
+    asyncio.create_task(cert_reloader(ctx))
     srv = await asyncio.start_server(handle, "0.0.0.0", LPORT, ssl=ctx, backlog=512)
     async with srv:
         await srv.serve_forever()
@@ -110,66 +448,290 @@ write_tls_client_script() {
     mkdir -p "$CONF_DIR"
     cat > "$TLS_CLIENT_PY" <<'EOF'
 #!/usr/bin/env python3
-import os, socket, ssl, sys, threading
+import os, secrets, selectors, socket, ssl, sys, time
 
-HOST, PORT = sys.argv[1], int(sys.argv[2])
-SNI = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "www.microsoft.com"
-BIPS = [x.strip() for x in (sys.argv[4] if len(sys.argv) > 4 else "").split(",") if x.strip()] + [""]
+CONF_PATH = os.environ.get("PG_FOREIGN_CONF", "/etc/pg-tunnel/foreign.conf")
+LAST_IP_FILE = os.environ.get("PG_LAST_IP_FILE", "/etc/pg-tunnel/last_good_ip")
 
-raw = None
-err = None
-for bip in BIPS:
+def load_conf():
+    cfg = {}
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with open(CONF_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip("\x22\x27")
+    except Exception:
+        pass
+    return cfg
+
+cfg = load_conf()
+HOST = sys.argv[1]
+PORT = int(sys.argv[2])
+SNI = (sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else cfg.get("TLS_SNI", "")) or "www.microsoft.com"
+RAW_BIPS = sys.argv[4] if len(sys.argv) > 4 else cfg.get("BIND_IPS", "")
+SECRET = sys.argv[5] if len(sys.argv) > 5 else cfg.get("TLS_SECRET", "")
+ROLE = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else "tunnel"
+
+bips = []
+for x in RAW_BIPS.split(","):
+    x = x.strip()
+    if x and x not in bips:
+        bips.append(x)
+if "" not in bips:
+    bips.append("")
+
+try:
+    with open(LAST_IP_FILE, "r", encoding="utf-8") as lf:
+        last_good = lf.read().strip()
+    if last_good in bips:
+        bips.remove(last_good)
+        bips.insert(0, last_good)
+except Exception:
+    pass
+
+def establish_connection(bip):
+    deadline = time.monotonic() + 7.0
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.settimeout(8)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 20)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        s.settimeout(6.0)
         if bip:
             s.bind((bip, 0))
         s.connect((HOST, PORT))
-        s.settimeout(None)
-        raw = s
-        break
-    except Exception as e:
-        err = e
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_alpn_protocols(["http/1.1"])
+        except Exception:
+            pass
+        in_bio = ssl.MemoryBIO()
+        out_bio = ssl.MemoryBIO()
+        sslobj = ctx.wrap_bio(in_bio, out_bio, server_hostname=SNI)
+
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("TLS handshake timeout")
+            s.settimeout(rem)
+            try:
+                sslobj.do_handshake()
+                out = out_bio.read()
+                if out:
+                    s.sendall(out)
+                break
+            except ssl.SSLWantReadError:
+                out = out_bio.read()
+                if out:
+                    s.sendall(out)
+                data = s.recv(65536)
+                if not data:
+                    raise EOFError("EOF during TLS handshake")
+                in_bio.write(data)
+            except ssl.SSLWantWriteError:
+                out = out_bio.read()
+                if out:
+                    s.sendall(out)
+
+        pad = secrets.token_urlsafe(secrets.randbelow(96) + 32)
+        req = (
+            f"GET /ws HTTP/1.1\r\n"
+            f"Host: {SNI}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"X-Auth: {SECRET}\r\n"
+            f"X-Role: {ROLE}\r\n"
+            f"X-Pad: {pad}\r\n\r\n"
+        ).encode("ascii")
+        off = 0
+        while off < len(req):
+            off += sslobj.write(memoryview(req)[off:])
+        out = out_bio.read()
+        if out:
+            s.sendall(out)
+
+        first_plain = bytearray()
+        while not first_plain:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("SSH banner exchange timeout")
+            s.settimeout(rem)
+            try:
+                chunk = sslobj.read(65536)
+                if not chunk:
+                    raise EOFError("EOF waiting for SSH banner")
+                first_plain.extend(chunk)
+            except ssl.SSLWantReadError:
+                data = s.recv(65536)
+                if not data:
+                    raise EOFError("EOF before SSH banner")
+                in_bio.write(data)
+            except ssl.SSLWantWriteError:
+                out = out_bio.read()
+                if out:
+                    s.sendall(out)
+
+        if not first_plain.startswith(b"SSH-"):
+            raise RuntimeError("Invalid upstream response (rejected secret or blocked)")
+
+        return s, sslobj, in_bio, out_bio, first_plain
+    except Exception:
         try:
             s.close()
         except Exception:
             pass
+        raise
+
+raw = None
+err = None
+chosen_bip = ""
+for bip in bips:
+    try:
+        raw, sslobj, in_bio, out_bio, plain_out = establish_connection(bip)
+        chosen_bip = bip
+        break
+    except Exception as e:
+        err = e
 
 if raw is None:
-    sys.stderr.write(f"TLS connect error: {err}\n")
+    sys.stderr.write(f"TLS tunnel connect failed across {bips}: {err}\n")
     sys.exit(1)
 
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-tls = ctx.wrap_socket(raw, server_hostname=SNI)
-
-def tx():
+if chosen_bip:
     try:
-        while True:
-            d = os.read(0, 65536)
-            if not d:
-                break
-            tls.sendall(d)
+        os.makedirs(os.path.dirname(LAST_IP_FILE), exist_ok=True)
+        tmp = f"{LAST_IP_FILE}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(chosen_bip + "\n")
+        os.replace(tmp, LAST_IP_FILE)
     except Exception:
         pass
-    finally:
-        try:
-            tls.close()
-        except Exception:
-            pass
-        os._exit(0)
 
-threading.Thread(target=tx, daemon=True).start()
+in_fd = 0
+out_fd = os.dup(1)
+raw.setblocking(False)
+os.set_blocking(in_fd, False)
+os.set_blocking(out_fd, False)
+
+sel = selectors.DefaultSelector()
+cipher_out = bytearray(out_bio.read())
+raw_eof = False
+ssl_eof = False
+stdin_eof = False
+MAX_BUF = 262144
+
+def pump_ssl():
+    global ssl_eof
+    if not ssl_eof and len(plain_out) < MAX_BUF:
+        while len(plain_out) < MAX_BUF:
+            try:
+                d = sslobj.read(65536)
+                if not d:
+                    ssl_eof = True
+                    break
+                plain_out.extend(d)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                break
+            except ssl.SSLEOFError:
+                ssl_eof = True
+                break
+    out = out_bio.read()
+    if out:
+        cipher_out.extend(out)
+
+pump_ssl()
+
 try:
-    while True:
-        d = tls.recv(65536)
-        if not d:
+    while not (ssl_eof and not plain_out):
+        if stdin_eof and not cipher_out and raw_eof and ssl_eof:
             break
-        v = memoryview(d)
-        while v:
-            v = v[os.write(1, v):]
+
+        ev_raw = 0
+        if not raw_eof and len(plain_out) < MAX_BUF:
+            ev_raw |= selectors.EVENT_READ
+        if cipher_out:
+            ev_raw |= selectors.EVENT_WRITE
+
+        ev_in = selectors.EVENT_READ if (not stdin_eof and len(cipher_out) < MAX_BUF) else 0
+        ev_out = selectors.EVENT_WRITE if plain_out else 0
+
+        for fd, ev in ((raw, ev_raw), (in_fd, ev_in), (out_fd, ev_out)):
+            try:
+                key = sel.get_key(fd)
+                if ev == 0:
+                    sel.unregister(fd)
+                elif key.events != ev:
+                    sel.modify(fd, ev)
+            except KeyError:
+                if ev != 0:
+                    sel.register(fd, ev)
+
+        events = sel.select(timeout=5.0)
+        for key, mask in events:
+            fd = key.fileobj
+            if fd is raw:
+                if mask & selectors.EVENT_READ:
+                    try:
+                        d = raw.recv(65536)
+                        if not d:
+                            raw_eof = True
+                            in_bio.write_eof()
+                        else:
+                            in_bio.write(d)
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        raw_eof = True
+                        in_bio.write_eof()
+                if mask & selectors.EVENT_WRITE and cipher_out:
+                    try:
+                        n = raw.send(cipher_out)
+                        del cipher_out[:n]
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        os._exit(0)
+            elif fd == in_fd and (mask & selectors.EVENT_READ):
+                try:
+                    d = os.read(in_fd, 65536)
+                    if not d:
+                        stdin_eof = True
+                        try:
+                            sslobj.unwrap()
+                        except Exception:
+                            pass
+                        out = out_bio.read()
+                        if out:
+                            cipher_out.extend(out)
+                        if not cipher_out:
+                            os._exit(0)
+                    else:
+                        off = 0
+                        while off < len(d):
+                            off += sslobj.write(memoryview(d)[off:])
+                except BlockingIOError:
+                    pass
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    pass
+                except OSError:
+                    os._exit(0)
+            elif fd == out_fd and (mask & selectors.EVENT_WRITE) and plain_out:
+                try:
+                    n = os.write(out_fd, plain_out)
+                    del plain_out[:n]
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    os._exit(0)
+
+        pump_ssl()
 except Exception:
     pass
 finally:
@@ -229,7 +791,7 @@ ensure_accounting_rules() {
     command -v iptables >/dev/null 2>&1 || return 0
 
     if [[ -f "$IRAN_CONF" ]]; then
-        local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI=""
+        local OUT_IP="" NODE_PORT="" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
         source "$IRAN_CONF"
         [[ -n "${SEC_SSH:-}" ]] || return 0
 
@@ -247,7 +809,7 @@ ensure_accounting_rules() {
             iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
 
     elif [[ -f "$FOREIGN_CONF" ]]; then
-        local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="" BIND_IPS=""
+        local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="" BIND_IPS="" TLS_SECRET=""
         source "$FOREIGN_CONF"
         [[ -n "${IR_IP:-}" && -n "${SEC_SSH:-}" ]] || return 0
 
@@ -386,15 +948,14 @@ EOF
 
 release_iran_tunnel_ports() {
     [[ -f "$IRAN_CONF" ]] || return 0
-    local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI=""
+    local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
     source "$IRAN_CONF"
-    [[ -n "${DATA_PORTS:-}" ]] || return 0
 
     local port_regex="" p
-    IFS=',' read -ra _ports <<< "$DATA_PORTS"
+    IFS=',' read -ra _ports <<< "${NODE_PORT:-62075},${DATA_PORTS:-}"
     for p in "${_ports[@]}"; do
         p=$(echo "$p" | xargs)
-        if [[ "$p" =~ ^[0-9]+$ ]]; then
+        if [[ "$p" =~ ^[0-9]+$ && "$p" != "22" && "$p" != "${SEC_SSH:-}" ]]; then
             port_regex="${port_regex:+${port_regex}|}${p}"
         fi
     done
@@ -412,12 +973,9 @@ release_iran_tunnel_ports() {
     if [[ -n "$pids" ]]; then
         local pid
         for pid in $pids; do
-            kill -TERM "$pid" 2>/dev/null || true
-        done
-        sleep 0.3
-        for pid in $pids; do
             kill -KILL "$pid" 2>/dev/null || true
         done
+        sleep 0.2
     fi
 }
 
@@ -446,27 +1004,25 @@ migrate_existing_state() {
                 parsed_bips=$(sed -n 's/.*tls_client\.py [^ ]* [^ ]* [^ "]* \([^ "]*\).*/\1/p' "$TUNNEL_SERVICE" | head -n 1)
                 echo "BIND_IPS=${parsed_bips}" >> "$FOREIGN_CONF"
             fi
+            write_tls_client_script
         fi
     fi
 
-    if [[ -f "$IRAN_CONF" ]] && ! grep -q '^TLS_SNI=' "$IRAN_CONF"; then
-        echo "TLS_SNI=www.microsoft.com" >> "$IRAN_CONF"
+    if [[ -f "$IRAN_CONF" ]]; then
+        if ! grep -q '^NODE_PORT=' "$IRAN_CONF"; then
+            echo "NODE_PORT=62075" >> "$IRAN_CONF"
+        fi
+        if ! grep -q '^TLS_SNI=' "$IRAN_CONF"; then
+            echo "TLS_SNI=www.microsoft.com" >> "$IRAN_CONF"
+        fi
+        if [[ -f /etc/ssh/sshd_config ]] && ! grep -q '^MaxStartups 150:30:300' /etc/ssh/sshd_config; then
+            configure_iran_sshd_safe
+        fi
     fi
 
     if [[ -f "$FOREIGN_CONF" && -f "$CRON_FILE" ]]; then
         if grep -q '^0 ' "$CRON_FILE"; then
             sed -i 's/^0 /1 /' "$CRON_FILE"
-        fi
-    fi
-
-    if [[ -f "$IRAN_CONF" && -f /etc/ssh/sshd_config ]]; then
-        if ! grep -q '^ClientAliveInterval 10' /etc/ssh/sshd_config; then
-            sed -i '/^ClientAliveInterval /d; /^ClientAliveCountMax /d; /^TCPKeepAlive /d' /etc/ssh/sshd_config
-            printf 'TCPKeepAlive yes\nClientAliveInterval 10\nClientAliveCountMax 2\n' >> /etc/ssh/sshd_config
-            mkdir -p /run/sshd
-            if sshd -t 2>/dev/null; then
-                systemctl reload ssh.service 2>/dev/null || systemctl restart ssh.service 2>/dev/null || true
-            fi
         fi
     fi
 }
@@ -484,15 +1040,18 @@ handle_cli_subcommands() {
             check_root
             sync_traffic_state >/dev/null 2>&1 || true
             if [[ -f "$IRAN_CONF" ]]; then
-                release_iran_tunnel_ports 2>/dev/null || true
-                systemctl restart ssh.service 2>/dev/null || true
-                if [[ -f "$TLS_SERVER_SERVICE" ]]; then
+                local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+                source "$IRAN_CONF"
+                if ! systemctl is-active --quiet ssh.service; then
+                    systemctl restart ssh.service 2>/dev/null || true
+                fi
+                if [[ -f "$TLS_SERVER_SERVICE" ]] && ! systemctl is-active --quiet pg-tls-server.service; then
                     systemctl restart pg-tls-server.service 2>/dev/null || true
                 fi
-                source "$IRAN_CONF"
                 IFS=',' read -ra PORTS <<< "$DATA_PORTS"
                 for port in "${PORTS[@]}"; do
                     port=$(echo "$port" | xargs)
+                    [[ -n "$port" ]] || continue
                     iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
                     iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
                 done
@@ -500,15 +1059,19 @@ handle_cli_subcommands() {
                 sync_traffic_state >/dev/null 2>&1 || true
             elif [[ -f "$FOREIGN_CONF" ]]; then
                 ensure_accounting_rules 2>/dev/null || true
-                systemctl restart reverse-tunnel 2>/dev/null || true
+                if ! systemctl is-active --quiet reverse-tunnel; then
+                    systemctl restart reverse-tunnel 2>/dev/null || true
+                fi
                 sync_traffic_state >/dev/null 2>&1 || true
             fi
             exit 0
             ;;
         acct-init|acct-sync)
             check_root
-            ensure_accounting_rules 2>/dev/null || true
-            sync_traffic_state >/dev/null 2>&1 || true
+            if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
+                ensure_accounting_rules 2>/dev/null || true
+                sync_traffic_state >/dev/null 2>&1 || true
+            fi
             exit 0
             ;;
     esac
@@ -533,17 +1096,45 @@ print_header() {
 
 install_iran() {
     print_header
-    echo -e "${CYAN}=== Configuring IRAN Server (TLS 1.3 Anti-DPI) ===${NC}"
+    echo -e "${CYAN}=== Configuring IRAN Server (Trojan-Style TLS 1.3 Anti-DPI) ===${NC}"
     echo
 
-    read -p "Foreign Server IP (inside Pasarguard Outbounds): " OUT_IP
-    read -p "Outbound ports (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+    local cur_out_ip="" cur_node_port="62075" cur_data_ports="" cur_sec="" cur_sni="" cur_secret=""
+    if [[ -f "$IRAN_CONF" ]]; then
+        local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+        source "$IRAN_CONF"
+        cur_out_ip="${OUT_IP:-}"
+        cur_node_port="${NODE_PORT:-62075}"
+        cur_data_ports="${DATA_PORTS:-}"
+        cur_sec="${SEC_SSH:-}"
+        cur_sni="${TLS_SNI:-}"
+        cur_secret="${TLS_SECRET:-}"
+    fi
 
+    if [[ -n "$cur_out_ip" ]]; then
+        read -p "Foreign Server IP (PasarGuard Outbound IP) [default: ${cur_out_ip}]: " OUT_IP
+        OUT_IP=${OUT_IP:-$cur_out_ip}
+    else
+        read -p "Foreign Server IP (PasarGuard Outbound IP): " OUT_IP
+    fi
+
+    read -p "Node management port [default: ${cur_node_port}]: " NODE_PORT
+    NODE_PORT=${NODE_PORT:-$cur_node_port}
+
+    if [[ -n "$cur_data_ports" ]]; then
+        read -p "Outbound data ports (comma separated) [default: ${cur_data_ports}]: " DATA_PORTS
+        DATA_PORTS=${DATA_PORTS:-$cur_data_ports}
+    else
+        read -p "Outbound data ports (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+    fi
+
+    local suggested_port
+    suggested_port=$(pick_free_https_port)
     while true; do
-        read -p "Custom Anti-DPI TLS Port (default 58443, e.g. 58443 or 2053): " SEC_SSH
-        SEC_SSH=${SEC_SSH:-58443}
-        if [[ "$SEC_SSH" == "22" ]]; then
-            echo -e "${RED}[ERROR] Do not use Port 22 for TLS wrapper. Port 22 stays open for SSH.${NC}"
+        read -p "Anti-DPI HTTPS Port [recommended free port: ${suggested_port}]: " SEC_SSH
+        SEC_SSH=${SEC_SSH:-$suggested_port}
+        if [[ "$SEC_SSH" == "22" || "$SEC_SSH" == "80" || "$SEC_SSH" == "443" ]]; then
+            echo -e "${RED}[ERROR] Do not use port ${SEC_SSH} (reserved for SSH/Caddy/Xray). Pick e.g. ${suggested_port}.${NC}"
             continue
         fi
         local conflict_proc=""
@@ -551,22 +1142,48 @@ install_iran() {
         if [[ -n "$conflict_proc" ]]; then
             echo -e "${RED}[WARN] Port ${SEC_SSH} is currently occupied by another process:${NC}"
             echo "  $conflict_proc"
-            echo -e "${YELLOW}Please pick a free port (e.g. 58443).${NC}"
+            echo -e "${YELLOW}Please pick a free port (recommended: ${suggested_port}).${NC}"
             continue
         fi
         break
     done
 
-    read -p "TLS Cover SNI Domain [default: www.microsoft.com]: " TLS_SNI
-    TLS_SNI=${TLS_SNI:-www.microsoft.com}
+    local detected_line="" det_dom="" det_crt="" det_key="" CERT_SRC="" KEY_SRC=""
+    if detected_line=$(auto_detect_real_cert); then
+        IFS='|' read -r det_dom det_crt det_key <<< "$detected_line"
+        echo
+        echo -e "${GREEN}[AUTO-DETECTED] Valid CA SSL Certificate found on this server:${NC}"
+        echo -e "  Domain : ${CYAN}${det_dom}${NC}"
+        echo -e "  Source : ${det_crt}"
+    fi
 
-    reset_traffic_accounting
+    local default_sni="${det_dom:-${cur_sni:-www.microsoft.com}}"
+    read -p "TLS Cover Domain (SNI) [default: ${default_sni}]: " TLS_SNI
+    TLS_SNI=${TLS_SNI:-$default_sni}
+
+    if [[ -n "$det_dom" && "$TLS_SNI" == "$det_dom" ]]; then
+        CERT_SRC="$det_crt"
+        KEY_SRC="$det_key"
+    fi
+
+    local default_secret="${cur_secret:-$(generate_secret)}"
+    read -p "Anti-Prober Secret Key [Enter = ${default_secret}]: " TLS_SECRET
+    TLS_SECRET=${TLS_SECRET:-$default_secret}
+
+    if [[ -z "$cur_sec" || "$SEC_SSH" != "$cur_sec" ]]; then
+        cleanup_accounting_rules
+    fi
 
     cat > "$IRAN_CONF" <<EOF
 OUT_IP=${OUT_IP}
+NODE_PORT=${NODE_PORT}
 DATA_PORTS=${DATA_PORTS}
 SEC_SSH=${SEC_SSH}
 TLS_SNI=${TLS_SNI}
+TLS_SECRET=${TLS_SECRET}
+FALLBACK_PORT=80
+CERT_SRC=${CERT_SRC}
+KEY_SRC=${KEY_SRC}
 EOF
 
     apply_iran_configs
@@ -577,43 +1194,47 @@ apply_iran_configs() {
         echo -e "${RED}[ERROR] Configuration not found. Run installation first.${NC}"
         sleep 2; return
     fi
-    local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com"
+    local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com" TLS_SECRET="" FALLBACK_PORT="80" CERT_SRC="" KEY_SRC=""
     source "$IRAN_CONF"
     TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
     ensure_packages iptables-persistent netfilter-persistent openssh-server openssl python3
 
-    echo -e "${YELLOW}Disabling ssh.socket and ensuring SSH listens cleanly on Port 22...${NC}"
-    systemctl stop ssh.socket 2>/dev/null || true
-    systemctl disable ssh.socket 2>/dev/null || true
-    systemctl mask ssh.socket 2>/dev/null || true
-    rm -rf /etc/systemd/system/ssh.socket.d/
+    echo -e "${YELLOW}Hardening SSH daemon (Port 22 + anti-brute-force preauth pool)...${NC}"
+    configure_iran_sshd_safe
 
-    sed -i '/^Port /d; /^ClientAliveInterval /d; /^ClientAliveCountMax /d; /^TCPKeepAlive /d' /etc/ssh/sshd_config
-    cat >> /etc/ssh/sshd_config <<'EOF'
-Port 22
-TCPKeepAlive yes
-ClientAliveInterval 10
-ClientAliveCountMax 2
-EOF
-
-    mkdir -p /run/sshd
-    systemctl daemon-reload
-    systemctl unmask ssh.service 2>/dev/null || true
-    systemctl enable ssh.service >/dev/null 2>&1
-    systemctl restart ssh.service
-
-    echo -e "${YELLOW}Configuring TLS 1.3 Anti-DPI Wrapper Server on Port ${SEC_SSH} (SNI: ${TLS_SNI})...${NC}"
+    echo -e "${YELLOW}Preparing TLS 1.3 Certificate & Trojan-Style Web Camouflage on Port ${SEC_SSH}...${NC}"
     write_tls_server_script
-    if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$TLS_KEY" -out "$TLS_CERT" \
-            -days 3650 -subj "/CN=${TLS_SNI}" >/dev/null 2>&1
+
+    if [[ -n "${CERT_SRC:-}" && -f "${CERT_SRC}" && -n "${KEY_SRC:-}" && -f "${KEY_SRC}" ]]; then
+        cp -f "$CERT_SRC" "$TLS_CERT"
+        cp -f "$KEY_SRC" "$TLS_KEY"
+        chmod 600 "$TLS_KEY"
+    else
+        local detected_line="" d_dom="" d_crt="" d_key=""
+        if detected_line=$(auto_detect_real_cert); then
+            IFS='|' read -r d_dom d_crt d_key <<< "$detected_line"
+            if [[ "$TLS_SNI" == "$d_dom" ]]; then
+                cp -f "$d_crt" "$TLS_CERT"
+                cp -f "$d_key" "$TLS_KEY"
+                chmod 600 "$TLS_KEY"
+            fi
+        fi
+        if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+                -keyout "$TLS_KEY" -out "$TLS_CERT" \
+                -days 3650 -subj "/CN=${TLS_SNI}" \
+                -addext "subjectAltName=DNS:${TLS_SNI}" >/dev/null 2>&1 || \
+            openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout "$TLS_KEY" -out "$TLS_CERT" \
+                -days 3650 -subj "/CN=${TLS_SNI}" >/dev/null 2>&1
+            chmod 600 "$TLS_KEY"
+        fi
     fi
 
     cat > "$TLS_SERVER_SERVICE" <<EOF
 [Unit]
-Description=PG Tunnel TLS 1.3 Anti-DPI Wrapper Server
+Description=PG Tunnel Trojan-Style TLS 1.3 Anti-DPI Server
 After=network-online.target ssh.service
 StartLimitIntervalSec=0
 
@@ -631,49 +1252,100 @@ EOF
     systemctl enable pg-tls-server.service >/dev/null 2>&1
     systemctl restart pg-tls-server.service
 
-    echo -e "${YELLOW}Applying iptables REDIRECT rules...${NC}"
+    echo -e "${YELLOW}Applying targeted iptables NAT REDIRECT rules...${NC}"
     IFS=',' read -ra PORTS <<< "$DATA_PORTS"
     for port in "${PORTS[@]}"; do
         port=$(echo "$port" | xargs)
+        [[ -n "$port" ]] || continue
         iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
         iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port"
         echo "  -> Redirected $OUT_IP:$port"
     done
 
-    echo -e "${YELLOW}Enabling persistent tunnel traffic accounting...${NC}"
     setup_accounting_persistence
     netfilter-persistent save >/dev/null 2>&1 || true
 
-    echo -e "${GREEN}[OK] Iran server configured successfully.${NC}"
-    echo -e "SSH Port 22 is active | TLS 1.3 Tunnel listening on Port ${SEC_SSH} (SNI: ${TLS_SNI})"
+    local pub_ir_ip
+    pub_ir_ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}' || echo "<IRAN_IP>")
+
+    echo
+    echo -e "${GREEN}[OK] Iran server configured successfully ($(get_cert_badge) certificate active).${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "${CYAN}  ENTER THESE EXACT VALUES ON YOUR FOREIGN SERVER (Option 1):${NC}"
+    echo -e "  Iran Server IP : ${YELLOW}${pub_ir_ip}${NC}"
+    echo -e "  TLS Port       : ${YELLOW}${SEC_SSH}${NC}"
+    echo -e "  TLS SNI Domain : ${YELLOW}${TLS_SNI}${NC}"
+    echo -e "  TLS Secret Key : ${YELLOW}${TLS_SECRET}${NC}"
+    echo -e "${GREEN}============================================================${NC}"
     echo
     read -p "Press Enter to return to menu..."
 }
 
 install_foreign() {
     print_header
-    echo -e "${CYAN}=== Configuring FOREIGN Server (TLS 1.3 Anti-DPI) ===${NC}"
+    echo -e "${CYAN}=== Configuring FOREIGN Server (TLS 1.3 + Secret + Multi-IP) ===${NC}"
     echo
 
-    read -p "Iran Server IP: " IR_IP
-    read -p "Iran Anti-DPI TLS Port (default 58443): " SEC_SSH
-    SEC_SSH=${SEC_SSH:-58443}
-    read -p "Node management port (e.g. 62075): " NODE_PORT
-    read -p "Outbound ports to tunnel (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
-    read -p "TLS Cover SNI Domain [default: www.microsoft.com]: " TLS_SNI
-    TLS_SNI=${TLS_SNI:-www.microsoft.com}
+    ensure_packages openssh-client openssl python3
 
-    local host_ips=""
-    host_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth|lo)/ {split($4,a,"/"); out=(out==""?a[1]:out", "a[1])} END{print out}' || true)
-    if [[ -n "$host_ips" ]]; then
-        echo -e "${CYAN}Detected Public IPs on this server:${NC} ${host_ips}"
+    local cur_ir_ip="" cur_sec="2087" cur_sni="" cur_secret="" cur_node="62075" cur_data="" cur_bips=""
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        local IR_IP="" SEC_SSH="" NODE_PORT="62075" DATA_PORTS="" TLS_SNI="" BIND_IPS="" TLS_SECRET=""
+        source "$FOREIGN_CONF"
+        cur_ir_ip="${IR_IP:-}"
+        cur_sec="${SEC_SSH:-2087}"
+        cur_sni="${TLS_SNI:-}"
+        cur_secret="${TLS_SECRET:-}"
+        cur_node="${NODE_PORT:-62075}"
+        cur_data="${DATA_PORTS:-}"
+        cur_bips="${BIND_IPS:-}"
     fi
-    read -p "Source Bind IP(s) for tunnel [optional, comma-separated, Enter=Auto]: " BIND_IPS
-    BIND_IPS=$(echo "${BIND_IPS:-}" | tr -d ' ')
 
-    ensure_packages openssh-client python3 iptables
-    write_tls_client_script
-    reset_traffic_accounting
+    if [[ -n "$cur_ir_ip" ]]; then
+        read -p "Iran Server IP [default: ${cur_ir_ip}]: " IR_IP
+        IR_IP=${IR_IP:-$cur_ir_ip}
+    else
+        read -p "Iran Server IP: " IR_IP
+    fi
+
+    read -p "Anti-DPI HTTPS Port on Iran [default: ${cur_sec}]: " SEC_SSH
+    SEC_SSH=${SEC_SSH:-$cur_sec}
+
+    local sni_prompt="${cur_sni:-www.microsoft.com}"
+    read -p "TLS SNI Domain (from Iran summary) [default: ${sni_prompt}]: " TLS_SNI
+    TLS_SNI=${TLS_SNI:-$sni_prompt}
+
+    if [[ -n "$cur_secret" ]]; then
+        read -p "TLS Secret Key (from Iran summary) [default: ${cur_secret}]: " TLS_SECRET
+        TLS_SECRET=${TLS_SECRET:-$cur_secret}
+    else
+        read -p "TLS Secret Key (paste from Iran summary): " TLS_SECRET
+    fi
+
+    read -p "Node management port [default: ${cur_node}]: " NODE_PORT
+    NODE_PORT=${NODE_PORT:-$cur_node}
+
+    if [[ -n "$cur_data" ]]; then
+        read -p "Outbound data ports to tunnel [default: ${cur_data}]: " DATA_PORTS
+        DATA_PORTS=${DATA_PORTS:-$cur_data}
+    else
+        read -p "Outbound data ports to tunnel (comma separated, e.g. 64483,26132,22971): " DATA_PORTS
+    fi
+
+    local detected_ips
+    detected_ips=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2}' | paste -sd, - || true)
+    if [[ -n "$detected_ips" ]]; then
+        echo -e "${CYAN}Detected Public IPv4s on this server:${NC} ${detected_ips}"
+    fi
+    if [[ -n "$cur_bips" ]]; then
+        read -p "Source Bind IPs for failover [default: ${cur_bips}]: " BIND_IPS
+        BIND_IPS=${BIND_IPS:-$cur_bips}
+    else
+        read -p "Optional Clean Source Bind IPs (comma separated, Enter = Auto/Default): " BIND_IPS
+    fi
+
+    cleanup_accounting_rules
+    rm -f "$LAST_GOOD_IP_FILE"
 
     cat > "$FOREIGN_CONF" <<EOF
 IR_IP=${IR_IP}
@@ -682,26 +1354,29 @@ NODE_PORT=${NODE_PORT}
 DATA_PORTS=${DATA_PORTS}
 TLS_SNI=${TLS_SNI}
 BIND_IPS=${BIND_IPS}
+TLS_SECRET=${TLS_SECRET}
 EOF
 
-    echo -e "${YELLOW}Generating SSH key...${NC}"
+    write_tls_client_script
+
+    echo -e "${YELLOW}Checking SSH key & TLS 1.3 connectivity to Iran...${NC}"
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
     if [[ ! -f /root/.ssh/tunnel_key ]]; then
         ssh-keygen -t ed25519 -f /root/.ssh/tunnel_key -N "" -q
     fi
 
-    echo -e "${YELLOW}Copying public key to Iran server over encrypted TLS 1.3 wrapper...${NC}"
-    echo -e "${CYAN}Enter Iran Server root password when asked below:${NC}"
-    local proxy_cmd="/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI}"
-    if [[ -n "$BIND_IPS" ]]; then
-        proxy_cmd+=" ${BIND_IPS}"
+    local proxy_opt="ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' probe"
+    if ssh -i /root/.ssh/tunnel_key -o "$proxy_opt" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$IR_IP" "true" >/dev/null 2>&1; then
+        echo -e "${GREEN}[OK] SSH public key already verified over TLS 1.3 + Secret!${NC}"
+    else
+        echo -e "${CYAN}Enter Iran Server root password once to authorize SSH key over TLS 1.3:${NC}"
+        ssh-copy-id -i /root/.ssh/tunnel_key.pub \
+            -o "$proxy_opt" \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@"$IR_IP"
     fi
-    ssh-copy-id -i /root/.ssh/tunnel_key.pub \
-        -o "ProxyCommand=${proxy_cmd}" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        root@"$IR_IP"
 
     apply_foreign_configs
 }
@@ -711,31 +1386,25 @@ apply_foreign_configs() {
         echo -e "${RED}[ERROR] Configuration not found. Run installation first.${NC}"
         sleep 2; return
     fi
-    local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS=""
+    local IR_IP="" SEC_SSH="" NODE_PORT="62075" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
     source "$FOREIGN_CONF"
     TLS_SNI=${TLS_SNI:-www.microsoft.com}
 
-    ensure_packages openssh-client python3 iptables
+    ensure_packages openssh-client openssl python3
     write_tls_client_script
-
-    echo -e "${YELLOW}Enabling persistent tunnel traffic accounting...${NC}"
     setup_accounting_persistence
 
-    echo -e "${YELLOW}Creating systemd reverse-tunnel service (SSH over TLS 1.3)...${NC}"
-    local proxy_arg="ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI}"
-    if [[ -n "${BIND_IPS:-}" ]]; then
-        proxy_arg+=" ${BIND_IPS}"
-    fi
-
+    echo -e "${YELLOW}Creating systemd reverse-tunnel service (TLS 1.3 + Secret + Failover)...${NC}"
     local SSH_CMD="/usr/bin/ssh -R ${NODE_PORT}:localhost:${NODE_PORT}"
     IFS=',' read -ra PORTS <<< "$DATA_PORTS"
     for port in "${PORTS[@]}"; do
         port=$(echo "$port" | xargs)
+        [[ -n "$port" ]] || continue
         SSH_CMD+=" -R ${port}:localhost:${port}"
     done
     SSH_CMD+=" root@${IR_IP} -N -i /root/.ssh/tunnel_key"
-    SSH_CMD+=" -o \"${proxy_arg}\""
-    SSH_CMD+=" -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    SSH_CMD+=" -o \"ProxyCommand=/usr/bin/python3 ${TLS_CLIENT_PY} ${IR_IP} ${SEC_SSH} ${TLS_SNI} '${BIND_IPS}' '${TLS_SECRET}' tunnel\""
+    SSH_CMD+=" -o ConnectTimeout=12 -o TCPKeepAlive=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
     cat > "$TUNNEL_SERVICE" <<EOF
 [Unit]
@@ -748,7 +1417,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=${SSH_CMD}
 Restart=always
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -758,208 +1427,171 @@ EOF
     systemctl enable reverse-tunnel >/dev/null 2>&1
     systemctl restart reverse-tunnel
 
-    sleep 3
+    sleep 2.5
     if systemctl is-active --quiet reverse-tunnel; then
-        echo -e "${GREEN}[OK] Foreign server configured. TLS 1.3 Tunnel is active to ${IR_IP}:${SEC_SSH}.${NC}"
+        echo -e "${GREEN}[OK] Foreign server active & connected over TLS 1.3 (${IR_IP}:${SEC_SSH}, SNI: ${TLS_SNI}).${NC}"
     else
-        echo -e "${RED}[ERROR] Tunnel service failed to start. Check logs (option 4).${NC}"
+        echo -e "${RED}[ERROR] Tunnel service failed to connect. Check logs (Option 4) or verify Secret/Port.${NC}"
     fi
     echo
     read -p "Press Enter to return to menu..."
 }
 
 manage_service() {
-    local stop_live=0
-    trap 'stop_live=1' INT
-
+    local is_configured=0
     if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
-        setup_accounting_persistence
+        is_configured=1
+        ensure_accounting_rules
     fi
 
-    local prev_ns prev_state prev_rx=0 prev_tx=0 created_at="Not Configured"
-    prev_ns=$(date +%s%N)
-    if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
-        prev_state=$(sync_traffic_state)
-        IFS='|' read -r prev_rx prev_tx created_at <<< "$prev_state"
-        sleep 0.4
+    local prev_rx=0 prev_tx=0 prev_ns=0
+    local cur_rx=0 cur_tx=0 cur_ns=0
+    local state_line="" created_at="Not configured"
+    if (( is_configured == 1 )); then
+        state_line=$(sync_traffic_state)
+        IFS='|' read -r prev_rx prev_tx created_at <<< "$state_line"
+        prev_ns=$(date +%s%N)
     fi
 
-    local esc=$'\033'
-    local clr_eol="${esc}[K"
-    local nl=$'\n'
-    local c_green="${esc}[0;32m"
-    local c_red="${esc}[0;31m"
-    local c_yellow="${esc}[1;33m"
-    local c_cyan="${esc}[0;36m"
-    local c_nc="${esc}[0m"
+    printf '\033[?1049h\033[?25l\033[2J\033[H'
+    local cleanup_done=0
+    restore_terminal() {
+        if (( cleanup_done == 0 )); then
+            cleanup_done=1
+            printf '\033[?25h\033[?1049l'
+        fi
+    }
+    trap 'restore_terminal; exit 0' INT TERM
 
-    printf '\033[?1049h\033[2J\033[H\033[?25l'
+    while true; do
+        local dl_bytes=0 ul_bytes=0 dl_delta=0 ul_delta=0 elapsed_ns=1000000000
+        if (( is_configured == 1 )); then
+            state_line=$(sync_traffic_state)
+            IFS='|' read -r cur_rx cur_tx created_at <<< "$state_line"
+            cur_ns=$(date +%s%N)
 
-    while [[ "$stop_live" -eq 0 ]]; do
-        local now_ns live_clock cur_rx=0 cur_tx=0 total_bytes=0 delta_ns=1000000000 delta_rx=0 delta_tx=0
-        now_ns=$(date +%s%N)
-        live_clock=$(date '+%H:%M:%S')
-        delta_ns=$(( now_ns - prev_ns ))
-        if (( delta_ns <= 0 )); then
-            delta_ns=1
+            elapsed_ns=$(( cur_ns - prev_ns ))
+            (( elapsed_ns <= 0 )) && elapsed_ns=1000000000
+
+            local delta_rx=$(( cur_rx - prev_rx ))
+            local delta_tx=$(( cur_tx - prev_tx ))
+            (( delta_rx < 0 )) && delta_rx=0
+            (( delta_tx < 0 )) && delta_tx=0
+
+            dl_bytes="$cur_rx"
+            ul_bytes="$cur_tx"
+            dl_delta="$delta_rx"
+            ul_delta="$delta_tx"
+
+            prev_rx="$cur_rx"
+            prev_tx="$cur_tx"
+            prev_ns="$cur_ns"
         fi
 
-        if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
-            ensure_accounting_rules
-            local cur_state
-            cur_state=$(sync_traffic_state)
-            IFS='|' read -r cur_rx cur_tx created_at <<< "$cur_state"
-            delta_rx=$(( cur_rx - prev_rx ))
-            delta_tx=$(( cur_tx - prev_tx ))
-            if (( delta_rx < 0 )); then
-                delta_rx=0
+        local dl_total ul_total sum_total dl_speed ul_speed
+        dl_total=$(format_traffic_size "$dl_bytes")
+        ul_total=$(format_traffic_size "$ul_bytes")
+        sum_total=$(format_traffic_size "$(( dl_bytes + ul_bytes ))")
+        dl_speed=$(format_speed_mbs "$dl_delta" "$elapsed_ns")
+        ul_speed=$(format_speed_mbs "$ul_delta" "$elapsed_ns")
+
+        local screen_buf=""
+        screen_buf+="${GREEN}============================================================${NC}\033[K\n"
+        screen_buf+="${CYAN}  PG Node SSH Tunnel Manager v${SCRIPT_VERSION}         [Live $(date '+%H:%M:%S')]${NC}\033[K\n"
+        screen_buf+="${GREEN}============================================================${NC}\033[K\n"
+        screen_buf+="${CYAN}=== Tunnel Traffic & Speed (Since: ${created_at}) ===${NC}\033[K\n"
+        screen_buf+=$(printf "  ${GREEN}Download Used${NC}      : %-12s |  ${GREEN}Download Speed${NC} : %s\033[K\n" "$dl_total" "$dl_speed")
+        screen_buf+=$(printf "  ${YELLOW}Upload Used${NC}        : %-12s |  ${YELLOW}Upload Speed${NC}   : %s\033[K\n" "$ul_total" "$ul_speed")
+        screen_buf+=$(printf "  ${CYAN}Total Traffic Used${NC} : %-12s\033[K\n" "$sum_total")
+        screen_buf+="------------------------------------------------------------\033[K\n"
+
+        screen_buf+="${CYAN}=== System & Anti-DPI Status ===${NC}\033[K\n"
+        if [[ -f "$TUNNEL_SERVICE" ]]; then
+            local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
+            [[ -f "$FOREIGN_CONF" ]] && source "$FOREIGN_CONF"
+            local active_state sub_state active_since main_pid mem_bytes mem_mb last_log active_ip auth_tag
+            active_state=$(systemctl show reverse-tunnel -p ActiveState --value 2>/dev/null || echo "unknown")
+            sub_state=$(systemctl show reverse-tunnel -p SubState --value 2>/dev/null || echo "unknown")
+            active_since=$(systemctl show reverse-tunnel -p ActiveEnterTimestamp --value 2>/dev/null || echo "N/A")
+            main_pid=$(systemctl show reverse-tunnel -p MainPID --value 2>/dev/null || echo "0")
+            mem_bytes=$(systemctl show reverse-tunnel -p MemoryCurrent --value 2>/dev/null || echo "0")
+            mem_mb="N/A"
+            if [[ "$mem_bytes" =~ ^[0-9]+$ ]] && (( mem_bytes > 0 && mem_bytes < 1099511627776 )); then
+                mem_mb=$(awk -v m="$mem_bytes" 'BEGIN { printf "%.1f MB", m / 1048576.0 }')
             fi
-            if (( delta_tx < 0 )); then
-                delta_tx=0
+            active_ip="Default"
+            [[ -f "$LAST_GOOD_IP_FILE" ]] && active_ip=$(cat "$LAST_GOOD_IP_FILE" 2>/dev/null | xargs || echo "Default")
+            auth_tag="Legacy"
+            [[ -n "${TLS_SECRET:-}" ]] && auth_tag="Secret+Camo"
+            last_log=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
+
+            if [[ "$active_state" == "active" ]]; then
+                screen_buf+="  Service State   : ${GREEN}${active_state} (${sub_state})${NC} since ${active_since:-N/A}\033[K\n"
+            else
+                screen_buf+="  Service State   : ${RED}${active_state} (${sub_state})${NC}\033[K\n"
             fi
-            total_bytes=$(( cur_rx + cur_tx ))
+            screen_buf+="  Process / RAM   : Main PID ${main_pid} | Memory: ${mem_mb}\033[K\n"
+            screen_buf+="  TLS 1.3 Target  : ${IR_IP:-N/A}:${SEC_SSH:-N/A} | SNI: ${TLS_SNI} [${auth_tag}]\033[K\n"
+            screen_buf+="  Active Bind IP  : ${GREEN}${active_ip}${NC} (Pool: ${BIND_IPS:-Default})\033[K\n"
+            screen_buf+="  Tunnel Ports    : Node ${NODE_PORT:-N/A} | Data ${DATA_PORTS:-N/A}\033[K\n"
+            [[ -n "$last_log" ]] && screen_buf+="  Latest Log      : ${last_log}\033[K\n"
+        else
+            local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com" TLS_SECRET=""
+            [[ -f "$IRAN_CONF" ]] && source "$IRAN_CONF"
+            local tls_status="${RED}Inactive${NC}" cert_badge auth_mode="Legacy"
+            cert_badge=$(get_cert_badge)
+            [[ -n "${TLS_SECRET:-}" ]] && auth_mode="Trojan-Auth+WebCamo"
+            if systemctl is-active --quiet pg-tls-server.service 2>/dev/null; then
+                tls_status="${GREEN}Active on Port ${SEC_SSH} (${cert_badge}, ${auth_mode})${NC}"
+            fi
+            screen_buf+="  TLS 1.3 Server  : ${tls_status}\033[K\n"
+            screen_buf+="  Cover Domain    : ${TLS_SNI:-N/A}\033[K\n"
+
+            local ssh_ports tunnel_ports
+            ssh_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
+            tunnel_ports=$(ss -tlnp 2>/dev/null | awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')
+            screen_buf+="  SSH / Tunnel Prt: SSH [${ssh_ports}] | Local [${tunnel_ports}]\033[K\n"
+            screen_buf+="  NAT OUTPUT Rules:\033[K\n"
+            local nat_summary
+            nat_summary=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
+                NR > 2 && NF >= 9 {
+                    rule = "    #" $1 " " $4 " -> " $9
+                    if ($4 == "REDIRECT") rule = rule ":" $12 " => :" $NF
+                    print rule " (pkts:" $2 ", " $3 ")"
+                }' | head -n 6 || true)
+            if [[ -n "$nat_summary" ]]; then
+                while IFS= read -r nline; do
+                    screen_buf+="${nline}\033[K\n"
+                done <<< "$nat_summary"
+            else
+                screen_buf+="    (No active NAT OUTPUT rules)\033[K\n"
+            fi
         fi
 
-        local dl_used ul_used total_used dl_speed ul_speed
-        dl_used=$(format_traffic_size "$cur_rx")
-        ul_used=$(format_traffic_size "$cur_tx")
-        total_used=$(format_traffic_size "$total_bytes")
-        dl_speed=$(format_speed_mbs "$delta_rx" "$delta_ns")
-        ul_speed=$(format_speed_mbs "$delta_tx" "$delta_ns")
-
-        prev_rx="$cur_rx"
-        prev_tx="$cur_tx"
-        prev_ns="$now_ns"
-
-        local cron_info
+        screen_buf+="${CYAN}=== Smart Auto-Heal Cronjob ===${NC}\033[K\n"
         if [[ -f "$CRON_FILE" ]]; then
             local cron_sched
-            cron_sched=$(awk '{print $1,$2,$3,$4,$5}' "$CRON_FILE" 2>/dev/null || echo "enabled")
-            cron_info="  Schedule : ${c_green}Active (${cron_sched})${c_nc}"
+            cron_sched=$(awk '{print $1" "$2" "$3" "$4" "$5}' "$CRON_FILE" 2>/dev/null || echo "Active")
+            screen_buf+="  Schedule : ${GREEN}Active (${cron_sched})${NC}\033[K\n"
         else
-            cron_info="  Schedule : ${c_yellow}Disabled${c_nc}"
+            screen_buf+="  Schedule : ${YELLOW}Disabled${NC}\033[K\n"
         fi
+        screen_buf+="------------------------------------------------------------\033[K\n"
+        screen_buf+="${YELLOW}Updating every 1s... Press [Enter] or [q] to return to menu.${NC}\033[K\n"
+        screen_buf+="\033[J"
 
-        local sys_details=""
-        if [[ -f "$TUNNEL_SERVICE" ]]; then
-            local IR_IP="" SEC_SSH="" NODE_PORT="" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS=""
-            if [[ -f "$FOREIGN_CONF" ]]; then
-                source "$FOREIGN_CONF"
-            fi
-            local svc_props active_st="unknown" sub_st="" main_pid="0" mem_bytes="" since_ts=""
-            svc_props=$(systemctl show reverse-tunnel.service --no-page -p ActiveState,SubState,MainPID,MemoryCurrent,ActiveEnterTimestamp 2>/dev/null || true)
-            while IFS='=' read -r k v; do
-                case "$k" in
-                    ActiveState) active_st="$v" ;;
-                    SubState) sub_st="$v" ;;
-                    MainPID) main_pid="$v" ;;
-                    MemoryCurrent) mem_bytes="$v" ;;
-                    ActiveEnterTimestamp) since_ts="$v" ;;
-                esac
-            done <<< "$svc_props"
-
-            local mem_str st_color="$c_red"
-            if [[ "$active_st" == "active" ]]; then
-                st_color="$c_green"
-            elif [[ "$active_st" == "activating" ]]; then
-                st_color="$c_yellow"
-            fi
-            mem_str=$(awk -v m="${mem_bytes:-}" 'BEGIN {
-                if (m ~ /^[0-9]+$/ && (m + 0.0) < 1099511627776.0) printf "%.1f MB", (m + 0.0) / 1048576.0
-                else printf "N/A"
-            }')
-            local last_log
-            last_log=$(journalctl -u reverse-tunnel.service -n 1 --no-pager -o cat 2>/dev/null || true)
-            last_log="${last_log:-No recent log entries}"
-            last_log="${last_log:0:52}"
-
-            sys_details+="  Service State   : ${st_color}${active_st} (${sub_st})${c_nc}${since_ts:+ since ${since_ts:0:27}}${nl}"
-            sys_details+="  Process / RAM   : Main PID ${main_pid} | Memory: ${mem_str}${nl}"
-            sys_details+="  TLS 1.3 Target  : ${IR_IP:-N/A}:${SEC_SSH:-N/A} (SNI: ${TLS_SNI:-www.microsoft.com})${nl}"
-            sys_details+="  Source / Ports  : Bind ${BIND_IPS:-Auto} | Node ${NODE_PORT:-N/A}, Data ${DATA_PORTS:-N/A}${nl}"
-            sys_details+="  Latest Log      : ${last_log}"
-
-        elif [[ -f "$IRAN_CONF" ]]; then
-            local OUT_IP="" DATA_PORTS="" SEC_SSH="" TLS_SNI="www.microsoft.com"
-            source "$IRAN_CONF"
-            local tls_status="${c_yellow}Not Installed (Raw SSH Mode)${c_nc}"
-            if [[ -f "$TLS_SERVER_SERVICE" ]]; then
-                if systemctl is-active --quiet pg-tls-server.service 2>/dev/null; then
-                    tls_status="${c_green}Active on Port ${SEC_SSH} (SNI: ${TLS_SNI:-www.microsoft.com})${c_nc}"
-                else
-                    tls_status="${c_red}Inactive on Port ${SEC_SSH}${c_nc}"
-                fi
-            fi
-
-            local ss_raw pub_ssh_ports tun_local_ports nat_compact
-            ss_raw=$(ss -tlnp4 2>/dev/null || ss -tlnp 2>/dev/null || true)
-            pub_ssh_ports=$(awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {
-                n = split($4, a, ":"); p = a[n]
-                if (!seen[p]++) out = (out == "" ? p : out ", " p)
-            } END { print (out == "" ? "None" : out) }' <<< "$ss_raw")
-            tun_local_ports=$(awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {
-                n = split($4, a, ":"); p = a[n]
-                if (!seen[p]++) out = (out == "" ? p : out ", " p)
-            } END { print out }' <<< "$ss_raw")
-
-            if [[ -n "$tun_local_ports" ]]; then
-                tun_local_ports="${c_green}${tun_local_ports:0:50}${c_nc}"
-            else
-                tun_local_ports="${c_red}None (Tunnel Not Connected)${c_nc}"
-            fi
-
-            nat_compact=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
-                NR > 2 && NF >= 9 && count < 6 {
-                    count++
-                    num = $1; pkts = $2; bytes = $3; tgt = $4
-                    dst = ($6 == "--" && NF >= 10) ? $10 : $9
-                    dpt = ""; rpt = ""
-                    for (i = 9; i <= NF; i++) {
-                        if ($i ~ /^dpt:/) { sub(/^dpt:/, "", $i); dpt = ":" $i }
-                        if ($i == "ports" && (i + 1) <= NF) { rpt = " => :" $(i + 1) }
-                    }
-                    printf "    #%s %-8s -> %s%s%s (pkts:%s, %s)\n", num, tgt, dst, dpt, rpt, pkts, bytes
-                }' || true)
-            nat_compact="${nat_compact:-    No rules in nat OUTPUT chain}"
-
-            sys_details+="  TLS 1.3 Server   : ${tls_status}${nl}"
-            sys_details+="  SSH / Tunnel Prt : SSH [${pub_ssh_ports}] | Local [${tun_local_ports}]${nl}"
-            sys_details+="  NAT OUTPUT Rules :${nl}${nat_compact}"
-        else
-            sys_details+="  ${c_yellow}No tunnel configuration detected on this server yet.${c_nc}"
-        fi
-
-        local frame=""
-        frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
-        frame+="$(printf "  ${c_cyan}PG Node SSH Tunnel Manager v%s${c_nc}         ${c_yellow}[Live %s]${c_nc}" "$SCRIPT_VERSION" "$live_clock")${clr_eol}${nl}"
-        frame+="${c_green}============================================================${c_nc}${clr_eol}${nl}"
-        frame+="${c_cyan}=== Tunnel Traffic & Speed (Since: ${created_at}) ===${c_nc}${clr_eol}${nl}"
-        frame+=$(printf "  Download Used      : ${c_green}%-12s${c_nc} |  Download Speed : ${c_cyan}%s${c_nc}${clr_eol}" "$dl_used" "$dl_speed")$'\n'
-        frame+=$(printf "  Upload Used        : ${c_green}%-12s${c_nc} |  Upload Speed   : ${c_cyan}%s${c_nc}${clr_eol}" "$ul_used" "$ul_speed")$'\n'
-        frame+=$(printf "  Total Traffic Used : ${c_yellow}%s${c_nc}${clr_eol}" "$total_used")$'\n'
-        frame+="------------------------------------------------------------${clr_eol}${nl}"
-        frame+="${c_cyan}=== System & Rules Status ===${c_nc}${clr_eol}${nl}"
-        while IFS= read -r line; do
-            frame+="${line}${clr_eol}${nl}"
-        done <<< "$sys_details"
-        frame+="${c_cyan}=== Auto-Restart Cronjob ===${c_nc}${clr_eol}${nl}"
-        frame+="${cron_info}${clr_eol}${nl}"
-        frame+="------------------------------------------------------------${clr_eol}${nl}"
-        frame+="${c_yellow}Updating every 1s... Press [Enter] or [q] to return to menu.${c_nc}${clr_eol}"
-
-        printf '\033[H%s\033[J' "$frame"
+        printf '\033[H%b' "$screen_buf"
 
         local key=""
-        if read -r -s -n 1 -t 1 key; then
-            if [[ -z "$key" || "$key" == $'\r' || "$key" == $'\n' || "$key" == "q" || "$key" == "Q" ]]; then
-                read -r -s -t 0.02 -n 100 _ 2>/dev/null || true
+        if IFS= read -r -s -n 1 -t 1 key; then
+            if [[ -z "$key" || "$key" == "q" || "$key" == "Q" || "$key" == "0" ]]; then
                 break
             fi
         fi
     done
 
-    trap - INT
-    printf '\033[?25h\033[?1049l'
+    trap - INT TERM
+    restore_terminal
 }
 
 uninstall_all() {
@@ -968,40 +1600,39 @@ uninstall_all() {
     rm -f "$CRON_FILE" "$ACCT_CRON_FILE"
 
     if [[ -f "$ACCT_SERVICE" ]]; then
-        systemctl stop pg-tunnel-acct.service 2>/dev/null || true
-        systemctl disable pg-tunnel-acct.service 2>/dev/null || true
+        systemctl disable pg-tunnel-acct.service >/dev/null 2>&1 || true
         rm -f "$ACCT_SERVICE"
-        systemctl daemon-reload 2>/dev/null || true
     fi
 
     cleanup_accounting_rules
-    rm -f "$TRAFFIC_STATE" "$TRAFFIC_LOCK" "${TRAFFIC_STATE}.tmp."*
 
     if [[ -f "$FOREIGN_CONF" ]]; then
         systemctl stop reverse-tunnel 2>/dev/null || true
         systemctl disable reverse-tunnel 2>/dev/null || true
-        rm -f "$TUNNEL_SERVICE" "$TLS_CLIENT_PY"
+        rm -f "$TUNNEL_SERVICE" "$TLS_CLIENT_PY" "$LAST_GOOD_IP_FILE"
         systemctl daemon-reload
-        rm -f "$FOREIGN_CONF"
-        echo -e "${GREEN}[OK] Service, TLS client, and traffic counters removed from Foreign server.${NC}"
+        rm -f "$FOREIGN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
+        echo -e "${GREEN}[OK] Reverse TLS tunnel service & accounting removed from Foreign server.${NC}"
     elif [[ -f "$IRAN_CONF" ]]; then
-        if [[ -f "$TLS_SERVER_SERVICE" ]]; then
-            systemctl stop pg-tls-server.service 2>/dev/null || true
-            systemctl disable pg-tls-server.service 2>/dev/null || true
-            rm -f "$TLS_SERVER_SERVICE"
-            systemctl daemon-reload 2>/dev/null || true
-        fi
-        rm -f "$TLS_SERVER_PY" "$TLS_CERT" "$TLS_KEY"
+        local OUT_IP="" NODE_PORT="" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
         source "$IRAN_CONF"
+        systemctl stop pg-tls-server.service 2>/dev/null || true
+        systemctl disable pg-tls-server.service 2>/dev/null || true
+        rm -f "$TLS_SERVER_SERVICE" "$TLS_SERVER_PY" "$TLS_CERT" "$TLS_KEY"
+        systemctl daemon-reload
+        release_iran_tunnel_ports 2>/dev/null || true
         IFS=',' read -ra PORTS <<< "$DATA_PORTS"
         for port in "${PORTS[@]}"; do
             port=$(echo "$port" | xargs)
+            [[ -n "$port" ]] || continue
             iptables -t nat -D OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
         done
         netfilter-persistent save >/dev/null 2>&1 || true
-        rm -f "$IRAN_CONF"
-        echo -e "${GREEN}[OK] TLS server, iptables rules, and traffic counters removed from Iran server.${NC}"
+        rm -f "$IRAN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
+        echo -e "${GREEN}[OK] TLS 1.3 server, iptables rules & accounting removed safely from Iran server.${NC}"
     else
+        rm -f "$TRAFFIC_STATE" "$TRAFFIC_LOCK"
+        systemctl daemon-reload 2>/dev/null || true
         echo -e "${YELLOW}No configuration found to uninstall.${NC}"
     fi
     read -p "Press Enter to return to menu..."
@@ -1010,13 +1641,13 @@ uninstall_all() {
 view_logs() {
     print_header
     if [[ -f "$TUNNEL_SERVICE" ]]; then
-        echo -e "${CYAN}Live Foreign Tunnel Logs (Press Ctrl+C to exit)...${NC}"
-        journalctl -u reverse-tunnel.service -f --no-pager
+        echo -e "${CYAN}Live Foreign Tunnel Logs (Press Ctrl+C to return)...${NC}"
+        journalctl -u reverse-tunnel.service -n 30 -f --no-pager || true
     elif [[ -f "$TLS_SERVER_SERVICE" ]]; then
-        echo -e "${CYAN}Live Iran TLS Wrapper & SSH Logs (Press Ctrl+C to exit)...${NC}"
-        journalctl -u pg-tls-server.service -u ssh.service -f --no-pager
+        echo -e "${CYAN}Live Iran TLS 1.3 & SSH Logs (Press Ctrl+C to return)...${NC}"
+        journalctl -u pg-tls-server.service -u ssh.service -n 30 -f --no-pager || true
     else
-        echo -e "${RED}Tunnel service not found on this server.${NC}"
+        echo -e "${RED}No active tunnel service found on this server.${NC}"
         read -p "Press Enter to return to menu..."
     fi
 }
@@ -1079,114 +1710,103 @@ EOF
     read -p "Press Enter to return to menu..."
 }
 
-normalize_git_ref() {
-    local ref="$1"
-    ref=$(echo "$ref" | xargs)
-    ref="${ref#https://github.com/${REPO_SLUG}/tree/}"
-    ref="${ref#https://github.com/${REPO_SLUG}/blob/}"
-    ref="${ref#https://github.com/${REPO_SLUG}/commit/}"
-    ref="${ref#origin/}"
-    ref="${ref%/script.sh}"
-    echo "$ref"
+version_gt() {
+    local v1="${1#v}" v2="${2#v}"
+    [[ "$v1" == "$v2" ]] && return 1
+    local highest
+    highest=$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | tail -n 1)
+    [[ "$highest" == "$v1" ]]
 }
 
 extract_script_version() {
     local file="$1"
     local ver=""
-    ver=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' "$file" | head -n 1)
+    ver=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n 1 || true)
     if [[ -z "$ver" ]]; then
-        ver=$(sed -n 's/^#.*Manager v\([0-9][0-9.]*\).*/\1/p' "$file" | head -n 1)
+        ver=$(sed -n 's/.*Tunnel Manager v\([0-9][0-9.]*\).*/\1/p' "$file" 2>/dev/null | head -n 1 || true)
     fi
     echo "${ver:-0.0}"
 }
 
-version_gt() {
-    local v1="$1" v2="$2"
-    if [[ "$v1" == "$v2" ]]; then
-        return 1
+validate_downloaded_script() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -q '^#!/bin/bash' || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+normalize_git_ref() {
+    local raw="$1"
+    raw=$(echo "$raw" | xargs)
+    raw="${raw#https://github.com/${GITHUB_REPO_SLUG}/tree/}"
+    raw="${raw#https://github.com/${GITHUB_REPO_SLUG}/commit/}"
+    raw="${raw#origin/}"
+    raw="${raw%/}"
+    echo "$raw"
+}
+
+resolve_ref_latest_sha() {
+    local ref="$1"
+    local json="" sha=""
+    json=$(curl -fsSL --connect-timeout 8 --max-time 15 \
+        -G --data-urlencode "sha=${ref}" --data-urlencode "per_page=1" \
+        -H "Accept: application/vnd.github+json" \
+        -H "Cache-Control: no-cache" \
+        "${GITHUB_API_BASE}/commits" 2>/dev/null || true)
+    if [[ -n "$json" ]]; then
+        sha=$(echo "$json" | grep -m 1 '"sha"' | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{7,40\}\)".*/\1/p' || true)
     fi
-    local IFS=.
-    local i a=() b=()
-    read -ra a <<< "$v1"
-    read -ra b <<< "$v2"
-    local len=${#a[@]}
-    if (( ${#b[@]} > len )); then
-        len=${#b[@]}
-    fi
-    for (( i=0; i<len; i++ )); do
-        local n1="${a[i]:-0}"
-        local n2="${b[i]:-0}"
-        if (( 10#$n1 > 10#$n2 )); then
-            return 0
-        elif (( 10#$n1 < 10#$n2 )); then
-            return 1
-        fi
-    done
-    return 1
+    echo "$sha"
 }
 
 fetch_script_from_ref() {
-    local target_ref="$1"
-    local dest_file="$2"
-    local resolved_sha=""
-    local api_json=""
+    local ref="$1"
+    local out_file="$2"
+    local sha="" target_ref="$ref"
 
-    api_json=$(curl -fsSL --connect-timeout 8 --max-time 15 \
-        -G --data-urlencode "sha=${target_ref}" --data-urlencode "per_page=1" \
-        "https://api.github.com/repos/${REPO_SLUG}/commits" 2>/dev/null || true)
-
-    if [[ -n "$api_json" ]]; then
-        resolved_sha=$(sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' <<< "$api_json" | head -n 1)
+    sha=$(resolve_ref_latest_sha "$ref")
+    if [[ -n "$sha" ]]; then
+        target_ref="$sha"
     fi
 
-    local download_ref="${resolved_sha:-$target_ref}"
-    local downloaded=0
-
-    if curl -fsSL --connect-timeout 8 --max-time 25 \
+    if curl -fsSL --connect-timeout 8 --max-time 20 \
+        -G --data-urlencode "ref=${target_ref}" \
         -H "Accept: application/vnd.github.raw+json" \
-        -G --data-urlencode "ref=${download_ref}" \
-        "https://api.github.com/repos/${REPO_SLUG}/contents/script.sh" \
-        -o "$dest_file" 2>/dev/null; then
-        downloaded=1
-    elif curl -fsSL --connect-timeout 8 --max-time 25 \
         -H "Cache-Control: no-cache" \
-        "https://raw.githubusercontent.com/${REPO_SLUG}/${download_ref}/script.sh?cb=$(date +%s)" \
-        -o "$dest_file" 2>/dev/null; then
-        downloaded=1
+        "${GITHUB_API_BASE}/contents/script.sh" -o "$out_file" 2>/dev/null && validate_downloaded_script "$out_file"; then
+        echo "$target_ref"
+        return 0
     fi
 
-    if [[ "$downloaded" -ne 1 || ! -s "$dest_file" ]]; then
-        rm -f "$dest_file"
-        return 1
+    if curl -fsSL --connect-timeout 8 --max-time 20 \
+        -H "Cache-Control: no-cache" \
+        "${GITHUB_RAW_BASE}/${target_ref}/script.sh?cb=$(date +%s)" -o "$out_file" 2>/dev/null && validate_downloaded_script "$out_file"; then
+        echo "$target_ref"
+        return 0
     fi
 
-    if [[ "$(head -n 1 "$dest_file")" != "#!/bin/bash"* ]] || ! bash -n "$dest_file" 2>/dev/null; then
-        rm -f "$dest_file"
-        return 1
-    fi
-
-    echo "$download_ref"
-    return 0
+    rm -f "$out_file"
+    return 1
 }
 
 update_script() {
     print_header
     echo -e "${CYAN}=== Update Script from GitHub ===${NC}"
-    sync_traffic_state >/dev/null 2>&1 || true
+    echo -e "Current Installed Version : ${GREEN}v${SCRIPT_VERSION}${NC}"
+    echo
 
-    local tmp_main="/usr/local/bin/pg-tunnel.main.tmp"
-    local tmp_target="/usr/local/bin/pg-tunnel.tmp"
+    local tmp_main="/tmp/pg-tunnel-main.$$"
+    local tmp_target="/tmp/pg-tunnel-target.$$"
     rm -f "$tmp_main" "$tmp_target"
 
     echo -e "${YELLOW}Checking latest version on 'main' branch...${NC}"
     local main_ref="" main_ver="0.0"
     if main_ref=$(fetch_script_from_ref "main" "$tmp_main"); then
         main_ver=$(extract_script_version "$tmp_main")
-        echo -e "  Current Installed Version : ${CYAN}v${SCRIPT_VERSION}${NC}"
-        echo -e "  GitHub 'main' Version     : ${GREEN}v${main_ver}${NC} (${main_ref:0:7})"
+        echo -e "Latest Version on 'main'  : ${CYAN}v${main_ver}${NC} (${main_ref:0:7})"
     else
-        echo -e "  Current Installed Version : ${CYAN}v${SCRIPT_VERSION}${NC}"
-        echo -e "  GitHub 'main' Status      : ${YELLOW}Could not verify 'main' automatically${NC}"
+        echo -e "${YELLOW}[WARN] Could not reach 'main' branch info.${NC}"
     fi
     echo
 
@@ -1252,7 +1872,7 @@ repair_tunnels() {
 
 setup_cronjob() {
     print_header
-    echo -e "${CYAN}=== Auto-Restart Cronjob Configuration ===${NC}"
+    echo -e "${CYAN}=== Smart Auto-Heal Cronjob Configuration ===${NC}"
     echo "  1) Every 1 Hour"
     echo "  2) Every 2 Hours"
     echo "  3) Every 3 Hours"
@@ -1263,22 +1883,20 @@ setup_cronjob() {
     echo -e "------------------------------------------------------------"
     read -p "Select interval option [1-7]: " cron_choice
 
-    local min_offset="0"
-    if [[ -f "$FOREIGN_CONF" ]]; then
-        min_offset="1"
-    fi
+    local min_slot="0"
+    [[ -f "$FOREIGN_CONF" ]] && min_slot="1"
 
     local schedule=""
     case $cron_choice in
-        1) schedule="${min_offset} * * * *" ;;
-        2) schedule="${min_offset} */2 * * *" ;;
-        3) schedule="${min_offset} */3 * * *" ;;
-        4) schedule="${min_offset} */5 * * *" ;;
-        5) schedule="${min_offset} */12 * * *" ;;
-        6) schedule="${min_offset} 0 * * *" ;;
+        1) schedule="${min_slot} * * * *" ;;
+        2) schedule="${min_slot} */2 * * *" ;;
+        3) schedule="${min_slot} */3 * * *" ;;
+        4) schedule="${min_slot} */5 * * *" ;;
+        5) schedule="${min_slot} */12 * * *" ;;
+        6) schedule="${min_slot} 0 * * *" ;;
         7)
             rm -f "$CRON_FILE"
-            echo -e "${GREEN}[OK] Auto-restart cronjob disabled.${NC}"
+            echo -e "${GREEN}[OK] Auto-heal cronjob disabled.${NC}"
             read -p "Press Enter to return to menu..."
             return
             ;;
@@ -1291,7 +1909,7 @@ setup_cronjob() {
 
     echo "$schedule root /usr/local/bin/pg-tunnel cron-auto-repair >/dev/null 2>&1" > "$CRON_FILE"
     chmod 644 "$CRON_FILE"
-    echo -e "${GREEN}[OK] Cronjob scheduled successfully: ($schedule)${NC}"
+    echo -e "${GREEN}[OK] Smart non-disruptive auto-heal scheduled: ($schedule)${NC}"
     echo
     read -p "Press Enter to return to menu..."
 }
@@ -1299,7 +1917,7 @@ setup_cronjob() {
 main_menu() {
     while true; do
         print_header
-        echo "  1. Install / Configure Tunnel (TLS 1.3 Anti-DPI)"
+        echo "  1. Install / Configure Tunnel"
         echo "  2. Check Status / Rules & Live Speed"
         echo "  3. Uninstall Safely"
         echo "  4. View Tunnel Logs"
