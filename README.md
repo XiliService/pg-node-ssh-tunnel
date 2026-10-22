@@ -16,10 +16,10 @@ sudo curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github
 ```
 
 ### ب) نصب مستقیم از شاخه نشست کاری یا کامیت دلخواه (بدون نیاز به PR و Merge)
-برای دریافت مستقیم آخرین کامیت یک شاخه کاری (مثلاً `arena/...`) بدون نیاز به ساخت Pull Request یا Merge در `main`، کافیست مقدار `BRANCH` را قرار داده و اجرا کنید:
+برای دریافت مستقیم آخرین کامیت هر شاخه کاری یا کامیت دلخواه بدون نیاز به ساخت Pull Request یا Merge در `main`، کافیست نام شاخه یا هش کامیت را به جای `YOUR_BRANCH_OR_COMMIT` قرار داده و اجرا کنید:
 
 ```bash
-BRANCH="arena/3db13c2c-pg-node-ssh-tunnel" && sudo mkdir -p /etc/pg-tunnel && echo "$BRANCH" | sudo tee /etc/pg-tunnel/update_ref.conf >/dev/null && sudo curl -fsSL -H "Accept: application/vnd.github.raw+json" -G --data-urlencode "ref=${BRANCH}" "https://api.github.com/repos/XiliService/pg-node-ssh-tunnel/contents/script.sh" -o /usr/local/bin/pg-tunnel && sudo chmod +x /usr/local/bin/pg-tunnel && sudo pg-tunnel
+BRANCH="YOUR_BRANCH_OR_COMMIT" && sudo curl -fsSL -H "Accept: application/vnd.github.raw+json" -G --data-urlencode "ref=${BRANCH}" "https://api.github.com/repos/XiliService/pg-node-ssh-tunnel/contents/script.sh" -o /usr/local/bin/pg-tunnel && sudo chmod +x /usr/local/bin/pg-tunnel && sudo pg-tunnel
 ```
 
 پس از اولین اجرا، اسکریپت روی سرور ثبت شده و در دفعات بعدی فقط کافیست دستور زیر را بزنید (و برای بروزرسانی‌های بعدی مستقیماً از **گزینه ۶ منو** استفاده کنید):
@@ -59,7 +59,7 @@ pg-tunnel
 با انتخاب گزینه `6` (`Update Script`):
 - اسکریپت ابتدا آخرین نسخه موجود در شاخه `main` گیت‌هاب را بررسی و با نسخه فعلی مقایسه می‌کند.
 - اگر نسخه `main` جدیدتر از نسخه فعلی باشد، خودکار همان نسخه را نصب می‌کند.
-- **اگر نسخه شاخه `main` پایین‌تر یا برابر با نسخه فعلی باشد**، از شما **نام شاخه نشست کاری** (مانند `arena/...`) یا **هش کامیت (Commit SHA)** را دریافت می‌کند، آخرین کامیت لحظه‌ای آن شاخه را از طریق GitHub API استخراج کرده و بدون معطلی کش CDN و **بدون نیاز به PR یا Merge** آخرین نسخه اسکریپت را جایگزین و اجرا می‌کند (نام آخرین شاخه واردشده نیز برای دفعات بعد در `/etc/pg-tunnel/update_ref.conf` به خاطر سپرده می‌شود).
+- **اگر نسخه شاخه `main` پایین‌تر یا برابر با نسخه فعلی باشد**، از شما به‌صورت دستی **نام شاخه نشست کاری** یا **هش کامیت (Commit SHA)** را دریافت می‌کند، آخرین کامیت لحظه‌ای آن شاخه را از طریق GitHub API استخراج کرده و بدون معطلی کش CDN و **بدون نیاز به PR یا Merge** آخرین نسخه اسکریپت را جایگزین و اجرا می‌کند.
 
 ---
 

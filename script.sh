@@ -22,7 +22,6 @@ REPO_URL="https://raw.githubusercontent.com/${REPO_SLUG}/main/script.sh"
 CONF_DIR="/etc/pg-tunnel"
 IRAN_CONF="${CONF_DIR}/iran.conf"
 FOREIGN_CONF="${CONF_DIR}/foreign.conf"
-UPDATE_REF_FILE="${CONF_DIR}/update_ref.conf"
 TRAFFIC_STATE="${CONF_DIR}/traffic.state"
 TRAFFIC_LOCK="${CONF_DIR}/traffic.lock"
 CRON_FILE="/etc/cron.d/pg-tunnel-restart"
@@ -797,20 +796,10 @@ update_script() {
 
     rm -f "$tmp_main"
     echo -e "${YELLOW}Branch 'main' version (v${main_ver}) is lower than or equal to current version (v${SCRIPT_VERSION}).${NC}"
-    echo -e "Enter a working branch name or commit SHA to fetch its latest version directly without PR/Merge."
-
-    local saved_ref=""
-    if [[ -f "$UPDATE_REF_FILE" ]]; then
-        saved_ref=$(cat "$UPDATE_REF_FILE" 2>/dev/null | xargs || true)
-    fi
+    echo -e "Enter a branch name or commit SHA to fetch its latest version directly without PR/Merge."
 
     local input_ref=""
-    if [[ -n "$saved_ref" ]]; then
-        read -p "Branch name or commit SHA [Enter='${saved_ref}', 0=Cancel]: " input_ref
-        input_ref=${input_ref:-$saved_ref}
-    else
-        read -p "Branch name or commit SHA (e.g. arena/... or commit hash, 0=Cancel): " input_ref
-    fi
+    read -p "Enter branch name or commit SHA (0 = Cancel): " input_ref
 
     input_ref=$(normalize_git_ref "$input_ref")
     if [[ -z "$input_ref" || "$input_ref" == "0" ]]; then
@@ -825,8 +814,6 @@ update_script() {
     if resolved_ref=$(fetch_script_from_ref "$input_ref" "$tmp_target"); then
         local target_ver
         target_ver=$(extract_script_version "$tmp_target")
-        mkdir -p "$CONF_DIR"
-        echo "$input_ref" > "$UPDATE_REF_FILE"
         mv -f "$tmp_target" /usr/local/bin/pg-tunnel
         chmod +x /usr/local/bin/pg-tunnel
         echo -e "${GREEN}[OK] Updated from '${input_ref}' at latest commit (${resolved_ref:0:7}) -> v${target_ver}!${NC}"
