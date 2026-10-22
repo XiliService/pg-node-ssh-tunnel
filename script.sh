@@ -243,13 +243,78 @@ EOF
     fi
 }
 
+release_iran_tunnel_ports() {
+    [[ -f "$IRAN_CONF" ]] || return 0
+    local OUT_IP="" DATA_PORTS="" SEC_SSH=""
+    source "$IRAN_CONF"
+    [[ -n "${DATA_PORTS:-}" ]] || return 0
+
+    local port_regex="" p
+    IFS=',' read -ra _ports <<< "$DATA_PORTS"
+    for p in "${_ports[@]}"; do
+        p=$(echo "$p" | xargs)
+        if [[ "$p" =~ ^[0-9]+$ ]]; then
+            port_regex="${port_regex:+${port_regex}|}${p}"
+        fi
+    done
+    [[ -n "$port_regex" ]] || return 0
+
+    local pids=""
+    pids=$(ss -tlnp 2>/dev/null | awk -v pr="^127\\.0\\.0\\.1:(${port_regex})$|^\\[::1\\]:(${port_regex})$" '
+        $4 ~ pr && /sshd/ {
+            if (match($0, /pid=[0-9]+/)) {
+                pid = substr($0, RSTART + 4, RLENGTH - 4)
+                if (!seen[pid]++) print pid
+            }
+        }' || true)
+
+    if [[ -n "$pids" ]]; then
+        local pid
+        for pid in $pids; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 0.3
+        for pid in $pids; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
 fix_legacy_unit_file() {
     local unit_file="/etc/systemd/system/reverse-tunnel.service"
-    if [[ -f "$unit_file" ]] && grep -q '^StartLimitIntervalSec=' "$unit_file"; then
-        if ! awk '/^\[Unit\]/{u=1; next} /^\[/{u=0} u && /^StartLimitIntervalSec=/{found=1} END{exit !found}' "$unit_file"; then
-            sed -i '/^StartLimitIntervalSec=/d' "$unit_file"
-            sed -i '/^\[Unit\]/a StartLimitIntervalSec=0' "$unit_file"
+    local changed=0
+    if [[ -f "$unit_file" ]]; then
+        if grep -q '^StartLimitIntervalSec=' "$unit_file"; then
+            if ! awk '/^\[Unit\]/{u=1; next} /^\[/{u=0} u && /^StartLimitIntervalSec=/{found=1} END{exit !found}' "$unit_file"; then
+                sed -i '/^StartLimitIntervalSec=/d' "$unit_file"
+                sed -i '/^\[Unit\]/a StartLimitIntervalSec=0' "$unit_file"
+                changed=1
+            fi
+        fi
+        if grep -q 'ServerAliveInterval=30' "$unit_file"; then
+            sed -i 's/-o ServerAliveInterval=30 -o ServerAliveCountMax=3/-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o TCPKeepAlive=yes/g' "$unit_file"
+            sed -i 's/^RestartSec=8/RestartSec=3/' "$unit_file"
+            changed=1
+        fi
+        if (( changed == 1 )); then
             systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -f "$FOREIGN_CONF" && -f "$CRON_FILE" ]]; then
+        if grep -q '^0 ' "$CRON_FILE"; then
+            sed -i 's/^0 /1 /' "$CRON_FILE"
+        fi
+    fi
+
+    if [[ -f "$IRAN_CONF" && -f /etc/ssh/sshd_config ]]; then
+        if ! grep -q '^ClientAliveInterval 10' /etc/ssh/sshd_config; then
+            sed -i '/^ClientAliveInterval /d; /^ClientAliveCountMax /d; /^TCPKeepAlive /d' /etc/ssh/sshd_config
+            printf 'TCPKeepAlive yes\nClientAliveInterval 10\nClientAliveCountMax 2\n' >> /etc/ssh/sshd_config
+            mkdir -p /run/sshd
+            if sshd -t 2>/dev/null; then
+                systemctl reload ssh.service 2>/dev/null || systemctl restart ssh.service 2>/dev/null || true
+            fi
         fi
     fi
 }
@@ -267,6 +332,7 @@ handle_cli_subcommands() {
             check_root
             sync_traffic_state >/dev/null 2>&1 || true
             if [[ -f "$IRAN_CONF" ]]; then
+                release_iran_tunnel_ports 2>/dev/null || true
                 systemctl restart ssh.service 2>/dev/null || true
                 source "$IRAN_CONF"
                 IFS=',' read -ra PORTS <<< "$DATA_PORTS"
@@ -346,10 +412,16 @@ apply_iran_configs() {
     systemctl mask ssh.socket 2>/dev/null || true
     rm -rf /etc/systemd/system/ssh.socket.d/
 
-    sed -i '/^Port /d' /etc/ssh/sshd_config
-    echo "Port 22" >> /etc/ssh/sshd_config
-    echo "Port ${SEC_SSH}" >> /etc/ssh/sshd_config
+    sed -i '/^Port /d; /^ClientAliveInterval /d; /^ClientAliveCountMax /d; /^TCPKeepAlive /d' /etc/ssh/sshd_config
+    cat >> /etc/ssh/sshd_config <<EOF
+Port 22
+Port ${SEC_SSH}
+TCPKeepAlive yes
+ClientAliveInterval 10
+ClientAliveCountMax 2
+EOF
 
+    mkdir -p /run/sshd
     systemctl daemon-reload
     systemctl unmask ssh.service 2>/dev/null || true
     systemctl enable ssh.service >/dev/null 2>&1
@@ -430,7 +502,7 @@ apply_foreign_configs() {
         SSH_CMD+=" -R ${port}:localhost:${port}"
     done
     SSH_CMD+=" root@${IR_IP} -p ${SEC_SSH} -N -i /root/.ssh/tunnel_key"
-    SSH_CMD+=" -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no"
+    SSH_CMD+=" -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no"
 
     cat > /etc/systemd/system/reverse-tunnel.service <<EOF
 [Unit]
@@ -443,7 +515,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=${SSH_CMD}
 Restart=always
-RestartSec=8
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -912,7 +984,8 @@ repair_tunnels() {
     echo -e "${CYAN}=== Repair / Restart Tunnels ===${NC}"
     sync_traffic_state >/dev/null 2>&1 || true
     if [[ -f "$IRAN_CONF" ]]; then
-        echo -e "${YELLOW}Restarting SSH and re-applying Iran iptables rules safely...${NC}"
+        echo -e "${YELLOW}Releasing stale tunnel sockets, restarting SSH, and re-applying Iran rules safely...${NC}"
+        release_iran_tunnel_ports 2>/dev/null || true
         systemctl restart ssh.service
         apply_iran_configs
     elif [[ -f "$FOREIGN_CONF" ]]; then
@@ -937,14 +1010,19 @@ setup_cronjob() {
     echo -e "------------------------------------------------------------"
     read -p "Select interval option [1-7]: " cron_choice
 
+    local min_offset="0"
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        min_offset="1"
+    fi
+
     local schedule=""
     case $cron_choice in
-        1) schedule="0 * * * *" ;;
-        2) schedule="0 */2 * * *" ;;
-        3) schedule="0 */3 * * *" ;;
-        4) schedule="0 */5 * * *" ;;
-        5) schedule="0 */12 * * *" ;;
-        6) schedule="0 0 * * *" ;;
+        1) schedule="${min_offset} * * * *" ;;
+        2) schedule="${min_offset} */2 * * *" ;;
+        3) schedule="${min_offset} */3 * * *" ;;
+        4) schedule="${min_offset} */5 * * *" ;;
+        5) schedule="${min_offset} */12 * * *" ;;
+        6) schedule="${min_offset} 0 * * *" ;;
         7)
             rm -f "$CRON_FILE"
             echo -e "${GREEN}[OK] Auto-restart cronjob disabled.${NC}"
