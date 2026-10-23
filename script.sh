@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.2
+# PG Node SSH Tunnel Manager v7.3
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -11,11 +11,13 @@
 #       + TOFU Host-Key Pinning + Unprivileged Sandboxed TLS Wrapper
 #       + Zero-Downtime Secret Rotation + Per-IP Accounting + Backup/Restore
 # v7.2: Streamlined main menu (frequently-used items) + Other Options submenu
+# v7.3: Self-cleaning per-IP accounting (zero-traffic strangers auto-pruned,
+#       surgical rule sync keeps healthy peers' byte counters intact)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.2"
+SCRIPT_VERSION="7.3"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1455,69 +1457,127 @@ ensure_accounting_rules() {
         iptables -t mangle -C OUTPUT -j PG_TUNNEL_OUT 2>/dev/null || \
             iptables -t mangle -I OUTPUT 1 -j PG_TUNNEL_OUT
 
-        # Discover live TLS peer IPs (one per parallel channel / bind IP)
-        local live_peers=() p stored=() s merged=() dup
+        # Discover live TLS peer IPs (one per parallel channel / bind IP).
+        local live_ips=() p
         while read -r p; do
             [[ "$p" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-            live_peers+=("$p")
+            live_ips+=("$p")
         done < <(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {sub(/:[0-9]+$/, "", $4); if ($4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $4}' | sort -u)
+
+        # Stored peers with their last byte snapshot ("IP BYTES"; legacy bare lines count as 0).
+        local stored_ips=() stored_bytes=() s sb
         if [[ -f "$PEER_IPS_FILE" ]]; then
-            while read -r s; do
+            while read -r s sb; do
                 [[ "$s" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-                stored+=("$s")
+                [[ "$sb" =~ ^[0-9]+$ ]] || sb=0
+                stored_ips+=("$s")
+                stored_bytes+=("$sb")
             done < "$PEER_IPS_FILE"
         fi
-        for p in ${live_peers[@]+"${live_peers[@]}"} ${stored[@]+"${stored[@]}"}; do
-            dup=0
-            for s in ${merged[@]+"${merged[@]}"}; do
-                [[ "$s" == "$p" ]] && dup=1
-            done
-            (( dup == 0 )) && merged+=("$p")
-            (( ${#merged[@]} >= 8 )) && break
-        done
-        if (( ${#merged[@]} > 0 )); then
-            mkdir -p "$CONF_DIR"
-            printf '%s\n' "${merged[@]}" > "${PEER_IPS_FILE}.tmp.$$"
-            mv -f "${PEER_IPS_FILE}.tmp.$$" "$PEER_IPS_FILE"
-        fi
 
-        # Per-peer rules first (first-match counters), catch-all last.
-        # Rebuild only when the desired rule set differs (stale/duplicate safe).
-        local want_n=$(( ${#merged[@]} + 1 )) have_n rebuild=0
+        # Current per-peer byte counters from existing mangle rules.
+        local cur_ips=() cur_bytes=() c cb
+        while read -r c cb; do
+            [[ "$c" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            cur_ips+=("$c")
+            cur_bytes+=("$cb")
+        done < <(iptables -t mangle -L PG_TUNNEL_IN -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8, $2}')
+
+        # Keep-set: every currently connected peer, plus stored peers whose
+        # traffic keeps growing (real channels re-earn their slot even while
+        # briefly reconnecting). Zero-traffic strangers such as internet
+        # scanners are dropped from the list automatically.
+        local keep_ips=() k i idx dup
+        for p in ${live_ips[@]+"${live_ips[@]}"}; do
+            dup=0
+            for k in ${keep_ips[@]+"${keep_ips[@]}"}; do
+                [[ "$k" == "$p" ]] && dup=1
+            done
+            (( dup == 0 )) && keep_ips+=("$p")
+        done
+        for i in ${stored_ips[@]+"${!stored_ips[@]}"}; do
+            s="${stored_ips[$i]}"
+            dup=0
+            for k in ${keep_ips[@]+"${keep_ips[@]}"}; do
+                [[ "$k" == "$s" ]] && dup=1
+            done
+            (( dup == 1 )) && continue
+            cb=0
+            for idx in ${cur_ips[@]+"${!cur_ips[@]}"}; do
+                [[ "${cur_ips[$idx]}" == "$s" ]] && cb="${cur_bytes[$idx]}"
+            done
+            if (( cb > ${stored_bytes[$i]} + 512 )); then
+                keep_ips+=("$s")
+            fi
+        done
+        (( ${#keep_ips[@]} > 8 )) && keep_ips=("${keep_ips[@]:0:8}")
+
+        # Surgical rule sync (targeted -D / -I only) so byte counters of
+        # healthy peers are never reset. Per-peer rules are kept ahead of the
+        # catch-all (inserted at position 1) for first-match counting.
+        local have_ip_list have_ip want_n=$(( ${#keep_ips[@]} + 1 )) have_n
+        have_ip_list=$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | sed -n 's/^-A PG_TUNNEL_IN -s \([0-9.]*\) -p tcp .*/\1/p' || true)
+        for have_ip in $have_ip_list; do
+            dup=0
+            for k in ${keep_ips[@]+"${keep_ips[@]}"}; do
+                [[ "$k" == "$have_ip" ]] && dup=1
+            done
+            if (( dup == 0 )); then
+                iptables -t mangle -D PG_TUNNEL_IN -s "$have_ip" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || true
+            fi
+        done
+        for p in ${keep_ips[@]+"${keep_ips[@]}"}; do
+            iptables -t mangle -C PG_TUNNEL_IN -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
+                iptables -t mangle -I PG_TUNNEL_IN 1 -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN
+        done
+        iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || \
+            iptables -t mangle -A PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN
         have_n=$(iptables -t mangle -S PG_TUNNEL_IN 2>/dev/null | grep -c '^-A ' || true)
         if [[ "$have_n" != "$want_n" ]]; then
-            rebuild=1
-        else
-            for p in ${merged[@]+"${merged[@]}"}; do
-                iptables -t mangle -C PG_TUNNEL_IN -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
-            done
-            iptables -t mangle -C PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
-        fi
-        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_IN 2>/dev/null || true
-            for p in ${merged[@]+"${merged[@]}"}; do
+            for p in ${keep_ips[@]+"${keep_ips[@]}"}; do
                 iptables -t mangle -A PG_TUNNEL_IN -s "$p" -p tcp --dport "$SEC_SSH" -j RETURN
             done
             iptables -t mangle -A PG_TUNNEL_IN ! -i lo -p tcp --dport "$SEC_SSH" -j RETURN
         fi
 
-        rebuild=0
+        have_ip_list=$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | sed -n 's/^-A PG_TUNNEL_OUT -d \([0-9.]*\) -p tcp .*/\1/p' || true)
+        for have_ip in $have_ip_list; do
+            dup=0
+            for k in ${keep_ips[@]+"${keep_ips[@]}"}; do
+                [[ "$k" == "$have_ip" ]] && dup=1
+            done
+            if (( dup == 0 )); then
+                iptables -t mangle -D PG_TUNNEL_OUT -d "$have_ip" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || true
+            fi
+        done
+        for p in ${keep_ips[@]+"${keep_ips[@]}"}; do
+            iptables -t mangle -C PG_TUNNEL_OUT -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
+                iptables -t mangle -I PG_TUNNEL_OUT 1 -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN
+        done
+        iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || \
+            iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
         have_n=$(iptables -t mangle -S PG_TUNNEL_OUT 2>/dev/null | grep -c '^-A ' || true)
         if [[ "$have_n" != "$want_n" ]]; then
-            rebuild=1
-        else
-            for p in ${merged[@]+"${merged[@]}"}; do
-                iptables -t mangle -C PG_TUNNEL_OUT -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
-            done
-            iptables -t mangle -C PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN 2>/dev/null || rebuild=1
-        fi
-        if (( rebuild == 1 )); then
             iptables -t mangle -F PG_TUNNEL_OUT 2>/dev/null || true
-            for p in ${merged[@]+"${merged[@]}"}; do
+            for p in ${keep_ips[@]+"${keep_ips[@]}"}; do
                 iptables -t mangle -A PG_TUNNEL_OUT -d "$p" -p tcp --sport "$SEC_SSH" -j RETURN
             done
             iptables -t mangle -A PG_TUNNEL_OUT ! -o lo -p tcp --sport "$SEC_SSH" -j RETURN
         fi
+
+        # Persist keep-set with current counters as the next growth baseline.
+        mkdir -p "$CONF_DIR"
+        {
+            for p in ${keep_ips[@]+"${keep_ips[@]}"}; do
+                cb=0
+                for idx in ${cur_ips[@]+"${!cur_ips[@]}"}; do
+                    [[ "${cur_ips[$idx]}" == "$p" ]] && cb="${cur_bytes[$idx]}"
+                done
+                printf '%s %s\n' "$p" "$cb"
+            done
+        } > "${PEER_IPS_FILE}.tmp.$$"
+        mv -f "${PEER_IPS_FILE}.tmp.$$" "$PEER_IPS_FILE"
 
     elif [[ -f "$FOREIGN_CONF" ]]; then
         local IR_IP="" SEC_SSH="" NODE_PORT="62075" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
