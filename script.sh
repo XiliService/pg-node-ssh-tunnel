@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.3
+# PG Node SSH Tunnel Manager v7.4
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -13,11 +13,13 @@
 # v7.2: Streamlined main menu (frequently-used items) + Other Options submenu
 # v7.3: Self-cleaning per-IP accounting (zero-traffic strangers auto-pruned,
 #       surgical rule sync keeps healthy peers' byte counters intact)
+# v7.4: Warning-free watchdog/listener matching (plain string equality),
+#       auto watchdog refresh on update, cron tuning path is sysctl-only
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.3"
+SCRIPT_VERSION="7.4"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1083,6 +1085,7 @@ write_watchdog_script() {
 # Monitors reverse-forward listeners + TLS sessions and self-heals the
 # TLS wrapper when the tunnel is fully wedged. Conservative by design:
 # healthy or partially-healthy states never trigger a restart.
+# PG-WD-REF: v7.4
 set -u
 CONF="/etc/pg-tunnel/iran.conf"
 STATE_FILE="/etc/pg-tunnel/watchdog.state"
@@ -1106,7 +1109,7 @@ while true; do
     for _p in "${_pp[@]}"; do
         _p="$(echo "$_p" | xargs)"
         [ -n "$_p" ] || continue
-        if ss -tln 2>/dev/null | awk -v ep="127\\.0\\.0\\.1:${_p}$|\\[::1\\]:${_p}$" '$4 ~ ep {f=1} END{exit !f}'; then
+        if ss -tln 2>/dev/null | awk -v p="$_p" '$4 == "127.0.0.1:" p || $4 == "[::1]:" p {f=1} END{exit !f}'; then
             LISTEN=$(( LISTEN + 1 ))
         fi
     done
@@ -1222,9 +1225,10 @@ brute_force_shield_menu() {
 
 ensure_network_tuning() {
     # Best-effort hot re-apply of critical tunnel tuning (BBR + fq +
-    # bufferbloat limit + RPS). Called by cron auto-heal and the boot
-    # oneshot unit so a provider reset or module reload never silently
-    # degrades the tunnel.
+    # bufferbloat limit). Called hourly by cron auto-heal with zero
+    # system-side writes beyond three sysctl values, so the periodic
+    # path can never disturb the NIC. RPS queue spreading is applied
+    # only with the "full" argument (Network Optimizer + boot unit).
     modprobe tcp_bbr 2>/dev/null || true
     local cur
     cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
@@ -1233,13 +1237,15 @@ ensure_network_tuning() {
     [[ "$cur" == "fq" ]] || sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     cur=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)
     [[ "$cur" == "131072" ]] || sysctl -w net.ipv4.tcp_notsent_lowat=131072 >/dev/null 2>&1 || true
-    local q
-    for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
-        [[ -w "$q" ]] || continue
-        if [[ "$(cat "$q" 2>/dev/null || true)" == "00000000" ]]; then
-            echo ffffffff > "$q" 2>/dev/null || true
-        fi
-    done
+    if [[ "${1:-}" == "full" ]]; then
+        local q
+        for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
+            [[ -w "$q" ]] || continue
+            if [[ "$(cat "$q" 2>/dev/null || true)" == "00000000" ]]; then
+                echo ffffffff > "$q" 2>/dev/null || true
+            fi
+        done
+    fi
     return 0
 }
 
@@ -1775,7 +1781,7 @@ release_iran_tunnel_ports() {
     [[ -n "$port_regex" ]] || return 0
 
     local pids=""
-    pids=$(ss -tlnp 2>/dev/null | awk -v pr="^127\\.0\\.0\\.1:(${port_regex})$|^\\[::1\\]:(${port_regex})$" '
+    pids=$(ss -tlnp 2>/dev/null | awk -v pr="^127[.]0[.]0[.]1:(${port_regex})$|^[[]::1[]]:(${port_regex})$" '
         $4 ~ pr && /sshd/ {
             if (match($0, /pid=[0-9]+/)) {
                 pid = substr($0, RSTART + 4, RLENGTH - 4)
@@ -1838,6 +1844,14 @@ migrate_existing_state() {
             sed -i 's/^0 /1 /' "$CRON_FILE"
         fi
     fi
+
+    # Refresh the watchdog script automatically after a script update so
+    # fixes ship without requiring a manual Repair (restarts only the
+    # monitor loop, never the tunnel itself).
+    if [[ -f "$IRAN_CONF" ]] && ! grep -q "PG-WD-REF: v7.4" "$WATCHDOG_SH" 2>/dev/null; then
+        write_watchdog_script
+        systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
+    fi
 }
 
 bootstrap_existing_accounting() {
@@ -1851,7 +1865,7 @@ handle_cli_subcommands() {
     case "${1:-}" in
         ensure-tuning)
             check_root
-            ensure_network_tuning >/dev/null 2>&1 || true
+            ensure_network_tuning full >/dev/null 2>&1 || true
             exit 0
             ;;
         reset-hostkey)
@@ -2910,7 +2924,7 @@ EOF
 
     sysctl --system >/dev/null 2>&1
 
-    ensure_network_tuning
+    ensure_network_tuning full
 
     cat > "$NET_TUNE_SERVICE" <<'EOF'
 [Unit]
