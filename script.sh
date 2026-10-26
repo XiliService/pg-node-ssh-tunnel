@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.4
+# PG Node SSH Tunnel Manager v7.5
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -15,11 +15,13 @@
 #       surgical rule sync keeps healthy peers' byte counters intact)
 # v7.4: Warning-free watchdog/listener matching (plain string equality),
 #       auto watchdog refresh on update, cron tuning path is sysctl-only
+# v7.5: 'Change Node IP' action - safely swap the node's public identity IP
+#       and rebuild NAT redirects without touching the tunnel itself
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.4"
+SCRIPT_VERSION="7.5"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1388,6 +1390,85 @@ backup_restore_menu() {
         0) return ;;
         *) echo -e "${RED}Invalid option.${NC}"; sleep 1; return ;;
     esac
+    read -p "Press Enter to return to menu..."
+}
+
+change_node_ip() {
+    print_header
+    echo -e "${CYAN}=== Change Node IP (Rebuild Redirect Rules) ===${NC}"
+    echo
+    if [[ ! -f "$IRAN_CONF" ]]; then
+        echo -e "${RED}[ERROR] This option must be used on the IRAN server (iran.conf not found).${NC}"
+        read -p "Press Enter to return to menu..."
+        return
+    fi
+    local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+    source "$IRAN_CONF"
+    echo "  Current Node IP : ${OUT_IP:-<none>}"
+    echo "  Redirect Ports  : ${DATA_PORTS:-N/A}"
+    echo
+    read -p "New node IP (leave empty to cancel): " new_ip
+    new_ip=$(echo "$new_ip" | xargs)
+    if [[ -z "$new_ip" ]]; then
+        return
+    fi
+    local oct_ok=1 a b c d
+    if [[ "$new_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        IFS='.' read -r a b c d <<< "$new_ip"
+        (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || oct_ok=0
+    else
+        oct_ok=0
+    fi
+    if (( oct_ok == 0 )); then
+        echo -e "${RED}[ERROR] Invalid IPv4 address.${NC}"
+        sleep 1
+        return
+    fi
+    if [[ -z "${OUT_IP:-}" ]]; then
+        echo -e "${RED}[ERROR] Current OUT_IP is empty - run Repair (Option 6) instead.${NC}"
+        sleep 1
+        return
+    fi
+    if [[ "$new_ip" == "$OUT_IP" ]]; then
+        echo -e "${YELLOW}New IP is identical to the current one - nothing to do.${NC}"
+        sleep 1
+        return
+    fi
+    echo
+    echo "  This will:"
+    echo "    - Update OUT_IP in iran.conf (nothing else in the file is modified)"
+    echo "    - Rebuild only the NAT REDIRECT rules for the new IP"
+    echo "    - NOT touch keys, secret, certificate, BIND_IPS or any service"
+    echo
+    read -p "Apply change ${OUT_IP} -> ${new_ip}? [y/N]: " yn
+    if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+        echo "Aborted. No changes were made."
+        sleep 1
+        return
+    fi
+    sed -i "s|^OUT_IP=.*|OUT_IP=${new_ip}|" "$IRAN_CONF"
+    chown root:pg-tunnel "$IRAN_CONF" 2>/dev/null || true
+    chmod 640 "$IRAN_CONF" 2>/dev/null || true
+
+    local ports=() port
+    IFS=',' read -ra ports <<< "$DATA_PORTS"
+    for port in ${ports[@]+"${ports[@]}"}; do
+        port=$(echo "$port" | xargs)
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        iptables -t nat -D OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    done
+    for port in ${ports[@]+"${ports[@]}"}; do
+        port=$(echo "$port" | xargs)
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        iptables -t nat -C OUTPUT -p tcp -d "$new_ip" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
+        iptables -t nat -A OUTPUT -p tcp -d "$new_ip" --dport "$port" -j REDIRECT --to-ports "$port"
+    done
+    netfilter-persistent save >/dev/null 2>&1 || true
+
+    echo
+    echo -e "${GREEN}[OK] Node IP changed: ${OUT_IP} -> ${new_ip}${NC}"
+    echo -e "${YELLOW}Reminder: update panel node addresses and direct user${NC}"
+    echo -e "${YELLOW}configs to the new IP. The tunnel itself needs no changes.${NC}"
     read -p "Press Enter to return to menu..."
 }
 
@@ -3177,15 +3258,17 @@ other_options_menu() {
         echo "  3. SSH Brute-Force Shield (Port 22)"
         echo "  4. Rotate TLS Secret (Iran, Zero Downtime)"
         echo "  5. Backup / Restore Configs"
+        echo "  6. Change Node IP (Iran, Rebuild Redirects)"
         echo "  0. Back to Main Menu"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-5]: " other_choice
+        read -p "Select option [0-6]: " other_choice
         case $other_choice in
             1) view_logs ;;
             2) setup_cronjob ;;
             3) brute_force_shield_menu ;;
             4) rotate_tls_secret ;;
             5) backup_restore_menu ;;
+            6) change_node_ip ;;
             0) return ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
