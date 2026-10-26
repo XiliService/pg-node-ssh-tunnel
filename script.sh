@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.6
+# PG Node SSH Tunnel Manager v7.7
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -19,11 +19,13 @@
 #       and rebuild NAT redirects without touching the tunnel itself
 # v7.6: Management port (NODE_PORT) joins the redirected port set - the
 #       panel->node API path now also stays on-tunnel behind the node IP
+# v7.7: SSH key-only wizard (multi-key, 3h emergency auto-revert, manual
+#       revert) + CPU-aware SSH cipher selection (AES-NI vs ChaCha20)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.6"
+SCRIPT_VERSION="7.7"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -58,7 +60,17 @@ SSHBF_DISABLED_FILE="${CONF_DIR}/sshbf.disabled"
 KNOWN_HOSTS_FILE="${CONF_DIR}/known_hosts"
 PEER_IPS_FILE="${CONF_DIR}/peer_ips"
 NET_TUNE_SERVICE="/etc/systemd/system/pg-tunnel-net-tune.service"
-SSH_CIPHERS="aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+pick_ssh_ciphers() {
+    # Prefer hardware-accelerated AES-GCM when the CPU has AES-NI;
+    # otherwise ChaCha20-Poly1305 is faster and equally secure.
+    if grep -qm1 ' aes ' "${1:-/proc/cpuinfo}" 2>/dev/null; then
+        echo "aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr"
+    else
+        echo "chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes128-ctr"
+    fi
+}
+
+SSH_CIPHERS="$(pick_ssh_ciphers)"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -1978,6 +1990,11 @@ handle_cli_subcommands() {
             ensure_network_tuning full >/dev/null 2>&1 || true
             exit 0
             ;;
+        sshkey-revert)
+            check_root
+            sshkey_revert_silent
+            exit 0
+            ;;
         reset-hostkey)
             check_root
             rm -f "$KNOWN_HOSTS_FILE"
@@ -2895,6 +2912,12 @@ manage_service() {
 uninstall_all() {
     print_header
     echo -e "${RED}=== Safe Uninstall ===${NC}"
+    if sshkey_block_present; then
+        sshkey_revert_silent
+        echo -e "${YELLOW}[NOTE] SSH key-only mode was active - password login has been restored.${NC}"
+    else
+        sshkey_cleanup_units 2>/dev/null || true
+    fi
     rm -f "$CRON_FILE" "$ACCT_CRON_FILE"
     systemctl disable pg-tunnel-net-tune.service >/dev/null 2>&1 || true
     rm -f "$NET_TUNE_SERVICE"
@@ -3268,6 +3291,181 @@ setup_cronjob() {
     read -p "Press Enter to return to menu..."
 }
 
+SSHKEY_BLOCK_BEGIN="# BEGIN PG-TUNNEL KEY-ONLY"
+SSHKEY_REVERT_SERVICE="/etc/systemd/system/pg-sshkey-revert.service"
+SSHKEY_REVERT_TIMER="/etc/systemd/system/pg-sshkey-revert.timer"
+
+sshkey_block_present() {
+    grep -qF "$SSHKEY_BLOCK_BEGIN" /etc/ssh/sshd_config 2>/dev/null
+}
+
+sshkey_remove_block() {
+    # Remove only our marker block; everything else stays byte-identical.
+    local cf="/etc/ssh/sshd_config"
+    [[ -f "$cf" ]] || return 0
+    if sshkey_block_present; then
+        sed -i '/^# BEGIN PG-TUNNEL KEY-ONLY$/,/^# END PG-TUNNEL KEY-ONLY$/d' "$cf"
+    fi
+}
+
+sshkey_apply_block() {
+    sshkey_remove_block
+    local cf="/etc/ssh/sshd_config"
+    {
+        echo "$SSHKEY_BLOCK_BEGIN"
+        echo "PasswordAuthentication no"
+        echo "PermitRootLogin prohibit-password"
+        echo "# END PG-TUNNEL KEY-ONLY"
+        cat "$cf"
+    } > "${cf}.pgtmp.$$"
+    mv -f "${cf}.pgtmp.$$" "$cf"
+}
+
+sshkey_cleanup_units() {
+    systemctl disable --now pg-sshkey-revert.timer >/dev/null 2>&1 || true
+    rm -f "$SSHKEY_REVERT_SERVICE" "$SSHKEY_REVERT_TIMER"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+sshkey_revert_silent() {
+    sshkey_remove_block
+    sshkey_cleanup_units
+    systemctl restart ssh.service >/dev/null 2>&1 || true
+}
+
+ssh_key_only_menu() {
+    while true; do
+        print_header
+        echo -e "${CYAN}=== SSH Key-Only Login (Password Off) ===${NC}"
+        echo
+        local key_count=0 timer_state="inactive"
+        [[ -f /root/.ssh/authorized_keys ]] && key_count=$(grep -c . /root/.ssh/authorized_keys 2>/dev/null || true)
+        if sshkey_block_present; then
+            echo "  Key-Only Mode     : ${GREEN}ACTIVE (password login disabled)${NC}"
+        else
+            echo "  Key-Only Mode     : ${YELLOW}inactive (password login allowed)${NC}"
+        fi
+        if systemctl is-active --quiet pg-sshkey-revert.timer 2>/dev/null; then
+            timer_state=$(systemctl list-timers pg-sshkey-revert.timer --no-pager 2>/dev/null | awk 'NR==1{print $1" "$2" "$3}' || echo "scheduled")
+            echo "  Safety Auto-Revert: ${YELLOW}armed (${timer_state})${NC}"
+        else
+            echo "  Safety Auto-Revert: not armed"
+        fi
+        echo "  Authorized Keys   : ${key_count}"
+        echo
+        echo "  1. Add Public Key (repeat for each device)"
+        echo "  2. Enable Key-Only Login (with 3h auto-revert safety)"
+        echo "  3. Confirm All Devices Work (cancel auto-revert)"
+        echo "  4. Re-Enable Password Login (manual revert)"
+        echo "  0. Back to Main Menu"
+        echo -e "------------------------------------------------------------"
+        read -p "Select option [0-4]: " sk_choice
+        case "$sk_choice" in
+            1)
+                echo
+                read -p "Paste the public key (one line, from 'ssh-keygen'/.pub file): " new_key
+                new_key=$(echo "$new_key" | xargs)
+                if [[ "$new_key" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-[a-z0-9-]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
+                    mkdir -p /root/.ssh
+                    chmod 700 /root/.ssh
+                    touch /root/.ssh/authorized_keys
+                    if grep -qxF "$new_key" /root/.ssh/authorized_keys; then
+                        echo -e "${YELLOW}This key is already installed.${NC}"
+                    else
+                        echo "$new_key" >> /root/.ssh/authorized_keys
+                        chmod 600 /root/.ssh/authorized_keys
+                        echo -e "${GREEN}[OK] Public key added. Total keys: $(grep -c . /root/.ssh/authorized_keys)${NC}"
+                        echo -e "${YELLOW}Make sure the private key is on that device before enabling key-only.${NC}"
+                    fi
+                else
+                    echo -e "${RED}[ERROR] That does not look like a valid public key line.${NC}"
+                fi
+                read -p "Press Enter to continue..."
+                ;;
+            2)
+                if sshkey_block_present; then
+                    echo -e "${YELLOW}Key-only mode is already active.${NC}"
+                    sleep 1
+                    continue
+                fi
+                if [[ ! -f /root/.ssh/authorized_keys ]] || ! grep -q . /root/.ssh/authorized_keys; then
+                    echo -e "${RED}[ERROR] No authorized keys installed. Add at least one key first (option 1).${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo
+                echo "  Installed keys (fingerprints):"
+                local kf=1
+                while read -r kline; do
+                    [[ -n "$kline" ]] || continue
+                    echo "    ${kf}) $(ssh-keygen -lf <(echo "$kline") 2>/dev/null | awk '{print $1, $2, $3}' || echo "unreadable")"
+                    kf=$((kf + 1))
+                done < /root/.ssh/authorized_keys
+                echo
+                echo -e "${RED}WARNING: after enabling, password login is rejected.${NC}"
+                echo "  A safety timer will automatically re-enable password login in 3 hours"
+                echo "  unless you confirm (option 3) that all your devices can connect."
+                echo
+                read -r -p "Type YES to enable key-only login: " yn
+                if [[ "$yn" != "YES" ]]; then
+                    echo "Aborted. No changes were made."
+                    sleep 1
+                    continue
+                fi
+                sshkey_apply_block
+                cat > "$SSHKEY_REVERT_SERVICE" <<'EOF'
+[Unit]
+Description=PG Tunnel SSH key-only emergency auto-revert
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-tunnel sshkey-revert
+EOF
+                cat > "$SSHKEY_REVERT_TIMER" <<'EOF'
+[Unit]
+Description=PG Tunnel SSH key-only emergency auto-revert timer
+
+[Timer]
+OnActiveSec=3h
+AccuracySec=1min
+Unit=pg-sshkey-revert.service
+
+[Install]
+WantedBy=timers.target
+EOF
+                systemctl daemon-reload
+                systemctl enable --now pg-sshkey-revert.timer >/dev/null 2>&1 || true
+                systemctl restart ssh.service
+                echo
+                echo -e "${GREEN}[OK] Key-only login is ACTIVE. Password login is now rejected.${NC}"
+                echo -e "${YELLOW}TEST ALL YOUR DEVICES NOW. Password login auto-returns in 3 hours${NC}"
+                echo -e "${YELLOW}unless you run option 3 (Confirm) from this menu.${NC}"
+                read -p "Press Enter to return to menu..."
+                ;;
+            3)
+                if systemctl is-active --quiet pg-sshkey-revert.timer 2>/dev/null || [[ -f "$SSHKEY_REVERT_TIMER" ]]; then
+                    sshkey_cleanup_units
+                    echo -e "${GREEN}[OK] Auto-revert cancelled. Key-only login stays active permanently.${NC}"
+                else
+                    echo -e "${YELLOW}No auto-revert timer is armed.${NC}"
+                fi
+                sleep 1
+                ;;
+            4)
+                if sshkey_block_present; then
+                    sshkey_revert_silent
+                    echo -e "${GREEN}[OK] Password login re-enabled. Your keys remain installed.${NC}"
+                else
+                    echo -e "${YELLOW}Key-only mode is not active.${NC}"
+                fi
+                sleep 1
+                ;;
+            0) return ;;
+            *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 other_options_menu() {
     while true; do
         print_header
@@ -3279,9 +3477,10 @@ other_options_menu() {
         echo "  4. Rotate TLS Secret (Iran, Zero Downtime)"
         echo "  5. Backup / Restore Configs"
         echo "  6. Change Node IP (Iran, Rebuild Redirects)"
+        echo "  7. SSH Key-Only Login (Password Off)"
         echo "  0. Back to Main Menu"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-6]: " other_choice
+        read -p "Select option [0-7]: " other_choice
         case $other_choice in
             1) view_logs ;;
             2) setup_cronjob ;;
@@ -3289,6 +3488,7 @@ other_options_menu() {
             4) rotate_tls_secret ;;
             5) backup_restore_menu ;;
             6) change_node_ip ;;
+            7) ssh_key_only_menu ;;
             0) return ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
