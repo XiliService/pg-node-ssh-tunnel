@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.5
+# PG Node SSH Tunnel Manager v7.6
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -17,11 +17,13 @@
 #       auto watchdog refresh on update, cron tuning path is sysctl-only
 # v7.5: 'Change Node IP' action - safely swap the node's public identity IP
 #       and rebuild NAT redirects without touching the tunnel itself
+# v7.6: Management port (NODE_PORT) joins the redirected port set - the
+#       panel->node API path now also stays on-tunnel behind the node IP
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.5"
+SCRIPT_VERSION="7.6"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1393,6 +1395,26 @@ backup_restore_menu() {
     read -p "Press Enter to return to menu..."
 }
 
+get_redirect_ports() {
+    # Prints the redirected port set (management + data ports), one per
+    # line, validated and deduplicated. Shared by install/repair, node-IP
+    # change, cron re-add and uninstall so all paths stay in sync.
+    local node_port="${1:-62075}" data_ports="${2:-}" p _p seen=""
+    if [[ "$node_port" =~ ^[0-9]+$ ]]; then
+        echo "$node_port"
+        seen=" $node_port "
+    fi
+    IFS=',' read -ra _p <<< "$data_ports"
+    for p in ${_p[@]+"${_p[@]}"}; do
+        p=$(echo "$p" | xargs)
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        [[ "$seen" == *" $p "* ]] && continue
+        echo "$p"
+        seen="${seen}${p} "
+    done
+    return 0
+}
+
 change_node_ip() {
     print_header
     echo -e "${CYAN}=== Change Node IP (Rebuild Redirect Rules) ===${NC}"
@@ -1450,19 +1472,13 @@ change_node_ip() {
     chown root:pg-tunnel "$IRAN_CONF" 2>/dev/null || true
     chmod 640 "$IRAN_CONF" 2>/dev/null || true
 
-    local ports=() port
-    IFS=',' read -ra ports <<< "$DATA_PORTS"
-    for port in ${ports[@]+"${ports[@]}"}; do
-        port=$(echo "$port" | xargs)
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
+    while read -r port; do
         iptables -t nat -D OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-    done
-    for port in ${ports[@]+"${ports[@]}"}; do
-        port=$(echo "$port" | xargs)
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
+    done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
+    while read -r port; do
         iptables -t nat -C OUTPUT -p tcp -d "$new_ip" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
         iptables -t nat -A OUTPUT -p tcp -d "$new_ip" --dport "$port" -j REDIRECT --to-ports "$port"
-    done
+    done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
     netfilter-persistent save >/dev/null 2>&1 || true
 
     echo
@@ -1933,6 +1949,19 @@ migrate_existing_state() {
         write_watchdog_script
         systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
     fi
+
+    # v7.6: the management port joined the redirected port set, so the
+    # panel->node API path also stays on-tunnel when node addresses point
+    # at the public node IP. Idempotent: adds the rule only if missing.
+    if [[ -f "$IRAN_CONF" ]]; then
+        local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+        source "$IRAN_CONF"
+        if [[ -n "${OUT_IP:-}" && "${NODE_PORT:-}" =~ ^[0-9]+$ ]] && \
+           ! iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$NODE_PORT" -j REDIRECT --to-ports "$NODE_PORT" 2>/dev/null; then
+            iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$NODE_PORT" -j REDIRECT --to-ports "$NODE_PORT" 2>/dev/null || true
+            netfilter-persistent save >/dev/null 2>&1 || true
+        fi
+    fi
 }
 
 bootstrap_existing_accounting() {
@@ -1971,13 +2000,10 @@ handle_cli_subcommands() {
                 if [[ -f "$WATCHDOG_SERVICE" ]] && ! systemctl is-active --quiet pg-tunnel-watchdog.service; then
                     systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
                 fi
-                IFS=',' read -ra PORTS <<< "$DATA_PORTS"
-                for port in "${PORTS[@]}"; do
-                    port=$(echo "$port" | xargs)
-                    [[ -n "$port" ]] || continue
+                while read -r port; do
                     iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
                     iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-                done
+                done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
                 ensure_accounting_rules 2>/dev/null || true
                 sync_traffic_state >/dev/null 2>&1 || true
             elif [[ -f "$FOREIGN_CONF" ]]; then
@@ -2275,14 +2301,11 @@ EOF
     fi
 
     echo -e "${YELLOW}Applying targeted iptables NAT REDIRECT rules...${NC}"
-    IFS=',' read -ra PORTS <<< "$DATA_PORTS"
-    for port in "${PORTS[@]}"; do
-        port=$(echo "$port" | xargs)
-        [[ -n "$port" ]] || continue
+    while read -r port; do
         iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
         iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port"
         echo "  -> Redirected $OUT_IP:$port"
-    done
+    done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
 
     setup_accounting_persistence
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -2922,12 +2945,9 @@ uninstall_all() {
         fi
         systemctl daemon-reload
         release_iran_tunnel_ports 2>/dev/null || true
-        IFS=',' read -ra PORTS <<< "$DATA_PORTS"
-        for port in "${PORTS[@]}"; do
-            port=$(echo "$port" | xargs)
-            [[ -n "$port" ]] || continue
+        while read -r port; do
             iptables -t nat -D OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-        done
+        done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
         netfilter-persistent save >/dev/null 2>&1 || true
         rm -f "$IRAN_CONF" "$TRAFFIC_STATE" "$TRAFFIC_LOCK" "$PEER_IPS_FILE"
         echo -e "${GREEN}[OK] TLS 1.3 server, iptables rules & accounting removed safely from Iran server.${NC}"
