@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.9
+# PG Node SSH Tunnel Manager v8.10
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -63,11 +63,15 @@
 #       (status/traffic/logs/help/alerts, EN+FA); /ipcheck now
 #       accepts multiple IPs (one per line or space separated,
 #       max 5) with a progress message edited into the results
+# v8.10: Bot /update (button + command, two-step confirm): updates
+#       the script from GitHub on BOTH servers (or one), via new
+#       non-interactive 'pg-tunnel update-ref <ref>' CLI + 'bot-sync'
+#       for the post-reply engine self-refresh; zero tunnel downtime
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.9"
+SCRIPT_VERSION="8.10"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2219,6 +2223,43 @@ diagnose_dump() {
     echo "=== END DIAGNOSTICS ==="
 }
 
+cli_update_ref() {
+    # Non-interactive script updater (used by the Telegram bot and handy
+    # from cron/scripts). 'main' installs only when newer; any other
+    # ref (branch or SHA) installs verbatim. Swapping the script file is
+    # zero-downtime for the tunnel; the idempotent live heals run right
+    # after. When invoked BY the bot (PG_TGBOT=1) the bot-engine sync is
+    # skipped so the service is not restarted under its own feet - the
+    # bot triggers 'bot-sync' itself after its reply is delivered.
+    local ref="${1:-main}"
+    [[ -n "$ref" ]] || ref="main"
+    local tmp="/tmp/pg-tunnel-upd.$$"
+    rm -f "$tmp"
+    local sha="" new_ver=""
+    if ! sha=$(fetch_script_from_ref "$ref" "$tmp"); then
+        echo "[FAIL] could not fetch script.sh for ref '${ref}' (network or invalid ref)"
+        rm -f "$tmp"
+        return 1
+    fi
+    new_ver=$(extract_script_version "$tmp")
+    if [[ "$ref" == "main" ]] && ! version_gt "$new_ver" "$SCRIPT_VERSION"; then
+        echo "[OK] already up-to-date (installed v${SCRIPT_VERSION}, main v${new_ver})"
+        rm -f "$tmp"
+        heal_data_memory_caps >/dev/null 2>&1 || true
+        heal_tls_memory_caps >/dev/null 2>&1 || true
+        return 0
+    fi
+    mv -f "$tmp" /usr/local/bin/pg-tunnel
+    chmod +x /usr/local/bin/pg-tunnel
+    echo "[OK] pg-tunnel updated to v${new_ver} (${sha:0:7}) from '${ref}'"
+    heal_data_memory_caps >/dev/null 2>&1 || true
+    heal_tls_memory_caps >/dev/null 2>&1 || true
+    if [[ "${PG_TGBOT:-}" != "1" ]]; then
+        heal_tgbot_script
+    fi
+    return 0
+}
+
 heal_tgbot_script() {
     # Keep the deployed bot engine in sync with the script. The .py file
     # was previously (re)written only by the install wizard, so a plain
@@ -2370,6 +2411,17 @@ handle_cli_subcommands() {
         diagnose)
             check_root
             diagnose_dump
+            exit 0
+            ;;
+        update-ref)
+            check_root
+            cli_update_ref "$(normalize_git_ref "${2:-main}")"
+            exit $?
+            ;;
+        bot-sync)
+            check_root
+            heal_tgbot_script
+            echo "[OK] bot engine synced to v${SCRIPT_VERSION}"
             exit 0
             ;;
         shield-off)
@@ -3715,7 +3767,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.9"
+BOT_REV = "8.10"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3849,7 +3901,13 @@ STR = {
         "btn_lang": "\U0001f310 Language",
         "btn_back": "\u2b05 Back",
         "btn_both": "Both",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status \u2014 full status of both servers\n\U0001f4c8 /traffic \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2753 /help \u2014 this message",
+        "btn_update": "\u2b05 Update",
+        "btn_custom_ref": "\u270f Custom ref",
+        "choose_update": "\u2b05 Update script from GitHub \u2014 which server(s)?",
+        "update_ref_prompt": "\u270f Send the branch name or commit SHA to update from (valid 3 min):",
+        "update_ref_bad": "\u26a0 Invalid ref \u2014 letters, digits, dot, dash, slash, underscore only.",
+        "update_done": "\u2b05 <b>Update result:</b>\n%s",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status \u2014 full status of both servers\n\U0001f4c8 /traffic \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\u2753 /help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -3931,7 +3989,13 @@ STR = {
         "btn_lang": "\U0001f310 \u0632\u0628\u0627\u0646",
         "btn_back": "\u2b05 \u0628\u0627\u0632\u06af\u0634\u062a",
         "btn_both": "\u0647\u0631 \u062f\u0648",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "btn_update": "\u2b05 \u0622\u067e\u062f\u06cc\u062a",
+        "btn_custom_ref": "\u270f \u0634\u0627\u062e\u0647/SHA \u062f\u0644\u062e\u0648\u0627\u0647",
+        "choose_update": "\u2b05 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub \u2014 \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631(\u0647\u0627)\u061f",
+        "update_ref_prompt": "\u270f \u0646\u0627\u0645 \u0634\u0627\u062e\u0647 \u06cc\u0627 SHA \u06a9\u0627\u0645\u06cc\u062a \u0631\u0627 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
+        "update_ref_bad": "\u26a0 \u0646\u0627\u0645\u0639\u062a\u0628\u0631 \u2014 \u0641\u0642\u0637 \u062d\u0631\u0641\u060c \u0631\u0642\u0645\u060c . _ / - .",
+        "update_done": "\u2b05 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0622\u067e\u062f\u06cc\u062a:</b>\n%s",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4089,7 +4153,8 @@ def main_menu_kb(chat_id):
         [{"text": trb(chat_id, "btn_restart"), "callback_data": "m:restart"},
          {"text": trb(chat_id, "btn_repair"), "callback_data": "m:repair"},
          {"text": trb(chat_id, "btn_shield"), "callback_data": "m:shield"}],
-        [{"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
+        [{"text": trb(chat_id, "btn_update"), "callback_data": "m:update"},
+         {"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
          {"text": trb(chat_id, "btn_lang"), "callback_data": "m:lang"}],
     ]
 
@@ -4125,6 +4190,15 @@ def shield_kb(chat_id):
     return [[{"text": "ON", "callback_data": "m:shield:on"},
              {"text": "OFF", "callback_data": "m:shield:off"}]
             ] + back_kb(chat_id)
+
+
+def update_kb(chat_id):
+    return [
+        [{"text": trb(chat_id, "btn_both"), "callback_data": "m:update:both"},
+         {"text": trb(chat_id, "foreign"), "callback_data": "m:update:foreign"},
+         {"text": trb(chat_id, "iran"), "callback_data": "m:update:iran"}],
+        [{"text": trb(chat_id, "btn_custom_ref"), "callback_data": "m:update:custom"}],
+    ] + back_kb(chat_id)
 
 
 def lang_kb(chat_id):
@@ -4186,6 +4260,7 @@ CMDS_EN = [
     ("mute", "Mute non-critical alerts [min]"),
     ("unmute", "Unmute alerts"),
     ("lang", "Switch language EN/FA"),
+    ("update", "Update script from GitHub [ref] [both|iran|foreign]"),
     ("help", "Command help"),
 ]
 
@@ -4201,6 +4276,7 @@ CMDS_FA = [
     ("mute", "\u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc [\u062f\u0642\u06cc\u0642\u0647]"),
     ("unmute", "\u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627"),
     ("lang", "\u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646 EN/FA"),
+    ("update", "\u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub [\u0634\u0627\u062e\u0647] [both|iran|foreign]"),
     ("help", "\u0631\u0627\u0647\u0646\u0645\u0627\u06cc \u062f\u0633\u062a\u0648\u0631\u0627\u062a"),
 ]
 
@@ -4413,11 +4489,11 @@ def ipcheck(ip):
         return None, str(e), None
 
 
-def confirm_and_run(chat_id, action, arg, desc, mid=None):
+def confirm_and_run(chat_id, action, arg, desc, mid=None, meta=None):
     nonce = "go%d" % (int(time.time() * 1000) % 1000000000)
     STATE["pending"][str(chat_id)] = {"action": action, "arg": arg,
                                       "data": nonce, "ts": time.time(),
-                                      "mid": mid}
+                                      "mid": mid, "meta": meta}
     kb = {"inline_keyboard": [
         [{"text": "OK", "callback_data": nonce},
          {"text": "Cancel", "callback_data": "cancel"}]]}
@@ -4436,7 +4512,40 @@ def finish_panel(chat_id, mid, text):
         send(chat_id, text)
 
 
-def run_action(chat_id, action, arg, mid=None):
+def run_update(chat_id, scope, ref, mid=None):
+    parts = []
+    local_ok = False
+    if scope in ("foreign", "both"):
+        env = dict(os.environ)
+        env["PG_TGBOT"] = "1"
+        try:
+            r = subprocess.run([LOCAL_CMD, "update-ref", ref], capture_output=True,
+                               text=True, timeout=300, env=env)
+            lines = (r.stdout or "").strip().splitlines()
+            parts.append("\U0001F30D " + (lines[-1] if lines else "no output"))
+            local_ok = r.returncode == 0
+        except Exception as e:
+            parts.append("\U0001F30D " + tr(chat_id, "failed") + " (%s)" % html.escape(str(e)))
+    if scope in ("iran", "both"):
+        out = ssh_iran("%s update-ref %s" % (LOCAL_CMD, ref), timeout=300)
+        lines = (out or "").strip().splitlines()
+        parts.append("\U0001F1EE\U0001F1F7 " + (lines[-1] if lines else tr(chat_id, "failed")))
+    finish_panel(chat_id, mid, tr(chat_id, "update_done", s="\n".join(parts)))
+    # After the reply is delivered, refresh the bot engine so the running
+    # service picks up the new script's embedded engine ('bot-sync' is a
+    # no-op when already current; otherwise it restarts only pg-tgbot).
+    if local_ok:
+        def _sync():
+            time.sleep(2)
+            try:
+                subprocess.run([LOCAL_CMD, "bot-sync"], capture_output=True,
+                               text=True, timeout=120)
+            except Exception:
+                pass
+        threading.Thread(target=_sync, daemon=True).start()
+
+
+def run_action(chat_id, action, arg, mid=None, meta=None):
     if action == "restart":
         unit = "pg-tunnel-mgmt" if arg == "mgmt" else "pg-tunnel-data-" + arg
         try:
@@ -4461,6 +4570,8 @@ def run_action(chat_id, action, arg, mid=None):
             ssh_iran(LOCAL_CMD + " cron-auto-repair", timeout=200)
             done.append("iran")
         finish_panel(chat_id, mid, tr(chat_id, "repair_done", s=", ".join(done) or arg))
+    elif action == "update":
+        run_update(chat_id, arg, (meta or {}).get("ref", "main"), mid)
     elif action == "shield":
         out = ssh_iran(LOCAL_CMD + (" shield-on" if arg == "on" else " shield-off"))
         finish_panel(chat_id, mid, tr(chat_id, "shield_done", s=arg) if out is not None
@@ -4552,6 +4663,21 @@ def handle_update(upd):
             if not kb_edit(chat, mid, tr(chat, "mute_off"), main_menu_kb(chat)):
                 send(chat, tr(chat, "mute_off"))
             return
+        if data == "m:update":
+            if not kb_edit(chat, mid, tr(chat, "choose_update"), update_kb(chat)):
+                kb_send(chat, tr(chat, "choose_update"), update_kb(chat))
+            return
+        if data.startswith("m:update:"):
+            sub = data.split(":", 2)[2]
+            if sub == "custom":
+                STATE["await"][str(chat)] = {"ts": time.time(), "kind": "ref"}
+                if not kb_edit(chat, mid, tr(chat, "update_ref_prompt"), back_kb(chat)):
+                    kb_send(chat, tr(chat, "update_ref_prompt"), back_kb(chat))
+                return
+            confirm_and_run(chat, "update", sub,
+                            "pg-tunnel update-ref main (%s)" % sub, mid,
+                            {"ref": "main"})
+            return
         if data == "m:lang":
             if not kb_edit(chat, mid, tr(chat, "title"), lang_kb(chat)):
                 kb_send(chat, tr(chat, "title"), lang_kb(chat))
@@ -4566,7 +4692,8 @@ def handle_update(upd):
                 time.time() - pend.get("ts", 0) > 120):
             send(chat, tr(chat, "cancelled"))
             return
-        run_action(chat, pend["action"], pend.get("arg"), pend.get("mid"))
+        run_action(chat, pend["action"], pend.get("arg"), pend.get("mid"),
+                   pend.get("meta"))
         return
     msg = upd.get("message") or upd.get("edited_message")
     if not msg or "text" not in msg:
@@ -4580,16 +4707,29 @@ def handle_update(upd):
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
     args = parts[1:]
-    aw = STATE["await"].get(str(chat))
-    if aw and time.time() - aw < 180:
-        STATE["await"].pop(str(chat), None)
-        if not cmd.startswith("/"):
+    aw = STATE["await"].pop(str(chat), None)
+    if aw:
+        if isinstance(aw, dict):
+            kind = aw.get("kind", "ip")
+            ts = aw.get("ts", 0)
+        else:
+            kind = "ip"
+            ts = aw
+        if time.time() - ts < 180 and not cmd.startswith("/"):
+            if kind == "ref":
+                cand = text.strip().split()[0] if text.strip() else ""
+                if re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", cand):
+                    confirm_and_run(chat, "update", "both",
+                                    "pg-tunnel update-ref %s (both servers)" % cand,
+                                    None, {"ref": cand})
+                else:
+                    send(chat, tr(chat, "update_ref_bad"))
+                return
             if re.search(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", text):
                 do_ipcheck(chat, text)
             else:
                 send(chat, tr(chat, "ip_bad"))
             return
-    STATE["await"].pop(str(chat), None)
     if cmd in ("/start", "/menu"):
         kb_send(chat, tr(chat, "help"), main_menu_kb(chat))
     elif cmd == "/help":
@@ -4630,6 +4770,22 @@ def handle_update(upd):
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/shield on|off"))
             return
         confirm_and_run(chat, "shield", args[0], "shield %s (Iran)" % args[0])
+    elif cmd == "/update":
+        ref = "main"
+        scope = "both"
+        if args:
+            if args[0] in ("both", "iran", "foreign"):
+                scope = args[0]
+            else:
+                ref = args[0]
+                if not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", ref):
+                    send(chat, tr(chat, "update_ref_bad"))
+                    return
+                if len(args) > 1 and args[1] in ("both", "iran", "foreign"):
+                    scope = args[1]
+        confirm_and_run(chat, "update", scope,
+                        "pg-tunnel update-ref %s (%s)" % (ref, scope), None,
+                        {"ref": ref})
 
 
 def warn_once_per_day(chat_key, text, critical=False):
@@ -4837,6 +4993,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 PYEOF
     chmod 644 "${TG_BOT_PY}"
 }
