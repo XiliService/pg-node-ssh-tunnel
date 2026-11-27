@@ -109,11 +109,16 @@
 #       avail, swap, disk used/total, process count and top-RSS
 #       processes; report gained CPU_USAGE_PCT, CPU_CORES,
 #       RAM_USED_KB, SWAP_*, DISK_*_GB, PROCS, TOP_RSS
+# v8.18: HOTFIX load keys: the report packed LOAD1/LOAD5/LOAD15 on a
+#       single line, but parsers split each line on the first '=' -
+#       LOAD5/LOAD15 were unreachable and the Resources panel showed
+#       '0.00 LOAD5=0.01 LOAD15=0.03/?/?'. Now one key per line; the
+#       bot also recovers the packed form from pre-v8.18 remotes
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.17"
+SCRIPT_VERSION="8.18"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1603,7 +1608,12 @@ emit_server_report() {
     awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "SWAP_TOTAL_KB=%d\nSWAP_FREE_KB=%d\n", t+0, f+0}' /proc/meminfo 2>/dev/null || true
     df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); printf "DISK_PCT=%d\nDISK_USED_GB=%.1f\nDISK_TOTAL_GB=%.1f\n", $5+0, $3/1048576, $2/1048576}' || true
     read -r _l1 _l5 _l15 _rest < /proc/loadavg 2>/dev/null || true
-    echo "LOAD1=${_l1:-0} LOAD5=${_l5:-0} LOAD15=${_l15:-0}"
+    # v8.18: one key per line - the bot parser splits each line on the
+    # FIRST '=' only, so packing LOAD1/5/15 on one line made LOAD5/LOAD15
+    # unparseable (they landed inside the LOAD1 value).
+    echo "LOAD1=${_l1:-0}"
+    echo "LOAD5=${_l5:-0}"
+    echo "LOAD15=${_l15:-0}"
     # v8.17: live CPU usage sampled from /proc/stat over 0.3s (idle+iowait
     # vs total deltas); cores, process count and top-RSS processes.
     local _cs1 _cs2 _cp _tp
@@ -3869,7 +3879,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.17"
+BOT_REV = "8.18"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4674,7 +4684,20 @@ def resources_text(chat_id, scope="both"):
             out.append("")
             continue
         out.append("%s <b>%s</b> \u2014 %s \u00b7 %s %s" % (icon, esc(name), esc(rep.get("VERSION", "?")), tr(chat_id, "up"), fmt_uptime(rep.get("UPTIME_SEC", 0))))
-        load = "%s/%s/%s" % (rep.get("LOAD1", "?"), rep.get("LOAD5", "?"), rep.get("LOAD15", "?"))
+        l1 = str(rep.get("LOAD1", "?"))
+        l5 = str(rep.get("LOAD5", "?"))
+        l15 = str(rep.get("LOAD15", "?"))
+        if "?" in (l5, l15):
+            # pre-v8.18 reports packed LOAD1/5/15 on one line, so LOAD5/15
+            # ended up inside the LOAD1 value; recover them when present.
+            m5 = re.search(r"LOAD5=([0-9.]+)", l1)
+            m15 = re.search(r"LOAD15=([0-9.]+)", l1)
+            l1 = l1.split()[0] if l1.split() else "?"
+            if l5 == "?" and m5:
+                l5 = m5.group(1)
+            if l15 == "?" and m15:
+                l15 = m15.group(1)
+        load = "%s/%s/%s" % (l1, l5, l15)
         cores = rep.get("CPU_CORES", "")
         tail = (" \u00b7 %s %s" % (cores, tr(chat_id, "cores_l"))) if cores else ""
         if rep.get("CPU_USAGE_PCT"):
@@ -5356,6 +5379,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
