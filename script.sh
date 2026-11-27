@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.0
+# PG Node SSH Tunnel Manager v8.1
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -29,11 +29,15 @@
 #       prediction, attack digest, ipcheck from Iranian nodes, remote
 #       restart/repair/shield with two-step confirm, EN/FA switching;
 #       new 'report' + 'shield-on/shield-off' CLI subcommands
+# v8.1: Bot glass-button menu (/menu) + auto-registered command list
+#       (setMyCommands EN/FA); resource guards: CPUQuota/Nice on the
+#       bot unit, Iran poll every 2 min (IRAN_EVERY); fixed Iran proxy
+#       argv (TLS_SNI + mgmt mode), help newlines, tr() interpolation
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.0"
+SCRIPT_VERSION="8.1"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3500,7 +3504,8 @@ write_tgbot_script() {
 Runs on the FOREIGN server only. Collects local status via
 'pg-tunnel report' and Iran status over the existing camouflaged TLS
 tunnel (SSH through the wrapper, ControlMaster persistence). Pure
-stdlib; long polling; per-chat language (EN default, FA via /lang).
+stdlib; long polling; glass-button menu; command list auto-registered
+via setMyCommands; per-chat language (EN default, FA via /lang).
 """
 import html
 import json
@@ -3511,6 +3516,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -3527,7 +3533,8 @@ TEHRAN = timezone(timedelta(hours=3, minutes=30))
 CFG = {}
 STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
          "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
-         "daily_done": "", "warn_day": {}}
+         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0,
+         "iran_last_ok": 0, "iran_down": False}
 
 
 def load_cfg():
@@ -3618,16 +3625,37 @@ STR = {
         "logs_tail": "Logs for %s (last %d lines):",
         "logs_none": "No logs available.",
         "logs_usage": "Usage: /logs [iran|foreign] [lines]",
-        "help": ("<b>PG Tunnel Bot</b>\\n"
-                 "/status - full status of both servers\\n"
-                 "/traffic - usage, per-IP and cap prediction\\n"
-                 "/logs [iran|foreign] [n] - recent tunnel logs\\n"
-                 "/restart &lt;port|mgmt&gt; - restart one channel (confirm)\\n"
-                 "/repair [iran|foreign|both] - revive dead services (confirm)\\n"
-                 "/shield &lt;on|off&gt; - Iran port-22 shield (confirm)\\n"
-                 "/ipcheck &lt;ip&gt; - test direct IP from Iranian nodes\\n"
-                 "/mute [min] - mute non-critical alerts\\n"
-                 "/lang - switch language\\n"
+        "menu_title": "Main menu - tap a button:",
+        "choose_logs": "Which server's logs?",
+        "choose_restart": "Restart which channel?",
+        "choose_repair": "Repair which side?",
+        "choose_shield": "Iran port-22 shield:",
+        "ip_prompt": "Send the IP address to test as plain text (valid 3 min):",
+        "ip_bad": "That does not look like a valid IP.",
+        "btn_status": "\U0001F4CA Status",
+        "btn_traffic": "\U0001F4C8 Traffic",
+        "btn_logs": "\U0001F4DC Logs",
+        "btn_ipcheck": "\U0001F310 IP Test",
+        "btn_restart": "\U0001F501 Restart",
+        "btn_repair": "\U0001F6E0 Repair",
+        "btn_shield": "\U0001F6E1 Shield",
+        "btn_mute": "\U0001F515 Mute 1h",
+        "btn_unmute": "\U0001F50A Unmute",
+        "btn_lang": "\U0001F310 Language",
+        "btn_back": "\u2b05 Back",
+        "btn_both": "Both",
+        "help": ("<b>PG Tunnel Bot</b>\n"
+                 "/status - full status of both servers\n"
+                 "/traffic - usage, per-IP and cap prediction\n"
+                 "/logs [iran|foreign] [n] - recent tunnel logs\n"
+                 "/restart &lt;port|mgmt&gt; - restart one channel (confirm)\n"
+                 "/repair [iran|foreign|both] - revive dead services (confirm)\n"
+                 "/shield &lt;on|off&gt; - Iran port-22 shield (confirm)\n"
+                 "/ipcheck &lt;ip&gt; - test direct IP from Iranian nodes\n"
+                 "/mute [min] - mute non-critical alerts\n"
+                 "/lang - switch language\n"
+                 "/unmute - unmute alerts\n"
+                 "/menu - glass-button panel\n"
                  "/help - this message"),
     },
     "fa": {
@@ -3682,16 +3710,37 @@ STR = {
         "logs_tail": "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc %s (\u0622\u062e\u0631\u06cc\u0646 %d \u062e\u0637):",
         "logs_none": "\u0644\u0627\u06af\u06cc \u0645\u0648\u062c\u0648\u062f \u0646\u06cc\u0633\u062a.",
         "logs_usage": "\u0637\u0631\u0632 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /logs [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]",
-        "help": ("<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\\n"
-                 "/status - \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\\n"
-                 "/traffic - \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u067e\u06cc\u0634\u200c\u0628\u06cc\u0646\u06cc \u0633\u0642\u0641\\n"
-                 "/logs [iran|foreign] [n] - \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\\n"
-                 "/restart &lt;port|mgmt&gt; - \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
-                 "/repair [iran|foreign|both] - \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
-                 "/shield &lt;on|off&gt; - \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
-                 "/ipcheck &lt;ip&gt; - \u062a\u0633\u062a IP \u062f\u0627\u06cc\u0631\u06a9\u062a \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\\n"
-                 "/mute [\u062f\u0642\u06cc\u0642\u0647] - \u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc\\n"
-                 "/lang - \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\\n"
+        "menu_title": "\u0645\u0646\u0648\u06cc \u0627\u0635\u0644\u06cc \u2014 \u062f\u06a9\u0645\u0647 \u0645\u0648\u0631\u062f\u0646\u0638\u0631 \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f:",
+        "choose_logs": "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "choose_restart": "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u062f\u0627\u0645 \u06a9\u0627\u0646\u0627\u0644\u061f",
+        "choose_repair": "\u062a\u0639\u0645\u06cc\u0631 \u06a9\u062f\u0627\u0645 \u0633\u0645\u062a\u061f",
+        "choose_shield": "\u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646:",
+        "ip_prompt": "\u0622\u062f\u0631\u0633 IP \u0628\u0631\u0627\u06cc \u062a\u0633\u062a \u0631\u0627 \u0628\u0647 \u0635\u0648\u0631\u062a \u0645\u062a\u0646 \u0633\u0627\u062f\u0647 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
+        "ip_bad": "\u0627\u06cc\u0646 \u06cc\u06a9 IP \u0645\u0639\u062a\u0628\u0631 \u0628\u0647 \u0646\u0638\u0631 \u0646\u0645\u06cc\u200c\u0631\u0633\u062f.",
+        "btn_status": "\U0001f4ca \u0648\u0636\u0639\u06cc\u062a",
+        "btn_traffic": "\U0001f4c8 \u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "btn_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627",
+        "btn_ipcheck": "\U0001f310 \u062a\u0633\u062a IP",
+        "btn_restart": "\U0001f501 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a",
+        "btn_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631",
+        "btn_shield": "\U0001f6e1 \u0633\u067e\u0631",
+        "btn_mute": "\U0001f515 \u0628\u06cc\u200c\u0635\u062f\u0627 \u06f1 \u0633\u0627\u0639\u062a",
+        "btn_unmute": "\U0001f50a \u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627",
+        "btn_lang": "\U0001f310 \u0632\u0628\u0627\u0646",
+        "btn_back": "\u2b05 \u0628\u0627\u0632\u06af\u0634\u062a",
+        "btn_both": "\u0647\u0631 \u062f\u0648",
+        "help": ("<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n"
+                 "/status - \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n"
+                 "/traffic - \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u067e\u06cc\u0634\u200c\u0628\u06cc\u0646\u06cc \u0633\u0642\u0641\n"
+                 "/logs [iran|foreign] [n] - \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n"
+                 "/restart &lt;port|mgmt&gt; - \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
+                 "/repair [iran|foreign|both] - \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
+                 "/shield &lt;on|off&gt; - \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
+                 "/ipcheck &lt;ip&gt; - \u062a\u0633\u062a IP \u062f\u0627\u06cc\u0631\u06a9\u062a \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\n"
+                 "/mute [\u062f\u0642\u06cc\u0642\u0647] - \u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc\n"
+                 "/lang - \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n"
+                 "/unmute - \u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n"
+                 "/menu - \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n"
                  "/help - \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645"),
     },
 }
@@ -3703,8 +3752,12 @@ def lang_of(chat_id):
 
 def tr(chat_id, key, **kw):
     s = STR.get(lang_of(chat_id), STR["en"]).get(key, STR["en"].get(key, key))
+    if not kw:
+        return s
+    # Templates use positional %s/%d placeholders; callers pass kwargs in
+    # placeholder order (py3.7+ preserves insertion order).
     try:
-        return s % kw if kw else s
+        return s % tuple(kw.values())
     except Exception:
         return s
 
@@ -3749,6 +3802,133 @@ def send(chat_id, text):
                            "parse_mode": "HTML", "disable_web_page_preview": True})
     except Exception:
         pass
+
+
+def kb_send(chat_id, text, kb):
+    try:
+        tg("sendMessage", {"chat_id": chat_id, "text": text[:3900],
+                           "parse_mode": "HTML", "disable_web_page_preview": True,
+                           "reply_markup": {"inline_keyboard": kb}})
+    except Exception:
+        pass
+
+
+def trb(chat_id, key):
+    d = STR.get(lang_of(chat_id), STR["en"])
+    return d.get(key, STR["en"].get(key, key))
+
+
+def rows_from(items, per=4):
+    return [items[i:i + per] for i in range(0, len(items), per)]
+
+
+def back_kb(chat_id):
+    return [[{"text": trb(chat_id, "btn_back"), "callback_data": "m:menu"}]]
+
+
+def main_menu_kb(chat_id):
+    muted = STATE["mute"].get(str(chat_id), 0) > time.time()
+    mute_key = "btn_unmute" if muted else "btn_mute"
+    return [
+        [{"text": trb(chat_id, "btn_status"), "callback_data": "m:status"},
+         {"text": trb(chat_id, "btn_traffic"), "callback_data": "m:traffic"}],
+        [{"text": trb(chat_id, "btn_logs"), "callback_data": "m:logs"},
+         {"text": trb(chat_id, "btn_ipcheck"), "callback_data": "m:ipcheck"}],
+        [{"text": trb(chat_id, "btn_restart"), "callback_data": "m:restart"},
+         {"text": trb(chat_id, "btn_repair"), "callback_data": "m:repair"},
+         {"text": trb(chat_id, "btn_shield"), "callback_data": "m:shield"}],
+        [{"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
+         {"text": trb(chat_id, "btn_lang"), "callback_data": "m:lang"}],
+    ]
+
+
+def show_main_menu(chat_id, text=None):
+    kb_send(chat_id, text or tr(chat_id, "menu_title"), main_menu_kb(chat_id))
+
+
+def restart_kb(chat_id):
+    rep_ = STATE.get("prev", {}).get("foreign") or local_report() or {}
+    btns = [{"text": "mgmt", "callback_data": "m:restart:mgmt"}]
+    for k in sorted(rep_):
+        if k.startswith("CHANNEL_DATA_"):
+            port = k.replace("CHANNEL_DATA_", "")
+            btns.append({"text": port, "callback_data": "m:restart:" + port})
+    return rows_from(btns) + back_kb(chat_id)
+
+
+def logs_kb(chat_id):
+    return [[{"text": trb(chat_id, "foreign"), "callback_data": "m:logs:foreign"},
+             {"text": trb(chat_id, "iran"), "callback_data": "m:logs:iran"}]
+            ] + back_kb(chat_id)
+
+
+def repair_kb(chat_id):
+    return [[{"text": trb(chat_id, "foreign"), "callback_data": "m:repair:foreign"},
+             {"text": trb(chat_id, "iran"), "callback_data": "m:repair:iran"},
+             {"text": trb(chat_id, "btn_both"), "callback_data": "m:repair:both"}]
+            ] + back_kb(chat_id)
+
+
+def shield_kb(chat_id):
+    return [[{"text": "ON", "callback_data": "m:shield:on"},
+             {"text": "OFF", "callback_data": "m:shield:off"}]
+            ] + back_kb(chat_id)
+
+
+def lang_kb(chat_id):
+    return [[{"text": "English", "callback_data": "lang:en"},
+             {"text": "\u0641\u0627\u0631\u0633\u06cc", "callback_data": "lang:fa"}]]
+
+
+def do_ipcheck(chat_id, ip):
+    send(chat_id, "...")
+    ok_n, ir_n, avg = ipcheck(ip)
+    if ok_n is None:
+        send(chat_id, tr(chat_id, "ipcheck_fail", s=html.escape(str(ir_n))))
+    else:
+        send(chat_id, tr(chat_id, "ipcheck_result", ip=ip, d=ok_n,
+                         dd=ir_n if ir_n else 0, s=avg))
+
+
+CMDS_EN = [
+    ("menu", "Button panel - all actions"),
+    ("status", "Full status of both servers"),
+    ("traffic", "Traffic usage and per-IP"),
+    ("logs", "Recent tunnel logs [iran|foreign] [n]"),
+    ("restart", "Restart a channel <port|mgmt>"),
+    ("repair", "Repair services [iran|foreign|both]"),
+    ("shield", "Iran port-22 shield <on|off>"),
+    ("ipcheck", "Ping an IP from Iranian nodes"),
+    ("mute", "Mute non-critical alerts [min]"),
+    ("unmute", "Unmute alerts"),
+    ("lang", "Switch language EN/FA"),
+    ("help", "Command help"),
+]
+
+CMDS_FA = [
+    ("menu", "\u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc \u2014 \u0647\u0645\u0647\u200c\u06cc \u06a9\u0627\u0631\u0647\u0627"),
+    ("status", "\u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631"),
+    ("traffic", "\u0645\u0635\u0631\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9 \u0648 \u062a\u0641\u06a9\u06cc\u06a9 IP"),
+    ("logs", "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631 \u062a\u0627\u0646\u0644 [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]"),
+    ("restart", "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 <port|mgmt>"),
+    ("repair", "\u062a\u0639\u0645\u06cc\u0631 \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627 [iran|foreign|both]"),
+    ("shield", "\u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 <on|off>"),
+    ("ipcheck", "\u062a\u0633\u062a \u067e\u06cc\u0646\u06af IP \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc"),
+    ("mute", "\u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc [\u062f\u0642\u06cc\u0642\u0647]"),
+    ("unmute", "\u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627"),
+    ("lang", "\u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646 EN/FA"),
+    ("help", "\u0631\u0627\u0647\u0646\u0645\u0627\u06cc \u062f\u0633\u062a\u0648\u0631\u0627\u062a"),
+]
+
+
+def set_commands():
+    for lc, lst in (("", CMDS_EN), ("fa", CMDS_FA)):
+        try:
+            tg("setMyCommands",
+               {"language_code": lc,
+                "commands": [{"command": c, "description": d} for c, d in lst]})
+        except Exception:
+            pass
 
 
 def broadcast(text, critical=False):
@@ -3799,8 +3979,9 @@ def ssh_iran(cmd, timeout=70):
     ir = f.get("IR_IP", "")
     if not ir:
         return None
-    proxy = "python3 %s %s %s '%s' '%s' report" % (
-        TLS_CLIENT, ir, f.get("SEC_SSH", ""), f.get("BIND_IPS", ""), f.get("TLS_SECRET", ""))
+    proxy = "/usr/bin/python3 %s %s %s %s '%s' '%s' mgmt '' %s" % (
+        TLS_CLIENT, ir, f.get("SEC_SSH", ""), f.get("TLS_SNI", ""),
+        f.get("BIND_IPS", ""), f.get("TLS_SECRET", ""), f.get("NODE_PORT", ""))
     argv = ["ssh", "-i", TUNNEL_KEY, "-o", "ProxyCommand=" + proxy,
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
@@ -4009,7 +4190,10 @@ def handle_update(upd):
     cbq = upd.get("callback_query")
     if cbq:
         chat = cbq.get("message", {}).get("chat", {}).get("id")
+        if chat is None:
+            return
         if chat not in allowed_chats():
+            print("pg-tgbot: unauthorized callback from chat %s" % chat, flush=True)
             try:
                 tg("answerCallbackQuery", {"callback_query_id": cbq["id"]})
             except Exception:
@@ -4022,12 +4206,65 @@ def handle_update(upd):
             pass
         if data.startswith("lang:"):
             STATE["chats"][str(chat)] = data.split(":", 1)[1]
-            send(chat, tr(chat, "lang_set"))
+            show_main_menu(chat, tr(chat, "lang_set"))
             return
-        pend = STATE["pending"].pop(str(chat), None)
+        if data == "m:menu":
+            show_main_menu(chat)
+            return
+        if data == "m:status":
+            send(chat, status_text(chat))
+            return
+        if data == "m:traffic":
+            send(chat, traffic_text(chat))
+            return
+        if data == "m:logs":
+            kb_send(chat, tr(chat, "choose_logs"), logs_kb(chat))
+            return
+        if data in ("m:logs:foreign", "m:logs:iran"):
+            send(chat, logs_text(chat, [data.split(":")[2]]))
+            return
+        if data == "m:ipcheck":
+            STATE["await"][str(chat)] = time.time()
+            kb_send(chat, tr(chat, "ip_prompt"), back_kb(chat))
+            return
+        if data == "m:restart":
+            kb_send(chat, tr(chat, "choose_restart"), restart_kb(chat))
+            return
+        if data.startswith("m:restart:"):
+            arg = data.split(":", 2)[2]
+            confirm_and_run(chat, "restart", arg,
+                            "systemctl restart pg-tunnel-* %s" % arg)
+            return
+        if data == "m:repair":
+            kb_send(chat, tr(chat, "choose_repair"), repair_kb(chat))
+            return
+        if data.startswith("m:repair:"):
+            arg = data.split(":", 2)[2]
+            confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
+            return
+        if data == "m:shield":
+            kb_send(chat, tr(chat, "choose_shield"), shield_kb(chat))
+            return
+        if data.startswith("m:shield:"):
+            arg = data.split(":", 2)[2]
+            confirm_and_run(chat, "shield", arg, "shield %s (Iran)" % arg)
+            return
+        if data == "m:mute":
+            STATE["mute"][str(chat)] = time.time() + 3600
+            send(chat, tr(chat, "mute_on", d=60))
+            return
+        if data == "m:unmute":
+            STATE["mute"][str(chat)] = 0
+            send(chat, tr(chat, "mute_off"))
+            return
+        if data == "m:lang":
+            kb_send(chat, tr(chat, "title"), lang_kb(chat))
+            return
         if data == "cancel":
+            STATE["pending"].pop(str(chat), None)
             send(chat, tr(chat, "cancelled"))
             return
+        pend = STATE["pending"].pop(str(chat), None)
         if (not pend or pend.get("data") != data or
                 time.time() - pend.get("ts", 0) > 120):
             send(chat, tr(chat, "cancelled"))
@@ -4040,12 +4277,25 @@ def handle_update(upd):
     chat = msg["chat"]["id"]
     text = msg["text"].strip()
     if chat not in allowed_chats():
+        print("pg-tgbot: unauthorized message from chat %s" % chat, flush=True)
         send(chat, tr(chat, "not_allowed"))
         return
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
     args = parts[1:]
-    if cmd in ("/start", "/help"):
+    aw = STATE["await"].get(str(chat))
+    if aw and time.time() - aw < 180:
+        STATE["await"].pop(str(chat), None)
+        if not cmd.startswith("/"):
+            if re.fullmatch(r"[0-9.]+", text):
+                do_ipcheck(chat, text)
+            else:
+                send(chat, tr(chat, "ip_bad"))
+            return
+    STATE["await"].pop(str(chat), None)
+    if cmd in ("/start", "/menu"):
+        kb_send(chat, tr(chat, "help"), main_menu_kb(chat))
+    elif cmd == "/help":
         send(chat, tr(chat, "help"))
     elif cmd == "/status":
         send(chat, status_text(chat))
@@ -4054,14 +4304,7 @@ def handle_update(upd):
     elif cmd == "/logs":
         send(chat, logs_text(chat, args))
     elif cmd == "/lang":
-        try:
-            tg("sendMessage", {"chat_id": chat, "text": tr(chat, "title"),
-                               "parse_mode": "HTML",
-                               "reply_markup": {"inline_keyboard": [[
-                                   {"text": "English", "callback_data": "lang:en"},
-                                   {"text": "\u0641\u0627\u0631\u0633\u06cc", "callback_data": "lang:fa"}]]}})
-        except Exception:
-            pass
+        kb_send(chat, tr(chat, "title"), lang_kb(chat))
     elif cmd == "/mute":
         mins = 120
         if args and args[0].isdigit():
@@ -4075,13 +4318,7 @@ def handle_update(upd):
         if not args or not re.fullmatch(r"[0-9.]+", args[0]):
             send(chat, tr(chat, "ipcheck_usage"))
             return
-        send(chat, "...")
-        ok_n, ir_n, avg = ipcheck(args[0])
-        if ok_n is None:
-            send(chat, tr(chat, "ipcheck_fail", s=html.escape(str(ir_n))))
-        else:
-            send(chat, tr(chat, "ipcheck_result", ip=args[0], d=ok_n,
-                          dd=ir_n if ir_n else 0, s=avg))
+        do_ipcheck(chat, args[0])
     elif cmd == "/restart":
         if not args:
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/restart"))
@@ -4108,7 +4345,14 @@ def warn_once_per_day(chat_key, text, critical=False):
 
 def check_once():
     loc = local_report()
-    irn = iran_report()
+    irn = None
+    try:
+        every = max(1, int(CFG.get("IRAN_EVERY", "2") or 2))
+    except Exception:
+        every = 2
+    STATE["iran_tick"] = int(STATE.get("iran_tick", 0)) + 1
+    if STATE["iran_tick"] % every == 1:
+        irn = iran_report()
     for role, rep in (("foreign", loc), ("iran", irn)):
         if rep is None:
             continue
@@ -4144,14 +4388,15 @@ def check_once():
             if f == 3:
                 broadcast("CHANNEL DOWN: %s = %s" % (k, v), critical=True)
     if irn is None:
-        f = STATE["fail"].get("IRAN_LINK", 0) + 1
-        STATE["fail"]["IRAN_LINK"] = f
-        if f == 3:
+        last = STATE.get("iran_last_ok", 0)
+        if last and not STATE.get("iran_down") and time.time() - last > 180:
+            STATE["iran_down"] = True
             broadcast("IRAN UNREACHABLE via tunnel (3 min)", critical=True)
     else:
-        if STATE["fail"].get("IRAN_LINK", 0) >= 3:
+        STATE["iran_last_ok"] = time.time()
+        if STATE.get("iran_down"):
+            STATE["iran_down"] = False
             broadcast("Iran reachable again via tunnel.", critical=True)
-        STATE["fail"]["IRAN_LINK"] = 0
         wd = irn.get("WATCHDOG", "")
         if wd and not wd.startswith("OK"):
             broadcast("WATCHDOG (Iran): %s" % html.escape(wd), critical=True)
@@ -4268,6 +4513,7 @@ def main():
         os.makedirs(STATE_DIR, exist_ok=True)
     except Exception:
         pass
+    set_commands()
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=daily_loop, daemon=True).start()
     offset = STATE.get("offset", 0)
@@ -4294,7 +4540,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 PYEOF
     chmod 644 "${TG_BOT_PY}"
 }
@@ -4316,6 +4561,8 @@ ProtectHome=read-only
 PrivateTmp=true
 MemoryHigh=48M
 MemoryMax=64M
+Nice=5
+CPUQuota=10%
 
 [Install]
 WantedBy=multi-user.target
@@ -4419,6 +4666,7 @@ DAILY_HH=${dhh}
 CAP_FOREIGN_GB=${cap_f}
 CAP_IRAN_GB=${cap_i}
 WATCH_BRANCH=${wbr}
+# IRAN_EVERY=2  (fetch Iran report every N monitor cycles; 1 = every minute)
 EOF
                 chmod 600 "$TG_BOT_CONF" 2>/dev/null || true
                 write_tgbot_script
@@ -4428,6 +4676,7 @@ EOF
                 sleep 2
                 if systemctl is-active --quiet pg-tgbot.service; then
                     echo -e "${GREEN}[OK] Bot service is running.${NC}"
+                    echo "Open Telegram and send /menu to your bot for the button panel."
                     local first_chat
                     first_chat=$(echo "$chats" | cut -d, -f1)
                     if tgbot_send_test "$token" "$first_chat"; then
