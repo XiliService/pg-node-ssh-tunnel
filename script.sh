@@ -122,11 +122,18 @@
 #       an anchor message and edit it through prompt -> result (and
 #       cancel), exactly like button-triggered actions - no more
 #       separate confirmation messages cluttering the chat
+# v8.21: HOTFIX Iran restart storm (live 2026-11-27): (1) watchdog
+#       restart-cooldown is now PERSISTED (watchdog.last_restart) so a
+#       watchdog restart can no longer re-arm the 10-min anti-flap and
+#       feed a tls-server restart loop; (2) tls-server caps raised
+#       384M/512M -> 640M/768M - the cgroup peaked 409.5M (kernel sock
+#       buffers), crossed MemoryHigh and the reclaim wedged the
+#       single-threaded proxy; live heal, zero tunnel downtime
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.20"
+SCRIPT_VERSION="8.21"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1223,7 +1230,7 @@ write_watchdog_script() {
 # Monitors reverse-forward listeners + TLS sessions and self-heals the
 # TLS wrapper when the tunnel is fully wedged. Conservative by design:
 # healthy or partially-healthy states never trigger a restart.
-# PG-WD-REF: v7.4
+# PG-WD-REF: v8.21
 set -u
 CONF="/etc/pg-tunnel/iran.conf"
 STATE_FILE="/etc/pg-tunnel/watchdog.state"
@@ -1235,6 +1242,16 @@ PORTS="${NODE_PORT:-62075},${DATA_PORTS:-}"
 SEC_SSH="${SEC_SSH:-2087}"
 MISS=0
 LAST_TLS_RESTART=0
+LAST_RESTART_FILE="/etc/pg-tunnel/watchdog.last_restart"
+# v8.21: persist the restart-cooldown anchor ACROSS watchdog restarts.
+# An in-memory counter reset to zero on every watchdog (re)start, which
+# defeated the 10-minute anti-flap cooldown and fed a tls-server
+# restart storm (live incident 2026-11-27: watchdog restarted between
+# tls restarts, cooldown re-armed each time, loop).
+if [ -r "$LAST_RESTART_FILE" ]; then
+    _lr=$(cat "$LAST_RESTART_FILE" 2>/dev/null | tr -dc '0-9')
+    [ -n "$_lr" ] && LAST_TLS_RESTART=$_lr
+fi
 
 write_state() {
     printf '%s|%s\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')" > "$STATE_FILE" 2>/dev/null || true
@@ -1263,6 +1280,7 @@ while true; do
             _now=$(date +%s)
             if (( _now - LAST_TLS_RESTART >= 600 )); then
                 LAST_TLS_RESTART=$_now
+                printf '%s\n' "$_now" > "$LAST_RESTART_FILE" 2>/dev/null || true
                 MISS=0
                 write_state "RESTARTING_TLS_WRAPPER"
                 systemctl restart pg-tls-server.service >/dev/null 2>&1 || true
@@ -2391,11 +2409,17 @@ heal_tls_memory_caps() {
     # and flapped the reverse channels ~once an hour). Raise the caps
     # on existing installs once - applied live via set-property, so no
     # service restart and zero downtime. Idempotent.
+    # v8.21: 384M/512M proved too tight as well - in a live incident
+    # (2026-11-27) the tls-server cgroup peaked at 409.5M (kernel
+    # socket buffers under a reconnect/scanner storm), crossed
+    # MemoryHigh and the constant reclaim wedged the single-threaded
+    # proxy into a watchdog restart storm. Raised to 640M/768M (2GB
+    # host; hard ceiling still protects the box).
     [[ -f "$TLS_SERVER_SERVICE" ]] || return 0
-    if grep -q "MemoryHigh=192M" "$TLS_SERVER_SERVICE" 2>/dev/null; then
-        sed -i 's/MemoryHigh=192M/MemoryHigh=384M/; s/MemoryMax=256M/MemoryMax=512M/' "$TLS_SERVER_SERVICE"
+    if grep -qE "MemoryHigh=(192|384)M" "$TLS_SERVER_SERVICE" 2>/dev/null; then
+        sed -i 's/MemoryHigh=192M/MemoryHigh=640M/; s/MemoryHigh=384M/MemoryHigh=640M/; s/MemoryMax=256M/MemoryMax=768M/; s/MemoryMax=512M/MemoryMax=768M/' "$TLS_SERVER_SERVICE"
         systemctl daemon-reload 2>/dev/null || true
-        systemctl set-property pg-tls-server.service MemoryHigh=384M MemoryMax=512M >/dev/null 2>&1 || true
+        systemctl set-property pg-tls-server.service MemoryHigh=640M MemoryMax=768M >/dev/null 2>&1 || true
     fi
     return 0
 }
@@ -2450,7 +2474,7 @@ migrate_existing_state() {
     # Refresh the watchdog script automatically after a script update so
     # fixes ship without requiring a manual Repair (restarts only the
     # monitor loop, never the tunnel itself).
-    if [[ -f "$IRAN_CONF" ]] && ! grep -q "PG-WD-REF: v7.4" "$WATCHDOG_SH" 2>/dev/null; then
+    if [[ -f "$IRAN_CONF" ]] && ! grep -q "PG-WD-REF: v8.21" "$WATCHDOG_SH" 2>/dev/null; then
         write_watchdog_script
         systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
     fi
@@ -2835,8 +2859,8 @@ ProtectSystem=strict
 ReadWritePaths=/etc/pg-tunnel
 ProtectHome=true
 PrivateTmp=true
-MemoryHigh=384M
-MemoryMax=512M
+MemoryHigh=640M
+MemoryMax=768M
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
@@ -3887,7 +3911,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.20"
+BOT_REV = "8.21"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
