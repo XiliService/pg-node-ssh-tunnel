@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.9
+# PG Node SSH Tunnel Manager v8.0
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -25,11 +25,15 @@
 # v7.9: Resource-efficient profile - 8MB socket buffers, systemd memory
 #       caps on every unit (kill->3s restart instead of server OOM),
 #       data channels at lower CPU weight, stale-channel auto-cleanup
+# v8.0: Telegram bot (foreign) - alerts, daily report, traffic-cap
+#       prediction, attack digest, ipcheck from Iranian nodes, remote
+#       restart/repair/shield with two-step confirm, EN/FA switching;
+#       new 'report' + 'shield-on/shield-off' CLI subcommands
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.9"
+SCRIPT_VERSION="8.0"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -64,6 +68,9 @@ SSHBF_DISABLED_FILE="${CONF_DIR}/sshbf.disabled"
 KNOWN_HOSTS_FILE="${CONF_DIR}/known_hosts"
 PEER_IPS_FILE="${CONF_DIR}/peer_ips"
 NET_TUNE_SERVICE="/etc/systemd/system/pg-tunnel-net-tune.service"
+TG_BOT_PY="${CONF_DIR}/tg_bot.py"
+TG_BOT_CONF="${CONF_DIR}/tgbot.conf"
+TG_BOT_UNIT="/etc/systemd/system/pg-tgbot.service"
 pick_ssh_ciphers() {
     # Prefer hardware-accelerated AES-GCM when the CPU has AES-NI;
     # otherwise ChaCha20-Poly1305 is faster and equally secure.
@@ -1481,6 +1488,106 @@ cleanup_stale_redirects() {
     return 0
 }
 
+emit_server_report() {
+    # Machine-readable one-shot status snapshot (KEY=VALUE lines) used by
+    # the Telegram bot and any external monitoring. Keys are append-only.
+    # Tolerant mode: a failing probe (missing chain, journalctl hiccup)
+    # must never abort the report - partial data beats no data.
+    set +e
+    local role="unknown"
+    [[ -f "$IRAN_CONF" ]] && role="iran"
+    [[ -f "$FOREIGN_CONF" ]] && role="foreign"
+    echo "ROLE=${role}"
+    echo "VERSION=v${SCRIPT_VERSION}"
+    echo "HOST=$(hostname 2>/dev/null || echo unknown)"
+    echo "UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+    awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\n", t+0, a+0}' /proc/meminfo 2>/dev/null || true
+    echo "DISK_PCT=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5+0}')"
+    read -r _l1 _l5 _l15 _rest < /proc/loadavg 2>/dev/null || true
+    echo "LOAD1=${_l1:-0} LOAD5=${_l5:-0} LOAD15=${_l15:-0}"
+    local _oom
+    _oom=$(dmesg -T 2>/dev/null | grep -i "out of memory" | tail -1 | grep -oE "Killed process [0-9]+ \([^)]+\)" | grep -oE "\([^)]+\)" | tr -d '()' || true)
+    echo "OOM_KILLED=${_oom:-none}"
+    local _cc _qd _nlow
+    _cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+    _qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+    _nlow=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
+    echo "TUNING=${_cc}/${_qd}/${_nlow}"
+
+    if [[ "$role" == "iran" ]]; then
+        local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
+        source "$IRAN_CONF"
+        local _tls _wd _shield _cdays _cr _af _top
+        _tls=$(systemctl is-active pg-tls-server 2>/dev/null || true)
+        echo "TLS_SERVER=${_tls:-unknown}"
+        echo "SEC_SSH=${SEC_SSH:-unknown}"
+        _wd="missing"
+        [[ -f "$WATCHDOG_STATE" ]] && _wd=$(head -1 "$WATCHDOG_STATE" 2>/dev/null)
+        echo "WATCHDOG=${_wd%%|*}"
+        echo "TLS_SESSIONS=$(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {n++} END{print n+0}')"
+        _shield=inactive
+        iptables -C INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -j PG_SSHBF 2>/dev/null && _shield=active
+        echo "SHIELD=${_shield}"
+        _cdays=unknown
+        if [[ -f "$TLS_CERT" ]] && command -v openssl >/dev/null 2>&1; then
+            _cdays=$(openssl x509 -in "$TLS_CERT" -noout -enddate 2>/dev/null | cut -d= -f2 | while read -r _ed; do
+                echo $(( ($(date -d "$_ed" +%s 2>/dev/null || echo 0) - $(date +%s)) / 86400 ))
+            done)
+        fi
+        echo "CERT_DAYS_LEFT=${_cdays:-unknown}"
+        _cr=disabled
+        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1}')
+        echo "CRON=${_cr}"
+        _af=0; _top=""
+        if command -v journalctl >/dev/null 2>&1; then
+            _af=$({ journalctl -u ssh -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -c "Failed password"; } || true)
+            _top=$({ journalctl -u ssh -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep "Failed password" | grep -oE "from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ port" | awk '{print $2}' | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s:%s,",$2,$1}' | sed 's/,$//'; } || true)
+        fi
+        [[ -z "$_af" ]] && _af=0
+        echo "AUTH_FAILS_24H=${_af}"
+        echo "AUTH_TOP_24H=${_top}"
+    elif [[ "$role" == "foreign" ]]; then
+        local IR_IP="" SEC_SSH="" NODE_PORT="62075" DATA_PORTS="" TLS_SNI="www.microsoft.com" BIND_IPS="" TLS_SECRET=""
+        source "$FOREIGN_CONF"
+        local _ms _dp _p _st _cr
+        _ms=$(systemctl is-active pg-tunnel-mgmt 2>/dev/null || true)
+        echo "CHANNEL_MGMT=${_ms:-unknown}"
+        IFS=',' read -ra _dp <<< "$DATA_PORTS"
+        for _p in ${_dp[@]+"${_dp[@]}"}; do
+            _p=$(echo "$_p" | xargs)
+            [[ "$_p" =~ ^[0-9]+$ ]] || continue
+            _st=$(systemctl is-active "pg-tunnel-data-${_p}" 2>/dev/null || true)
+            echo "CHANNEL_DATA_${_p}=${_st:-unknown}"
+        done
+        echo "BIND_POOL=${BIND_IPS:-default}"
+        echo "LAST_GOOD=$(cat "$LAST_GOOD_IP_FILE" 2>/dev/null || echo none)"
+        _cr=disabled
+        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1}')
+        echo "CRON=${_cr}"
+    fi
+
+    sync_traffic_state >/dev/null 2>&1 || true
+    if [[ -f "$TRAFFIC_STATE" ]]; then
+        local CREATED_AT="" BOOT_ID="" SAVED_RX_BYTES=0 SAVED_TX_BYTES=0 LAST_KERNEL_RX=0 LAST_KERNEL_TX=0
+        source "$TRAFFIC_STATE"
+        echo "TRAFFIC_RX_B=${SAVED_RX_BYTES:-0}"
+        echo "TRAFFIC_TX_B=${SAVED_TX_BYTES:-0}"
+        echo "TRAFFIC_SINCE=${CREATED_AT:-unknown}"
+    else
+        echo "TRAFFIC_RX_B=0"
+        echo "TRAFFIC_TX_B=0"
+        echo "TRAFFIC_SINCE=none"
+    fi
+    local _per=""
+    if [[ "$role" == "iran" ]]; then
+        _per=$({ iptables -t mangle -L PG_TUNNEL_IN -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8 ":" $2}' | sort -t: -k2 -rn | head -6 | paste -sd, -; } || true)
+    elif [[ "$role" == "foreign" ]]; then
+        _per=$({ iptables -t mangle -L PG_TUNNEL_OUT -v -x -n 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $8 ":" $2}' | sort -t: -k2 -rn | head -6 | paste -sd, -; } || true)
+    fi
+    echo "PER_IP=${_per:-}"
+    return 0
+}
+
 change_node_ip() {
     print_header
     echo -e "${CYAN}=== Change Node IP (Rebuild Redirect Rules) ===${NC}"
@@ -2059,6 +2166,21 @@ bootstrap_existing_accounting() {
 
 handle_cli_subcommands() {
     case "${1:-}" in
+        report)
+            check_root
+            emit_server_report
+            exit 0
+            ;;
+        shield-on)
+            check_root
+            enable_brute_force_shield || true
+            exit 0
+            ;;
+        shield-off)
+            check_root
+            disable_brute_force_shield
+            exit 0
+            ;;
         ensure-tuning)
             check_root
             ensure_network_tuning full >/dev/null 2>&1 || true
@@ -2992,6 +3114,10 @@ manage_service() {
 uninstall_all() {
     print_header
     echo -e "${RED}=== Safe Uninstall ===${NC}"
+    systemctl stop pg-tgbot.service 2>/dev/null || true
+    systemctl disable pg-tgbot.service >/dev/null 2>&1 || true
+    rm -f "$TG_BOT_UNIT" "$TG_BOT_PY" "$TG_BOT_CONF"
+    rm -rf "${CONF_DIR}/tgbot"
     rm -f "$CRON_FILE" "$ACCT_CRON_FILE"
     systemctl disable pg-tunnel-net-tune.service >/dev/null 2>&1 || true
     rm -f "$NET_TUNE_SERVICE"
@@ -3365,6 +3491,1004 @@ setup_cronjob() {
     read -p "Press Enter to return to menu..."
 }
 
+write_tgbot_script() {
+    mkdir -p "${CONF_DIR}/tgbot"
+    cat > "${TG_BOT_PY}" <<'PYEOF'
+#!/usr/bin/env python3
+"""PG Tunnel Telegram Bot - monitoring and remote control.
+
+Runs on the FOREIGN server only. Collects local status via
+'pg-tunnel report' and Iran status over the existing camouflaged TLS
+tunnel (SSH through the wrapper, ControlMaster persistence). Pure
+stdlib; long polling; per-chat language (EN default, FA via /lang).
+"""
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
+STATE_DIR = "/etc/pg-tunnel/tgbot"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+FOREIGN_CONF = "/etc/pg-tunnel/foreign.conf"
+KNOWN_HOSTS = "/etc/pg-tunnel/known_hosts"
+TLS_CLIENT = "/etc/pg-tunnel/tls_client.py"
+TUNNEL_KEY = "/root/.ssh/tunnel_key"
+LOCAL_CMD = "/usr/local/bin/pg-tunnel"
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
+
+CFG = {}
+STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
+         "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
+         "daily_done": "", "warn_day": {}}
+
+
+def load_cfg():
+    global CFG
+    CFG = {}
+    try:
+        with open(CONF_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                CFG[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return CFG
+
+
+def allowed_chats():
+    out = []
+    for part in CFG.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(","):
+        if re.fullmatch(r"-?[0-9]+", part):
+            out.append(int(part))
+    return out
+
+
+def save_state():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(STATE, fh)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+STR = {
+    "en": {
+        "title": "<b>PG Tunnel Bot</b>",
+        "foreign": "FOREIGN",
+        "iran": "IRAN",
+        "up": "up",
+        "channels": "Channels",
+        "cron": "Cron",
+        "tuning": "Tuning",
+        "traffic": "Traffic",
+        "since": "since",
+        "tls": "TLS",
+        "sessions": "sessions",
+        "watchdog": "Watchdog",
+        "shield": "Shield",
+        "cert": "Cert",
+        "attacks": "Attacks 24h",
+        "bind_pool": "Bind pool",
+        "rebooted": "<b>REBOOT DETECTED:</b> %s server restarted (uptime reset).",
+        "oom": "<b>OOM KILL DETECTED:</b> %s kernel killed process %s.",
+        "channel_down": "<b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
+        "tunnel_unreachable": "<b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
+        "tunnel_back": "Iran reachable again through the tunnel.",
+        "watchdog_bad": "<b>WATCHDOG ALERT (Iran):</b> %s",
+        "shield_off": "Brute-force shield on Iran changed to inactive.",
+        "ram_low": "Low RAM on %s: %d%% available.",
+        "disk_high": "Disk usage on %s: %d%% used.",
+        "cert_low": "TLS certificate on Iran expires in %d days.",
+        "tuning_drift": "Kernel tuning on %s drifted: %s (run Network Optimizer).",
+        "cap_warn": "<b>TRAFFIC CAP:</b> %s used %d%% of its monthly cap.",
+        "days_left": "<b>TRAFFIC CAP:</b> %s will hit its cap in about %d days at current rate.",
+        "daily_title": "<b>Daily PG Tunnel Report</b> - %s (Tehran)",
+        "daily_ok": "All systems nominal.",
+        "prediction": "Traffic rate: %s/day - cap in ~%d days",
+        "no_data": "no data",
+        "ipcheck_result": "Direct IP <code>%s</code> from Iranian nodes: <b>%d/%d OK</b> (avg %s)",
+        "ipcheck_fail": "IP check failed: %s",
+        "ipcheck_usage": "Usage: /ipcheck &lt;ip&gt;",
+        "not_allowed": "Unauthorized. This chat is not in the allow list.",
+        "confirm": "Confirm action: <code>%s</code>?",
+        "confirmed": "Action executed.",
+        "cancelled": "Cancelled.",
+        "failed": "Action failed. Check logs.",
+        "invalid_port": "Unknown port or unit: %s",
+        "restart_done": "Channel %s restarted.",
+        "repair_done": "Repair finished for: %s",
+        "shield_done": "Shield %s on Iran.",
+        "mute_on": "Non-critical alerts muted for %d minutes.",
+        "mute_off": "Alerts unmuted.",
+        "lang_set": "Language set to English.",
+        "logs_tail": "Logs for %s (last %d lines):",
+        "logs_none": "No logs available.",
+        "logs_usage": "Usage: /logs [iran|foreign] [lines]",
+        "help": ("<b>PG Tunnel Bot</b>\\n"
+                 "/status - full status of both servers\\n"
+                 "/traffic - usage, per-IP and cap prediction\\n"
+                 "/logs [iran|foreign] [n] - recent tunnel logs\\n"
+                 "/restart &lt;port|mgmt&gt; - restart one channel (confirm)\\n"
+                 "/repair [iran|foreign|both] - revive dead services (confirm)\\n"
+                 "/shield &lt;on|off&gt; - Iran port-22 shield (confirm)\\n"
+                 "/ipcheck &lt;ip&gt; - test direct IP from Iranian nodes\\n"
+                 "/mute [min] - mute non-critical alerts\\n"
+                 "/lang - switch language\\n"
+                 "/help - this message"),
+    },
+    "fa": {
+        "title": "<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
+        "foreign": "\u062e\u0627\u0631\u062c",
+        "iran": "\u0627\u06cc\u0631\u0627\u0646",
+        "up": "\u0641\u0639\u0627\u0644",
+        "channels": "\u06a9\u0627\u0646\u0627\u0644\u200c\u0647\u0627",
+        "cron": "\u06a9\u0631\u0648\u0646",
+        "tuning": "\u062a\u06cc\u0648\u0646\u06cc\u0646\u06af",
+        "traffic": "\u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "since": "\u0627\u0632",
+        "tls": "TLS",
+        "sessions": "\u062c\u0644\u0633\u0647",
+        "watchdog": "\u0648\u0627\u0686\u200c\u062f\u0627\u06af",
+        "shield": "\u0633\u067e\u0631",
+        "cert": "\u06af\u0648\u0627\u0647\u06cc",
+        "attacks": "\u062d\u0645\u0644\u0627\u062a \u06f2\u06f4\u0633",
+        "bind_pool": "\u0627\u0633\u062a\u062e\u0631 \u0628\u0627\u06cc\u0646\u062f",
+        "rebooted": "<b>\u0631\u06cc\u0628\u0648\u062a \u062a\u0634\u062e\u06cc\u0635 \u062f\u0627\u062f\u0647 \u0634\u062f:</b> \u0633\u0631\u0648\u0631 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f (\u0622\u067e\u200c\u062a\u0627\u06cc\u0645 \u0635\u0641\u0631 \u0634\u062f).",
+        "oom": "<b>\u06a9\u0634\u062a\u0646 \u067e\u0631\u0648\u0633\u0647 \u062a\u0648\u0633\u0637 OOM:</b> \u06a9\u0631\u0646\u0644 %s \u067e\u0631\u0648\u0633\u0647\u200c\u06cc %s \u0631\u0627 \u06a9\u0634\u062a.",
+        "channel_down": "<b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
+        "tunnel_unreachable": "<b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
+        "tunnel_back": "\u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
+        "watchdog_bad": "<b>\u0647\u0634\u062f\u0627\u0631 \u0648\u0627\u0686\u200c\u062f\u0627\u06af (\u0627\u06cc\u0631\u0627\u0646):</b> %s",
+        "shield_off": "\u0633\u067e\u0631 \u0628\u0631\u0648\u062a\u200c\u0641\u0648\u0631\u0633 \u0627\u06cc\u0631\u0627\u0646 \u063a\u06cc\u0631\u0641\u0639\u0627\u0644 \u0634\u062f.",
+        "ram_low": "\u06a9\u0645\u0628\u0648\u062f \u0631\u0645 \u062f\u0631 %s: \u0641\u0642\u0637 %d%% \u0628\u0627\u0642\u06cc \u0645\u0627\u0646\u062f\u0647.",
+        "disk_high": "\u0645\u0635\u0631\u0641 \u062f\u06cc\u0633\u06a9 \u062f\u0631 %s: %d%%.",
+        "cert_low": "\u06af\u0648\u0627\u0647\u06cc TLS \u0627\u06cc\u0631\u0627\u0646 \u062a\u0627 %d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0645\u0646\u0642\u0636\u06cc \u0645\u06cc\u200c\u0634\u0648\u062f.",
+        "tuning_drift": "\u062a\u06cc\u0648\u0646\u06cc\u0646\u06af \u06a9\u0631\u0646\u0644 %s \u0628\u0647\u200c\u0647\u0645 \u062e\u0648\u0631\u062f\u0647: %s (Optimize \u0631\u0627 \u0627\u062c\u0631\u0627 \u06a9\u0646\u06cc\u062f).",
+        "cap_warn": "<b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0647 %d%% \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647 \u0631\u0633\u06cc\u062f\u0647.",
+        "days_left": "<b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0627 \u0627\u06cc\u0646 \u0645\u0635\u0631\u0641 ~%d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0628\u0647 \u0633\u0642\u0641 \u0645\u06cc\u200c\u0631\u0633\u062f.",
+        "daily_title": "<b>\u06af\u0632\u0627\u0631\u0634 \u0631\u0648\u0632\u0627\u0646\u0647\u200c\u06cc \u062a\u0627\u0646\u0644 PG</b> - %s (\u062a\u0647\u0631\u0627\u0646)",
+        "daily_ok": "\u0647\u0645\u0647\u200c\u0686\u06cc\u0632 \u0633\u0627\u0644\u0645 \u0627\u0633\u062a.",
+        "prediction": "\u0646\u0631\u062e \u0645\u0635\u0631\u0641: %s \u062f\u0631 \u0631\u0648\u0632 - ~%d \u0631\u0648\u0632 \u062a\u0627 \u0633\u0642\u0641",
+        "no_data": "\u0628\u062f\u0648\u0646 \u062f\u0627\u062f\u0647",
+        "ipcheck_result": "IP \u062f\u0627\u06cc\u0631\u06a9\u062a <code>%s</code> \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc: <b>%d/%d \u0633\u0627\u0644\u0645</b> (\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 %s)",
+        "ipcheck_fail": "\u062a\u0633\u062a IP \u0646\u0627\u0645\u0648\u0641\u0642: %s",
+        "ipcheck_usage": "\u0637\u0631\u0632 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /ipcheck &lt;ip&gt;",
+        "not_allowed": "\u063a\u06cc\u0631\u0645\u062c\u0627\u0632. \u0627\u06cc\u0646 \u0686\u062a \u062f\u0631 \u0644\u06cc\u0633\u062a \u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a.",
+        "confirm": "\u062a\u0627\u06cc\u06cc\u062f \u0627\u062c\u0631\u0627\u06cc: <code>%s</code> \u061f",
+        "confirmed": "\u0627\u062c\u0631\u0627 \u0634\u062f.",
+        "cancelled": "\u0644\u063a\u0648 \u0634\u062f.",
+        "failed": "\u0627\u062c\u0631\u0627\u06cc \u062f\u0633\u062a\u0648\u0631 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062f. \u0644\u0627\u06af\u200c\u0647\u0627 \u0631\u0627 \u0628\u0628\u06cc\u0646\u06cc\u062f.",
+        "invalid_port": "\u067e\u0648\u0631\u062a/\u0633\u0631\u0648\u06cc\u0633 \u0646\u0627\u0634\u0646\u0627\u0633: %s",
+        "restart_done": "\u06a9\u0627\u0646\u0627\u0644 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f.",
+        "repair_done": "\u062a\u0639\u0645\u06cc\u0631 \u0627\u0646\u062c\u0627\u0645 \u0634\u062f \u0628\u0631\u0627\u06cc: %s",
+        "shield_done": "\u0633\u067e\u0631 \u0627\u06cc\u0631\u0627\u0646 %s \u0634\u062f.",
+        "mute_on": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc \u0628\u0631\u0627\u06cc %d \u062f\u0642\u06cc\u0642\u0647 \u0628\u06cc\u200c\u0635\u062f\u0627 \u0634\u062f.",
+        "mute_off": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627 \u0648\u0635\u0644 \u0634\u062f.",
+        "lang_set": "\u0632\u0628\u0627\u0646 \u0641\u0627\u0631\u0633\u06cc \u0634\u062f.",
+        "logs_tail": "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc %s (\u0622\u062e\u0631\u06cc\u0646 %d \u062e\u0637):",
+        "logs_none": "\u0644\u0627\u06af\u06cc \u0645\u0648\u062c\u0648\u062f \u0646\u06cc\u0633\u062a.",
+        "logs_usage": "\u0637\u0631\u0632 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /logs [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]",
+        "help": ("<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\\n"
+                 "/status - \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\\n"
+                 "/traffic - \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u067e\u06cc\u0634\u200c\u0628\u06cc\u0646\u06cc \u0633\u0642\u0641\\n"
+                 "/logs [iran|foreign] [n] - \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\\n"
+                 "/restart &lt;port|mgmt&gt; - \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
+                 "/repair [iran|foreign|both] - \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
+                 "/shield &lt;on|off&gt; - \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\\n"
+                 "/ipcheck &lt;ip&gt; - \u062a\u0633\u062a IP \u062f\u0627\u06cc\u0631\u06a9\u062a \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\\n"
+                 "/mute [\u062f\u0642\u06cc\u0642\u0647] - \u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc\\n"
+                 "/lang - \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\\n"
+                 "/help - \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645"),
+    },
+}
+
+
+def lang_of(chat_id):
+    return STATE["chats"].get(str(chat_id), CFG.get("LANG", "en"))
+
+
+def tr(chat_id, key, **kw):
+    s = STR.get(lang_of(chat_id), STR["en"]).get(key, STR["en"].get(key, key))
+    try:
+        return s % kw if kw else s
+    except Exception:
+        return s
+
+
+def fmt_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            if unit == "B":
+                return "%d %s" % (n, unit)
+            return "%.2f %s" % (n, unit)
+        n /= 1024.0
+
+
+def fmt_uptime(sec):
+    sec = int(sec or 0)
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    if d:
+        return "%dd %dh" % (d, h)
+    if h:
+        return "%dh %dm" % (h, m)
+    return "%dm" % m
+
+
+def tg(method, params, timeout=20):
+    url = "https://api.telegram.org/bot%s/%s" % (CFG.get("BOT_TOKEN", ""), method)
+    data = json.dumps(params).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def send(chat_id, text):
+    try:
+        tg("sendMessage", {"chat_id": chat_id, "text": text[:3900],
+                           "parse_mode": "HTML", "disable_web_page_preview": True})
+    except Exception:
+        pass
+
+
+def broadcast(text, critical=False):
+    now = time.time()
+    for cid in allowed_chats():
+        if not critical:
+            if STATE["mute"].get(str(cid), 0) > now:
+                continue
+            if datetime.now(TEHRAN).hour < 8:
+                continue
+        key = re.sub(r"<[^>]+>", "", text)[:60]
+        if STATE["win"].get(key, 0) > now - 300:
+            continue
+        STATE["win"][key] = now
+        send(cid, text)
+
+
+def parse_report(text):
+    d = {}
+    for line in (text or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def local_report():
+    try:
+        out = subprocess.run([LOCAL_CMD, "report"], capture_output=True,
+                             text=True, timeout=90)
+        if out.returncode == 0:
+            return parse_report(out.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def ssh_iran(cmd, timeout=70):
+    f = {}
+    try:
+        with open(FOREIGN_CONF, encoding="utf-8") as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    f[k.strip()] = v.strip()
+    except Exception:
+        return None
+    ir = f.get("IR_IP", "")
+    if not ir:
+        return None
+    proxy = "python3 %s %s %s '%s' '%s' report" % (
+        TLS_CLIENT, ir, f.get("SEC_SSH", ""), f.get("BIND_IPS", ""), f.get("TLS_SECRET", ""))
+    argv = ["ssh", "-i", TUNNEL_KEY, "-o", "ProxyCommand=" + proxy,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
+            "-o", "ControlMaster=auto", "-o", "ControlPath=/run/pgtgbot-%C",
+            "-o", "ControlPersist=900", "-o", "ConnectTimeout=12",
+            "-o", "BatchMode=yes", "root@" + ir, cmd]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        if out.returncode == 0:
+            return out.stdout
+    except Exception:
+        pass
+    return None
+
+
+def iran_report():
+    txt = ssh_iran(LOCAL_CMD + " report")
+    return parse_report(txt) if txt else None
+
+
+def label(chat_id, role):
+    return tr(chat_id, "iran" if role == "iran" else "foreign")
+
+
+def status_text(chat_id):
+    now = datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M")
+    loc = local_report()
+    irn = iran_report()
+    out = ["<b>PG Tunnel</b> - %s (Tehran)" % now, ""]
+    for role, rep in ((label(chat_id, "foreign"), loc), (label(chat_id, "iran"), irn)):
+        if rep is None:
+            out.append("<b>%s:</b> %s" % (role, tr(chat_id, "tunnel_unreachable")
+                                          if role != label(chat_id, "foreign")
+                                          else tr(chat_id, "failed")))
+            out.append("")
+            continue
+        up = fmt_uptime(rep.get("UPTIME_SEC", 0))
+        out.append("<b>%s:</b> %s | %s %s" % (role, rep.get("VERSION", "?"),
+                                              tr(chat_id, "up"), up))
+        chans = sorted(k for k in rep if k.startswith("CHANNEL_"))
+        if chans:
+            vals = " | ".join("%s %s" % (k.replace("CHANNEL_DATA_", "").replace("CHANNEL_", ""),
+                                         rep[k]) for k in chans)
+            out.append("  %s: %s" % (tr(chat_id, "channels"), vals))
+        if rep.get("TLS_SERVER"):
+            out.append("  %s: %s :%s | %s %s" % (tr(chat_id, "tls"), rep["TLS_SERVER"],
+                                                 rep.get("SEC_SSH", "?"),
+                                                 tr(chat_id, "sessions"),
+                                                 rep.get("TLS_SESSIONS", "?")))
+        if "WATCHDOG" in rep:
+            out.append("  %s: %s" % (tr(chat_id, "watchdog"),
+                                     html.escape(rep.get("WATCHDOG", "?"))))
+        if "SHIELD" in rep:
+            out.append("  %s: %s | %s: %s" % (tr(chat_id, "shield"), rep.get("SHIELD", "?"),
+                                              tr(chat_id, "cert"),
+                                              rep.get("CERT_DAYS_LEFT", "?")))
+        if "BIND_POOL" in rep:
+            out.append("  %s: %s" % (tr(chat_id, "bind_pool"), rep.get("BIND_POOL", "?")))
+        out.append("  %s: %s | %s: %s" % (tr(chat_id, "cron"), rep.get("CRON", "?"),
+                                          tr(chat_id, "tuning"), rep.get("TUNING", "?")))
+        out.append("  %s: D %s / U %s (%s %s)" % (
+            tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
+            fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
+            rep.get("TRAFFIC_SINCE", "?")))
+        if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
+            out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"),
+                                          rep.get("AUTH_FAILS_24H"),
+                                          html.escape(rep.get("AUTH_TOP_24H", "")) or "-"))
+        out.append("")
+    return "\n".join(out)
+
+
+def traffic_text(chat_id):
+    out = ["<b>Traffic</b>", ""]
+    for role in ("foreign", "iran"):
+        rep = local_report() if role == "foreign" else iran_report()
+        name = label(chat_id, role)
+        if rep is None:
+            out.append("<b>%s:</b> %s" % (name, tr(chat_id, "no_data")))
+            continue
+        out.append("<b>%s:</b> D %s / U %s (%s %s)" % (
+            name, fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
+            fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
+            rep.get("TRAFFIC_SINCE", "?")))
+        per = rep.get("PER_IP", "")
+        if per:
+            for item in per.split(","):
+                if ":" in item:
+                    ip, b = item.rsplit(":", 1)
+                    out.append("  %s: %s" % (html.escape(ip), fmt_bytes(b)))
+        cap = CFG.get("CAP_FOREIGN_GB" if role == "foreign" else "CAP_IRAN_GB", "0")
+        try:
+            capf = float(cap)
+        except Exception:
+            capf = 0.0
+        if capf > 0:
+            used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) +
+                    float(rep.get("TRAFFIC_TX_B", 0) or 0)) / (1024 ** 3)
+            pct = int(used * 100 / capf)
+            out.append("  cap: %d%% of %g GB" % (pct, capf))
+        out.append("")
+    return "\n".join(out)
+
+
+def logs_text(chat_id, args):
+    target = "foreign"
+    n = 30
+    if args and args[0] in ("iran", "foreign"):
+        target = args[0]
+        if len(args) > 1 and args[1].isdigit():
+            n = min(int(args[1]), 100)
+    elif args:
+        return tr(chat_id, "logs_usage")
+    if target == "foreign":
+        try:
+            out = subprocess.run(["journalctl", "-u", "pg-tunnel-mgmt", "-u", "pg-tunnel-data-*",
+                                  "--no-pager", "-n", str(n), "-o", "cat"],
+                                 capture_output=True, text=True, timeout=60)
+            body = out.stdout
+        except Exception:
+            body = ""
+    else:
+        body = ssh_iran("journalctl -u pg-tls-server -u pg-tunnel-watchdog --no-pager -n %d -o cat 2>/dev/null | tail -n %d" % (n, n)) or ""
+    if not body.strip():
+        return tr(chat_id, "logs_none")
+    head = tr(chat_id, "logs_tail", s=target, d=n)
+    return head + "\n<pre>" + html.escape(body[-3200:]) + "</pre>"
+
+
+def ipcheck(ip):
+    try:
+        req = urllib.request.Request(
+            "https://check-host.net/check-ping?host=%s&max_nodes=7" % ip,
+            headers={"Accept": "application/json"})
+        rid = json.loads(urllib.request.urlopen(req, timeout=15).read())["request_id"]
+        time.sleep(4)
+        req2 = urllib.request.Request("https://check-host.net/check-result/" + rid,
+                                      headers={"Accept": "application/json"})
+        res = json.loads(urllib.request.urlopen(req2, timeout=15).read())
+        ok_n = 0
+        ir_n = 0
+        lats = []
+        for node, val in (res or {}).items():
+            if not (node.startswith("ir") or ".ir." in node):
+                continue
+            ir_n += 1
+            entry = val[0] if isinstance(val, list) and val else None
+            if isinstance(entry, list):
+                times = [r.get("time") for r in entry if r and "time" in r]
+                if times:
+                    ok_n += 1
+                    lats.extend(times)
+        avg = "%.0f ms" % (1000.0 * sum(lats) / len(lats)) if lats else "-"
+        return ok_n, ir_n, avg
+    except Exception as e:
+        return None, str(e), None
+
+
+def confirm_and_run(chat_id, action, arg, desc):
+    nonce = "go%d" % (int(time.time() * 1000) % 1000000000)
+    STATE["pending"][str(chat_id)] = {"action": action, "arg": arg,
+                                      "data": nonce, "ts": time.time()}
+    kb = {"inline_keyboard": [
+        [{"text": "OK", "callback_data": nonce},
+         {"text": "Cancel", "callback_data": "cancel"}]]}
+    try:
+        tg("sendMessage", {"chat_id": chat_id,
+                           "text": tr(chat_id, "confirm", s=desc),
+                           "parse_mode": "HTML", "reply_markup": kb})
+    except Exception:
+        pass
+
+
+def run_action(chat_id, action, arg):
+    if action == "restart":
+        unit = "pg-tunnel-mgmt" if arg == "mgmt" else "pg-tunnel-data-" + arg
+        try:
+            r = subprocess.run(["systemctl", "restart", unit],
+                               capture_output=True, text=True, timeout=90)
+            if r.returncode == 0:
+                send(chat_id, tr(chat_id, "restart_done", s=arg))
+            else:
+                send(chat_id, tr(chat_id, "failed"))
+        except Exception:
+            send(chat_id, tr(chat_id, "failed"))
+    elif action == "repair":
+        done = []
+        if arg in ("foreign", "both"):
+            try:
+                subprocess.run([LOCAL_CMD, "cron-auto-repair"], capture_output=True,
+                               text=True, timeout=180)
+                done.append("foreign")
+            except Exception:
+                pass
+        if arg in ("iran", "both"):
+            ssh_iran(LOCAL_CMD + " cron-auto-repair", timeout=200)
+            done.append("iran")
+        send(chat_id, tr(chat_id, "repair_done", s=", ".join(done) or arg))
+    elif action == "shield":
+        out = ssh_iran(LOCAL_CMD + (" shield-on" if arg == "on" else " shield-off"))
+        send(chat_id, tr(chat_id, "shield_done", s=arg) if out is not None
+             else tr(chat_id, "failed"))
+
+
+def handle_update(upd):
+    cbq = upd.get("callback_query")
+    if cbq:
+        chat = cbq.get("message", {}).get("chat", {}).get("id")
+        if chat not in allowed_chats():
+            try:
+                tg("answerCallbackQuery", {"callback_query_id": cbq["id"]})
+            except Exception:
+                pass
+            return
+        data = cbq.get("data", "")
+        try:
+            tg("answerCallbackQuery", {"callback_query_id": cbq["id"]})
+        except Exception:
+            pass
+        if data.startswith("lang:"):
+            STATE["chats"][str(chat)] = data.split(":", 1)[1]
+            send(chat, tr(chat, "lang_set"))
+            return
+        pend = STATE["pending"].pop(str(chat), None)
+        if data == "cancel":
+            send(chat, tr(chat, "cancelled"))
+            return
+        if (not pend or pend.get("data") != data or
+                time.time() - pend.get("ts", 0) > 120):
+            send(chat, tr(chat, "cancelled"))
+            return
+        run_action(chat, pend["action"], pend.get("arg"))
+        return
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg or "text" not in msg:
+        return
+    chat = msg["chat"]["id"]
+    text = msg["text"].strip()
+    if chat not in allowed_chats():
+        send(chat, tr(chat, "not_allowed"))
+        return
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lower()
+    args = parts[1:]
+    if cmd in ("/start", "/help"):
+        send(chat, tr(chat, "help"))
+    elif cmd == "/status":
+        send(chat, status_text(chat))
+    elif cmd == "/traffic":
+        send(chat, traffic_text(chat))
+    elif cmd == "/logs":
+        send(chat, logs_text(chat, args))
+    elif cmd == "/lang":
+        try:
+            tg("sendMessage", {"chat_id": chat, "text": tr(chat, "title"),
+                               "parse_mode": "HTML",
+                               "reply_markup": {"inline_keyboard": [[
+                                   {"text": "English", "callback_data": "lang:en"},
+                                   {"text": "\u0641\u0627\u0631\u0633\u06cc", "callback_data": "lang:fa"}]]}})
+        except Exception:
+            pass
+    elif cmd == "/mute":
+        mins = 120
+        if args and args[0].isdigit():
+            mins = min(int(args[0]), 1440)
+        STATE["mute"][str(chat)] = time.time() + mins * 60
+        send(chat, tr(chat, "mute_on", d=mins))
+    elif cmd == "/unmute":
+        STATE["mute"][str(chat)] = 0
+        send(chat, tr(chat, "mute_off"))
+    elif cmd == "/ipcheck":
+        if not args or not re.fullmatch(r"[0-9.]+", args[0]):
+            send(chat, tr(chat, "ipcheck_usage"))
+            return
+        send(chat, "...")
+        ok_n, ir_n, avg = ipcheck(args[0])
+        if ok_n is None:
+            send(chat, tr(chat, "ipcheck_fail", s=html.escape(str(ir_n))))
+        else:
+            send(chat, tr(chat, "ipcheck_result", ip=args[0], d=ok_n,
+                          dd=ir_n if ir_n else 0, s=avg))
+    elif cmd == "/restart":
+        if not args:
+            send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/restart"))
+            return
+        arg = args[0]
+        confirm_and_run(chat, "restart", arg, "systemctl restart pg-tunnel-* %s" % arg)
+    elif cmd == "/repair":
+        arg = args[0] if args and args[0] in ("iran", "foreign", "both") else "both"
+        confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
+    elif cmd == "/shield":
+        if not args or args[0] not in ("on", "off"):
+            send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/shield on|off"))
+            return
+        confirm_and_run(chat, "shield", args[0], "shield %s (Iran)" % args[0])
+
+
+def warn_once_per_day(chat_key, text, critical=False):
+    today = datetime.now(TEHRAN).strftime("%Y-%m-%d")
+    if STATE["warn_day"].get(chat_key) == today:
+        return
+    STATE["warn_day"][chat_key] = today
+    broadcast(text, critical=critical)
+
+
+def check_once():
+    loc = local_report()
+    irn = iran_report()
+    for role, rep in (("foreign", loc), ("iran", irn)):
+        if rep is None:
+            continue
+        prev = STATE["prev"].get(role, {})
+        up = int(float(rep.get("UPTIME_SEC", "0") or 0))
+        if int(float(prev.get("UPTIME_SEC", up))) - up > 600:
+            broadcast("<b>REBOOT:</b> %s" % rep.get("HOST", role), critical=True)
+        if rep.get("OOM_KILLED", "none") not in ("none", "") and \
+                rep.get("OOM_KILLED") != prev.get("OOM_KILLED"):
+            broadcast("OOM: %s: %s" % (rep.get("HOST", role),
+                                       html.escape(rep.get("OOM_KILLED", ""))), critical=True)
+        total = int(rep.get("RAM_TOTAL_KB", "1") or 1)
+        avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
+        if total > 0 and avail * 100 // total < 15:
+            warn_once_per_day("ram_%s" % role, "RAM low %s: %d%%" %
+                              (rep.get("HOST", role), avail * 100 // total))
+        disk = int(rep.get("DISK_PCT", "0") or 0)
+        if disk > 85:
+            warn_once_per_day("disk_%s" % role, "Disk %s: %d%%" %
+                              (rep.get("HOST", role), disk))
+        tun = rep.get("TUNING", "")
+        if tun and not tun.startswith("bbr/fq"):
+            warn_once_per_day("tune_%s" % role, "Tuning %s: %s" %
+                              (rep.get("HOST", role), tun))
+        STATE["prev"][role] = rep
+    if loc:
+        for k, v in sorted(loc.items()):
+            if not k.startswith("CHANNEL_"):
+                continue
+            f = STATE["fail"].get(k, 0)
+            f = f + 1 if v != "active" else 0
+            STATE["fail"][k] = f
+            if f == 3:
+                broadcast("CHANNEL DOWN: %s = %s" % (k, v), critical=True)
+    if irn is None:
+        f = STATE["fail"].get("IRAN_LINK", 0) + 1
+        STATE["fail"]["IRAN_LINK"] = f
+        if f == 3:
+            broadcast("IRAN UNREACHABLE via tunnel (3 min)", critical=True)
+    else:
+        if STATE["fail"].get("IRAN_LINK", 0) >= 3:
+            broadcast("Iran reachable again via tunnel.", critical=True)
+        STATE["fail"]["IRAN_LINK"] = 0
+        wd = irn.get("WATCHDOG", "")
+        if wd and not wd.startswith("OK"):
+            broadcast("WATCHDOG (Iran): %s" % html.escape(wd), critical=True)
+        try:
+            days = int(irn.get("CERT_DAYS_LEFT", "999"))
+        except Exception:
+            days = 999
+        if 0 <= days <= 14:
+            warn_once_per_day("cert", "TLS cert (Iran) expires in %d days" % days)
+
+
+def sample_traffic(rep, role):
+    today = datetime.now(TEHRAN).strftime("%Y-%m-%d")
+    used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) +
+            float(rep.get("TRAFFIC_TX_B", 0) or 0))
+    STATE["samples"].setdefault(role, {})[today] = used
+
+
+def daily_report():
+    now = datetime.now(TEHRAN)
+    title = now.strftime("%Y-%m-%d")
+    loc = local_report()
+    irn = iran_report()
+    body = status_text(0)
+    extra = []
+    for role, rep in (("foreign", loc), ("iran", irn)):
+        if rep is None:
+            continue
+        sample_traffic(rep, role)
+        cap = CFG.get("CAP_FOREIGN_GB" if role == "foreign" else "CAP_IRAN_GB", "0")
+        try:
+            capf = float(cap)
+        except Exception:
+            capf = 0.0
+        if capf <= 0:
+            continue
+        used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) +
+                float(rep.get("TRAFFIC_TX_B", 0) or 0)) / (1024 ** 3)
+        pct = int(used * 100 / capf)
+        if pct >= 75:
+            extra.append("CAP %s: %d%%" % (role, pct))
+        hist = STATE["samples"].get(role, {})
+        rates = []
+        keys = sorted(hist)[-8:]
+        for i in range(1, len(keys)):
+            delta = hist[keys[i]] - hist[keys[i - 1]]
+            rates.append(delta / (1024 ** 3))
+        if rates:
+            rate = sum(rates) / len(rates)
+            if rate > 0:
+                left = (capf - used) / rate
+                if left <= 7:
+                    extra.append("CAP %s: ~%d days left" % (role, int(left)))
+    gh = github_check()
+    if gh:
+        extra.append(gh)
+    if extra:
+        body += "\n" + "\n".join("! " + e for e in extra)
+    broadcast("%s %s\n\n%s" % ("Daily:", title, body), critical=True)
+
+
+def github_check():
+    branch = CFG.get("WATCH_BRANCH", "")
+    if not branch:
+        return ""
+    try:
+        url = ("https://api.github.com/repos/XiliService/pg-node-ssh-tunnel/commits"
+               "?sha=%s&per_page=1" % urllib.parse.quote(branch))
+        req = urllib.request.Request(url, headers={"User-Agent": "pg-tgbot"})
+        data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        sha = data[0].get("sha", "")[:8]
+        if sha and sha != STATE.get("last_sha") and STATE.get("last_sha"):
+            STATE["last_sha"] = sha
+            return "New commit on %s: %s" % (branch, sha)
+        if sha:
+            STATE["last_sha"] = sha
+    except Exception:
+        pass
+    return ""
+
+
+def monitor_loop():
+    while True:
+        try:
+            load_cfg()
+            check_once()
+            save_state()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def daily_loop():
+    while True:
+        try:
+            now = datetime.now(TEHRAN)
+            hh = int(CFG.get("DAILY_HH", "9"))
+            today = now.strftime("%Y-%m-%d")
+            if now.hour == hh and STATE.get("daily_done") != today:
+                STATE["daily_done"] = today
+                daily_report()
+                save_state()
+        except Exception:
+            pass
+        time.sleep(120)
+
+
+def main():
+    load_cfg()
+    if not CFG.get("BOT_TOKEN") or not allowed_chats():
+        print("pg-tgbot: BOT_TOKEN/ALLOWED_CHAT_IDS missing in %s" % CONF_FILE)
+        sys.exit(1)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except Exception:
+        pass
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=daily_loop, daemon=True).start()
+    offset = STATE.get("offset", 0)
+    while True:
+        try:
+            res = tg("getUpdates", {"timeout": 30, "offset": offset,
+                                    "allowed_updates": ["message", "callback_query"]},
+                     timeout=40)
+            for u in res.get("result", []):
+                offset = max(offset, u["update_id"] + 1)
+                STATE["offset"] = offset
+                try:
+                    handle_update(u)
+                except Exception:
+                    pass
+            save_state()
+        except urllib.error.HTTPError as e:
+            time.sleep(5 if e.code == 409 else 30)
+            load_cfg()
+        except Exception:
+            load_cfg()
+            time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()
+
+PYEOF
+    chmod 644 "${TG_BOT_PY}"
+}
+
+write_tgbot_unit() {
+    cat > "$TG_BOT_UNIT" <<EOF
+[Unit]
+Description=PG Tunnel Telegram Bot (Monitoring and Control)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${TG_BOT_PY}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
+MemoryHigh=48M
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+tgbot_send_test() {
+    local token="$1" chat="$2"
+    curl -fsS -m 15 -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\": ${chat}, \"text\": \"PG Tunnel bot is online. (/help for commands)\"}" \
+        "https://api.telegram.org/bot${token}/sendMessage" >/dev/null 2>&1
+}
+
+tgbot_menu() {
+    while true; do
+        print_header
+        echo -e "${CYAN}=== Telegram Bot (Monitoring & Control) ===${NC}"
+        echo
+        local bs="not installed"
+        if [[ -f "$TG_BOT_CONF" ]]; then
+            if systemctl is-active --quiet pg-tgbot.service 2>/dev/null; then
+                bs="${GREEN}active${NC}"
+            else
+                bs="${YELLOW}installed but stopped${NC}"
+            fi
+        fi
+        echo "  Bot Status        : ${bs}"
+        echo
+        echo "  1. Install / Configure Bot (runs on the FOREIGN server)"
+        echo "  2. Start / Restart Bot Service"
+        echo "  3. Stop Bot Service"
+        echo "  4. Send Test Message"
+        echo "  5. Remove Bot"
+        echo "  0. Back to Main Menu"
+        echo -e "------------------------------------------------------------"
+        read -p "Select option [0-5]: " tb_choice
+        case "$tb_choice" in
+            1)
+                if [[ -f "$IRAN_CONF" ]]; then
+                    echo -e "${YELLOW}[NOTE] The bot is designed for the FOREIGN server; it reads Iran${NC}"
+                    echo -e "${YELLOW}reports through the tunnel. You can still configure it here.${NC}"
+                fi
+                local token="" chats="" cap_f="0" cap_i="0" dhh="9" wbr=""
+                read -p "Bot token from @BotFather: " token
+                token=$(echo "$token" | xargs)
+                if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+                    echo -e "${RED}[ERROR] That does not look like a valid bot token.${NC}"
+                    sleep 1
+                    continue
+                fi
+                echo
+                echo "Now open Telegram, send /start to your bot, then press Enter here"
+                echo "(waiting up to 60s to auto-detect your chat ID)..."
+                read -r _
+                local detected="" tries=0 upd
+                while (( tries < 12 )) && [[ -z "$detected" ]]; do
+                    upd=$(curl -fsS -m 15 "https://api.telegram.org/bot${token}/getUpdates?timeout=3" 2>/dev/null || true)
+                    detected=$(echo "$upd" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    ids = []
+    for u in d.get('result', []):
+        m = u.get('message') or u.get('callback_query', {}).get('message')
+        if m and 'text' in m:
+            ids.append(str(m['chat']['id']))
+    print(','.join(dict.fromkeys(ids)))
+except Exception:
+    pass" 2>/dev/null || true)
+                    [[ -z "$detected" ]] && { tries=$((tries + 1)); sleep 3; }
+                done
+                if [[ -n "$detected" ]]; then
+                    chats="$detected"
+                    echo -e "${GREEN}[OK] Detected chat ID(s): ${chats}${NC}"
+                else
+                    read -p "Could not auto-detect. Enter chat ID(s) manually (comma separated): " chats
+                    chats=$(echo "$chats" | tr -d ' ')
+                fi
+                if [[ -z "$chats" || ! "$chats" =~ ^-?[0-9]+(,-?[0-9]+)*$ ]]; then
+                    echo -e "${RED}[ERROR] No valid chat ID provided - aborted.${NC}"
+                    sleep 1
+                    continue
+                fi
+                read -p "Monthly traffic cap for FOREIGN server in GB (Enter = disabled): " cap_f
+                cap_f=$(echo "$cap_f" | xargs); [[ "$cap_f" =~ ^[0-9]+([.][0-9]+)?$ ]] || cap_f="0"
+                read -p "Monthly traffic cap for IRAN server in GB (Enter = disabled): " cap_i
+                cap_i=$(echo "$cap_i" | xargs); [[ "$cap_i" =~ ^[0-9]+([.][0-9]+)?$ ]] || cap_i="0"
+                read -p "Daily report hour 0-23 Tehran time [default: 9]: " dhh
+                dhh=$(echo "$dhh" | xargs); [[ "$dhh" =~ ^([0-9]|1[0-9]|2[0-3])$ ]] || dhh="9"
+                read -p "Optional GitHub branch to watch for new commits (Enter = off): " wbr
+                wbr=$(echo "$wbr" | xargs)
+
+                cat > "$TG_BOT_CONF" <<EOF
+# PG Tunnel Telegram Bot configuration
+BOT_TOKEN=${token}
+ALLOWED_CHAT_IDS=${chats}
+LANG=en
+DAILY_HH=${dhh}
+CAP_FOREIGN_GB=${cap_f}
+CAP_IRAN_GB=${cap_i}
+WATCH_BRANCH=${wbr}
+EOF
+                chmod 600 "$TG_BOT_CONF" 2>/dev/null || true
+                write_tgbot_script
+                write_tgbot_unit
+                systemctl enable pg-tgbot.service >/dev/null 2>&1 || true
+                systemctl restart pg-tgbot.service 2>/dev/null || true
+                sleep 2
+                if systemctl is-active --quiet pg-tgbot.service; then
+                    echo -e "${GREEN}[OK] Bot service is running.${NC}"
+                    local first_chat
+                    first_chat=$(echo "$chats" | cut -d, -f1)
+                    if tgbot_send_test "$token" "$first_chat"; then
+                        echo -e "${GREEN}[OK] Test message sent - check Telegram!${NC}"
+                    else
+                        echo -e "${YELLOW}[WARN] Test message could not be sent (network?). Check 'journalctl -u pg-tgbot'.${NC}"
+                    fi
+                else
+                    echo -e "${RED}[ERROR] Bot service failed to start. See: journalctl -u pg-tgbot -n 20${NC}"
+                fi
+                read -p "Press Enter to return to menu..."
+                ;;
+            2)
+                if [[ -f "$TG_BOT_CONF" ]]; then
+                    write_tgbot_unit
+                    systemctl restart pg-tgbot.service 2>/dev/null || true
+                    sleep 1
+                    systemctl is-active pg-tgbot.service 2>/dev/null || true
+                else
+                    echo -e "${RED}[ERROR] Bot is not configured yet (use option 1).${NC}"
+                    sleep 1
+                fi
+                ;;
+            3)
+                systemctl stop pg-tgbot.service 2>/dev/null || true
+                echo -e "${GREEN}[OK] Bot service stopped.${NC}"
+                sleep 1
+                ;;
+            4)
+                if [[ -f "$TG_BOT_CONF" ]]; then
+                    local _tk _fc
+                    _tk=$(sed -n 's/^BOT_TOKEN=//p' "$TG_BOT_CONF")
+                    _fc=$(sed -n 's/^ALLOWED_CHAT_IDS=//p' "$TG_BOT_CONF" | cut -d, -f1)
+                    if tgbot_send_test "$_tk" "$_fc"; then
+                        echo -e "${GREEN}[OK] Test message sent.${NC}"
+                    else
+                        echo -e "${RED}[ERROR] Send failed (network or token).${NC}"
+                    fi
+                else
+                    echo -e "${RED}[ERROR] Bot is not configured yet.${NC}"
+                fi
+                sleep 1
+                ;;
+            5)
+                read -p "Remove the Telegram bot completely? [y/N]: " yn
+                if [[ "$yn" == "y" || "$yn" == "Y" ]]; then
+                    systemctl stop pg-tgbot.service 2>/dev/null || true
+                    systemctl disable pg-tgbot.service >/dev/null 2>&1 || true
+                    rm -f "$TG_BOT_UNIT" "$TG_BOT_PY" "$TG_BOT_CONF"
+                    rm -rf "${CONF_DIR}/tgbot"
+                    systemctl daemon-reload 2>/dev/null || true
+                    echo -e "${GREEN}[OK] Bot removed (tunnel untouched).${NC}"
+                fi
+                sleep 1
+                ;;
+            0) return ;;
+            *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 other_options_menu() {
     while true; do
         print_header
@@ -3376,9 +4500,10 @@ other_options_menu() {
         echo "  4. Rotate TLS Secret (Iran, Zero Downtime)"
         echo "  5. Backup / Restore Configs"
         echo "  6. Change Node IP (Iran, Rebuild Redirects)"
+        echo "  7. Telegram Bot (Monitoring & Control)"
         echo "  0. Back to Main Menu"
         echo -e "------------------------------------------------------------"
-        read -p "Select option [0-6]: " other_choice
+        read -p "Select option [0-7]: " other_choice
         case $other_choice in
             1) view_logs ;;
             2) setup_cronjob ;;
@@ -3386,6 +4511,7 @@ other_options_menu() {
             4) rotate_tls_secret ;;
             5) backup_restore_menu ;;
             6) change_node_ip ;;
+            7) tgbot_menu ;;
             0) return ;;
             *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
