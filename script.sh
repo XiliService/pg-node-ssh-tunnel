@@ -67,11 +67,16 @@
 #       the script from GitHub on BOTH servers (or one), via new
 #       non-interactive 'pg-tunnel update-ref <ref>' CLI + 'bot-sync'
 #       for the post-reply engine self-refresh; zero tunnel downtime
+# v8.11: HOTFIX startup crash: pre-v8.8 bot engines have no BOT_REV
+#       marker, so the grep in heal_tgbot_script exited 1 and, with
+#       'set -o pipefail', killed the whole manager silently before
+#       the menu (v8.6 -> v8.10 jump on the foreign/bot server);
+#       guarded the pipeline, empty rev now falls through to the heal
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.10"
+SCRIPT_VERSION="8.11"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2268,7 +2273,12 @@ heal_tgbot_script() {
     # engine and restart the service. Zero impact when no bot installed.
     [[ -f "$TG_BOT_CONF" && -f "$TG_BOT_PY" ]] || return 0
     local cur_rev=""
-    cur_rev=$(grep -m1 '^BOT_REV = ' "$TG_BOT_PY" 2>/dev/null | cut -d'"' -f2)
+    # NOTE: '|| true' is load-bearing here. Pre-v8.8 bot engines have no
+    # BOT_REV marker, so grep exits 1; under 'set -o pipefail' that aborts
+    # the WHOLE manager silently at startup (seen on a v8.6 -> v8.10 jump
+    # with the bot installed). '|| true' lets an empty cur_rev fall
+    # through to the rewrite below, which is exactly the intended heal.
+    cur_rev=$(grep -m1 '^BOT_REV = ' "$TG_BOT_PY" 2>/dev/null | cut -d'"' -f2 || true)
     [[ -n "$cur_rev" && "$cur_rev" == "$SCRIPT_VERSION" ]] && return 0
     write_tgbot_script
     if [[ -f "$TG_BOT_UNIT" ]]; then
@@ -3767,7 +3777,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.10"
+BOT_REV = "8.11"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
