@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.1
+# PG Node SSH Tunnel Manager v8.2
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -33,11 +33,15 @@
 #       (setMyCommands EN/FA); resource guards: CPUQuota/Nice on the
 #       bot unit, Iran poll every 2 min (IRAN_EVERY); fixed Iran proxy
 #       argv (TLS_SNI + mgmt mode), help newlines, tr() interpolation
+# v8.2: Fix SEC_SSH port-conflict check on Iran reconfigure: the
+#       running pg-tls-server (our own service) was falsely reported
+#       as an external occupant (ss -p shows only the comm name);
+#       ownership is now resolved via the listener PID cmdline
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.1"
+SCRIPT_VERSION="8.2"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -182,10 +186,28 @@ generate_secret() {
     openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+port_owned_by_self() {
+    # True when the port is served by THIS project's own processes.
+    # ss -p only shows the comm name ("python3"), never the script
+    # path, so ownership must be resolved via the listener PID cmdline.
+    local port="$1" line="" pid="" cmd=""
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        for pid in $(echo "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2); do
+            cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+            if [[ "$cmd" == *tls_server.py* || "$cmd" == *"${CONF_DIR}/"* ]]; then
+                return 0
+            fi
+        done
+    done < <(ss -tlnp 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {print $0}' || true)
+    return 1
+}
+
 pick_free_https_port() {
     local cand
     for cand in 2087 2083 9443 2095 8880 52443; do
-        if ! ss -tlnp 2>/dev/null | awk -v p=":${cand}$" '$4 ~ p && $0 !~ /tls_server\.py/ {found=1} END{exit !found}'; then
+        if ! ss -tlnp 2>/dev/null | awk -v p=":${cand}$" '$4 ~ p {found=1} END{exit !found}' \
+                || port_owned_by_self "$cand"; then
             echo "$cand"
             return 0
         fi
@@ -2338,11 +2360,11 @@ install_iran() {
             continue
         fi
         local conflict_proc=""
-        conflict_proc=$(ss -tlnp 2>/dev/null | awk -v p=":${SEC_SSH}$" '$4 ~ p && $0 !~ /tls_server\.py/ {print $0}' || true)
-        if [[ -n "$conflict_proc" ]]; then
+        conflict_proc=$(ss -tlnp 2>/dev/null | awk -v p=":${SEC_SSH}$" '$4 ~ p {print $0}' || true)
+        if [[ -n "$conflict_proc" ]] && ! port_owned_by_self "$SEC_SSH"; then
             echo -e "${RED}[WARN] Port ${SEC_SSH} is currently occupied by another process:${NC}"
             echo "  $conflict_proc"
-            echo -e "${YELLOW}Please pick another free port (e.g. 2087, 2083, 9443).${NC}"
+            echo -e "${YELLOW}Please pick another free port (e.g. 2083, 8443, 9443) or stop that service first.${NC}"
             continue
         fi
         break
