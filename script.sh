@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.5
+# PG Node SSH Tunnel Manager v8.6
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -48,11 +48,15 @@
 #       + memory.peak + global memory PSI + per-process RSS + fixed
 #       established-session count on the foreign side - pinpoints
 #       exactly what balloons a channel at the moment it stalls
+# v8.6: Data-channel caps 192M/256M -> 384M/512M: deep diagnose proved
+#       the balloon is kernel socket memory (sock=240MB, anon=0) from
+#       parallel forwarded connections; tight caps collapsed the
+#       channel into a 100% PSI reclaim storm during speed tests
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.5"
+SCRIPT_VERSION="8.6"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2106,19 +2110,22 @@ release_iran_tunnel_ports() {
 }
 
 heal_data_memory_caps() {
-    # v8.4: data-channel units carry ssh + tls_client, whose kernel socket
-    # buffers (2 sockets x up to 16MB under load) can breach the v7.9
-    # 96M cap during real traffic bursts - same failure class as the TLS
-    # server cap fixed in v8.3. Raise existing installs to 192M/256M
-    # live (set-property, zero downtime). Idempotent.
+    # v8.4/v8.6: kernel socket buffers of N parallel forwarded user
+    # connections (up to ~8MB each via autotuning) accumulate inside the
+    # channel cgroup - production measured 240MB (sock) with anon=0 during
+    # a parallel speed test. Tight caps turn that burst into a memcg
+    # reclaim storm (PSI 100%, 'connect_to 127.0.0.1:port failed') and
+    # drop the channel. Normalize any legacy cap (96M from v7.9, 192M
+    # from v8.4) up to 384M/512M live (set-property, zero downtime,
+    # no restart). Idempotent.
     local du_file="" du_name=""
     for du_file in /etc/systemd/system/pg-tunnel-data-*.service; do
         [[ -f "$du_file" ]] || continue
-        if grep -q "MemoryHigh=96M" "$du_file" 2>/dev/null; then
-            sed -i 's/MemoryHigh=96M/MemoryHigh=192M/; s/MemoryMax=128M/MemoryMax=256M/' "$du_file"
+        if grep -qE "MemoryHigh=(96|192)M" "$du_file" 2>/dev/null; then
+            sed -i 's/MemoryHigh=96M/MemoryHigh=384M/; s/MemoryHigh=192M/MemoryHigh=384M/; s/MemoryMax=128M/MemoryMax=512M/; s/MemoryMax=256M/MemoryMax=512M/' "$du_file"
             du_name=$(basename "$du_file" .service)
             systemctl daemon-reload 2>/dev/null || true
-            systemctl set-property "$du_name" MemoryHigh=192M MemoryMax=256M >/dev/null 2>&1 || true
+            systemctl set-property "$du_name" MemoryHigh=384M MemoryMax=512M >/dev/null 2>&1 || true
         fi
     done
     return 0
@@ -2943,8 +2950,8 @@ RestartSec=3
 NoNewPrivileges=true
 ProtectHome=read-only
 PrivateTmp=true
-MemoryHigh=192M
-MemoryMax=256M
+MemoryHigh=384M
+MemoryMax=512M
 Nice=5
 CPUWeight=60
 
