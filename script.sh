@@ -156,11 +156,15 @@
 #       through the v8.25 AUTOFIX path. (b) bot: the Mute button opens
 #       the Alerts settings panel - every automatic report listed with
 #       a per-report state (on / silent / off), cycled by tapping
+# v9.0: tunnel refresh cadence 24h -> 12h (user request): units restart
+#       at BOTH refresh slots (TUNNEL_REFRESH_HH and +12, server TZ,
+#       default 01+13 UTC = ~04:30 & ~16:30 Tehran), guarded by an
+#       epoch marker (refresh.last, min 11h spacing)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.26"
+SCRIPT_VERSION="9.0"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2671,15 +2675,23 @@ handle_cli_subcommands() {
                 fi
                 sync_traffic_state >/dev/null 2>&1 || true
             fi
-            # v8.26: scheduled daily tunnel refresh (Rt/Hole-style): restart
-            # ALL tunnel units once a day at the refresh hour (server TZ,
-            # default 01 = ~04:30 Tehran on UTC servers), so sessions stay
-            # fresh. Disable: touch /etc/pg-tunnel/refresh.off
+            # v9.0: scheduled tunnel refresh (Rt/Hole-style) every 12 HOURS:
+            # restart ALL tunnel units when the hour matches a refresh slot
+            # (TUNNEL_REFRESH_HH and HH+12, server TZ, zero-padded; default
+            # 01 = ~04:30 and ~16:30 Tehran on UTC servers), at most once
+            # per 11h (epoch marker refresh.last), so sessions stay fresh.
+            # Disable: touch /etc/pg-tunnel/refresh.off
             if [[ ! -f "$CONF_DIR/refresh.off" ]]; then
-                local _rhh _cu
+                local _rhh _cu _rmod _now_h _rl _now_s
                 _rhh="${TUNNEL_REFRESH_HH:-01}"
-                if [[ "$(date +%H)" == "$_rhh" && "$(cat "$CONF_DIR/refresh.day" 2>/dev/null)" != "$(date +%F)" ]]; then
-                    echo "$(date +%F)" > "$CONF_DIR/refresh.day" 2>/dev/null || true
+                [[ "$_rhh" =~ ^[0-9]+$ ]] || _rhh=01
+                _rmod=$(( 10#$_rhh % 12 ))
+                _now_h=$(( 10#$(date +%H) ))
+                _now_s=$(date +%s)
+                _rl=$(cat "$CONF_DIR/refresh.last" 2>/dev/null || echo 0)
+                [[ "$_rl" =~ ^[0-9]+$ ]] || _rl=0
+                if [[ $(( _now_h % 12 )) -eq $_rmod && $(( _now_s - _rl )) -ge $(( 11 * 3600 )) ]]; then
+                    echo "$_now_s" > "$CONF_DIR/refresh.last" 2>/dev/null || true
                     if [[ -f "$IRAN_CONF" ]]; then
                         systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
                         log_autofix_event iran pg-tunnel-watchdog
@@ -4008,7 +4020,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.26"
+BOT_REV = "9.0"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
