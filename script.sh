@@ -114,11 +114,14 @@
 #       LOAD5/LOAD15 were unreachable and the Resources panel showed
 #       '0.00 LOAD5=0.01 LOAD15=0.03/?/?'. Now one key per line; the
 #       bot also recovers the packed form from pre-v8.18 remotes
+# v8.19: Restart-All: the Restart submenu gains an 'All' button
+#       ('/restart all' too) - restarts every data channel (sorted)
+#       and mgmt LAST, with a per-unit summary line
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.18"
+SCRIPT_VERSION="8.19"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3879,7 +3882,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.18"
+BOT_REV = "8.19"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4030,6 +4033,7 @@ STR = {
         "btn_logs": "\U0001f4dc Logs",
         "btn_ipcheck": "\U0001f310 IP Test",
         "btn_restart": "\U0001f501 Restart",
+        "btn_all": "All",
         "btn_repair": "\U0001f6e0 Repair",
         "btn_shield": "\U0001f6e1 Shield",
         "btn_mute": "\U0001f515 Mute 1h",
@@ -4047,7 +4051,7 @@ STR = {
         "btn_refresh": "\U0001f504 Refresh",
         "choose_optimize": "\U0001f680 Run the optimizer on which server?",
         "optimize_done": "\U0001f680 <b>Optimizer result:</b>\n%s",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n\u2753 /help \u2014 this message",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt|all&gt; \u2014 restart channel(s) (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n\u2753 /help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -4146,6 +4150,7 @@ STR = {
         "btn_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627",
         "btn_ipcheck": "\U0001f310 \u062a\u0633\u062a IP",
         "btn_restart": "\U0001f501 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a",
+        "btn_all": "\u0647\u0645\u0647",
         "btn_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631",
         "btn_shield": "\U0001f6e1 \u0633\u067e\u0631",
         "btn_mute": "\U0001f515 \u0628\u06cc\u200c\u0635\u062f\u0627 \u06f1 \u0633\u0627\u0639\u062a",
@@ -4163,7 +4168,7 @@ STR = {
         "btn_refresh": "\U0001f504 \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc",
         "choose_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u0631\u0648\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631 \u0627\u062c\u0631\u0627 \u0634\u0648\u062f\u061f",
         "optimize_done": "\U0001f680 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc:</b>\n%s",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt|all&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0627\u0646\u0627\u0644(\u200c\u0647\u0627) (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4340,7 +4345,8 @@ def restart_kb(chat_id):
         if k.startswith("CHANNEL_DATA_"):
             port = k.replace("CHANNEL_DATA_", "")
             btns.append({"text": port, "callback_data": "m:restart:" + port})
-    return rows_from(btns) + back_kb(chat_id)
+    all_row = [{"text": trb(chat_id, "btn_all"), "callback_data": "m:restart:all"}]
+    return rows_from(btns) + [all_row] + back_kb(chat_id)
 
 
 def logs_kb(chat_id):
@@ -4450,7 +4456,7 @@ CMDS_EN = [
     ("status", "Full status [both|iran|foreign]"),
     ("traffic", "Traffic usage and per-IP [scope]"),
     ("logs", "Recent tunnel logs [iran|foreign] [n]"),
-    ("restart", "Restart a channel <port|mgmt>"),
+    ("restart", "Restart channel(s) <port|mgmt|all>"),
     ("repair", "Repair services [iran|foreign|both]"),
     ("shield", "Iran port-22 shield <on|off>"),
     ("ipcheck", "Ping an IP from Iranian nodes"),
@@ -4468,7 +4474,7 @@ CMDS_FA = [
     ("status", "\u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
     ("traffic", "\u0645\u0635\u0631\u0641 \u0648 \u062a\u0641\u06a9\u06cc\u06a9 IP [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
     ("logs", "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631 \u062a\u0627\u0646\u0644 [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]"),
-    ("restart", "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 <port|mgmt>"),
+    ("restart", "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0627\u0646\u0627\u0644(\u200c\u0647\u0627) <port|mgmt|all>"),
     ("repair", "\u062a\u0639\u0645\u06cc\u0631 \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627 [iran|foreign|both]"),
     ("shield", "\u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 <on|off>"),
     ("ipcheck", "\u062a\u0633\u062a \u067e\u06cc\u0646\u06af IP \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc"),
@@ -4895,6 +4901,34 @@ def run_optimize(chat_id, scope, mid=None):
 
 def run_action(chat_id, action, arg, mid=None, meta=None):
     if action == "restart":
+        if arg == "all":
+            # v8.19: restart every channel - data ports first (sorted),
+            # mgmt LAST so the management path comes back with the data
+            # channels already up. Restarting mgmt drops the reverse
+            # tunnel; no Iran SSH calls happen inside this loop.
+            rep_ = STATE.get("prev", {}).get("foreign") or local_report() or {}
+            units = []
+            for k in sorted(rep_):
+                if k.startswith("CHANNEL_DATA_"):
+                    units.append("pg-tunnel-data-" + k.replace("CHANNEL_DATA_", ""))
+            units.append("pg-tunnel-mgmt")
+            done = []
+            failed = []
+            for u in units:
+                try:
+                    r = subprocess.run(["systemctl", "restart", u],
+                                       capture_output=True, text=True, timeout=90)
+                    (done if r.returncode == 0 else failed).append(u.replace("pg-tunnel-", ""))
+                except Exception:
+                    failed.append(u.replace("pg-tunnel-", ""))
+            if done and not failed:
+                summary = "all (" + ", ".join(done) + ")"
+            elif failed and not done:
+                summary = "all (FAILED: " + ", ".join(failed) + ")"
+            else:
+                summary = "all (" + ", ".join(done) + " / FAILED: " + ", ".join(failed) + ")"
+            finish_panel(chat_id, mid, tr(chat_id, "restart_done", s=summary))
+            return
         unit = "pg-tunnel-mgmt" if arg == "mgmt" else "pg-tunnel-data-" + arg
         try:
             r = subprocess.run(["systemctl", "restart", unit],
@@ -5379,6 +5413,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
