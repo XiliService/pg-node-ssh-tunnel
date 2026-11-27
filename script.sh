@@ -129,11 +129,16 @@
 #       384M/512M -> 640M/768M - the cgroup peaked 409.5M (kernel sock
 #       buffers), crossed MemoryHigh and the reclaim wedged the
 #       single-threaded proxy; live heal, zero tunnel downtime
+# v8.22: Cron at UTC hour boundaries: the auto-heal cron now fires at
+#       the TOP of each scheduled hour on BOTH servers (old installs
+#       used a foreign :01 stagger - migrated once); report gained the
+#       full schedule + SRV_TZ and the bot status shows both. Watchdog
+#       stays immediate (unchanged)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.21"
+SCRIPT_VERSION="8.22"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1629,6 +1634,7 @@ emit_server_report() {
     echo "ROLE=${role}"
     echo "VERSION=v${SCRIPT_VERSION}"
     echo "HOST=$(hostname 2>/dev/null || echo unknown)"
+    echo "SRV_TZ=$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
     echo "UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\nRAM_USED_KB=%d\n", t+0, a+0, (t-a)+0}' /proc/meminfo 2>/dev/null || true
     awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "SWAP_TOTAL_KB=%d\nSWAP_FREE_KB=%d\n", t+0, f+0}' /proc/meminfo 2>/dev/null || true
@@ -1699,7 +1705,7 @@ emit_server_report() {
         fi
         echo "CERT_DAYS_LEFT=${_cdays:-unknown}"
         _cr=disabled
-        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1}')
+        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1" "$2" "$3" "$4" "$5}')
         echo "CRON=${_cr}"
         _af=0; _top=""
         if command -v journalctl >/dev/null 2>&1; then
@@ -1738,7 +1744,7 @@ emit_server_report() {
         [[ -z "$_ll" && -f "$TUNNEL_SERVICE" ]] && _ll=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
         echo "LATEST_LOG=${_ll}"
         _cr=disabled
-        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1}')
+        [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1" "$2" "$3" "$4" "$5}')
         echo "CRON=${_cr}"
     fi
 
@@ -2424,6 +2430,19 @@ heal_tls_memory_caps() {
     return 0
 }
 
+align_cron_to_hour() {
+    # v8.22: the auto-heal cron fires at the TOP of each hour (with the
+    # server clock in UTC that is exactly 9:00, 10:00, ...). Older
+    # installs used a per-server stagger minute (foreign ran at :01) -
+    # normalize any nonzero plain minute back to 0. Idempotent; leaves
+    # */N-style minutes and disabled crons untouched.
+    [[ -f "$CRON_FILE" ]] || return 0
+    if grep -qE '^[1-9][0-9]* ' "$CRON_FILE" 2>/dev/null; then
+        sed -i 's/^[1-9][0-9]* /0 /' "$CRON_FILE" 2>/dev/null || true
+    fi
+    return 0
+}
+
 migrate_existing_state() {
     if [[ -f "$TUNNEL_SERVICE" ]]; then
         local changed=0
@@ -2465,11 +2484,10 @@ migrate_existing_state() {
         fi
     fi
 
-    if [[ -f "$FOREIGN_CONF" && -f "$CRON_FILE" ]]; then
-        if grep -q '^0 ' "$CRON_FILE"; then
-            sed -i 's/^0 /1 /' "$CRON_FILE"
-        fi
-    fi
+    # v8.22: cron alignment replaced the old foreign :01 stagger - the
+    # auto-heal now runs at the top of every scheduled hour on BOTH
+    # servers (user request: UTC hour boundaries such as 9:00/10:00).
+    align_cron_to_hour
 
     # Refresh the watchdog script automatically after a script update so
     # fixes ship without requiring a manual Repair (restarts only the
@@ -2579,6 +2597,7 @@ handle_cli_subcommands() {
         cron-auto-repair)
             check_root
             sync_traffic_state >/dev/null 2>&1 || true
+            align_cron_to_hour
             ensure_network_tuning >/dev/null 2>&1 || true
             if [[ -f "$IRAN_CONF" ]]; then
                 local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
@@ -3855,8 +3874,9 @@ setup_cronjob() {
     echo -e "------------------------------------------------------------"
     read -p "Select interval option [1-7]: " cron_choice
 
+    # v8.22: always the top of the hour (minute 0) - no per-server
+    # stagger; with a UTC server clock this is exactly 9:00, 10:00...
     local min_slot="0"
-    [[ -f "$FOREIGN_CONF" ]] && min_slot="1"
 
     local schedule=""
     case $cron_choice in
@@ -3882,6 +3902,7 @@ setup_cronjob() {
     echo "$schedule root /usr/local/bin/pg-tunnel cron-auto-repair >/dev/null 2>&1" > "$CRON_FILE"
     chmod 644 "$CRON_FILE"
     echo -e "${GREEN}[OK] Smart non-disruptive auto-heal scheduled: ($schedule)${NC}"
+    echo -e "  Fires at the top of each hour \u00b7 server timezone: ${CYAN}$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo unknown)${NC}"
     echo
     read -p "Press Enter to return to menu..."
 }
@@ -3911,7 +3932,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.21"
+BOT_REV = "8.22"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4646,7 +4667,13 @@ def status_text(chat_id, scope="both"):
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         if total > 0:
             out.append("  \U0001F4A0 %s: %d%% \u00b7 %s: %s%%" % (tr(chat_id, "ram_l"), avail * 100 // total, tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
-        out.append("  %s \u00b7 %s" % (tr(chat_id, "cron") + ": " + esc(rep.get("CRON", "?")), esc(rep.get("TUNING", "?"))))
+        _cv = str(rep.get("CRON", "?"))
+        if " " not in _cv and _cv.isdigit():
+            _cv = "@:" + _cv.zfill(2)  # pre-v8.22 minute-only value
+        _tz = str(rep.get("SRV_TZ", ""))
+        if _tz and _tz not in ("unknown", ""):
+            _cv = "%s (%s)" % (_cv, _tz)
+        out.append("  %s \u00b7 %s" % (tr(chat_id, "cron") + ": " + esc(_cv), esc(rep.get("TUNING", "?"))))
         out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
         per = rep.get("PER_IP", "")
         if per:
