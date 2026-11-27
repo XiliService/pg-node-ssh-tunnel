@@ -149,11 +149,18 @@
 #       the report (both servers, same ssh path as the rest), and the
 #       bot's 60s monitor announces each event ~1 minute AFTER it
 #       happened so the outcome (active / STILL DOWN) is included
+# v8.26: (a) scheduled daily tunnel refresh (Rt/Hole-style): the hourly
+#       cron restarts ALL tunnel units once a day at the refresh hour
+#       (server TZ, default 01 = ~04:30 Tehran on UTC servers; disable:
+#       touch /etc/pg-tunnel/refresh.off) - each restart is reported
+#       through the v8.25 AUTOFIX path. (b) bot: the Mute button opens
+#       the Alerts settings panel - every automatic report listed with
+#       a per-report state (on / silent / off), cycled by tapping
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.25"
+SCRIPT_VERSION="8.26"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2664,6 +2671,37 @@ handle_cli_subcommands() {
                 fi
                 sync_traffic_state >/dev/null 2>&1 || true
             fi
+            # v8.26: scheduled daily tunnel refresh (Rt/Hole-style): restart
+            # ALL tunnel units once a day at the refresh hour (server TZ,
+            # default 01 = ~04:30 Tehran on UTC servers), so sessions stay
+            # fresh. Disable: touch /etc/pg-tunnel/refresh.off
+            if [[ ! -f "$CONF_DIR/refresh.off" ]]; then
+                local _rhh _cu
+                _rhh="${TUNNEL_REFRESH_HH:-01}"
+                if [[ "$(date +%H)" == "$_rhh" && "$(cat "$CONF_DIR/refresh.day" 2>/dev/null)" != "$(date +%F)" ]]; then
+                    echo "$(date +%F)" > "$CONF_DIR/refresh.day" 2>/dev/null || true
+                    if [[ -f "$IRAN_CONF" ]]; then
+                        systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
+                        log_autofix_event iran pg-tunnel-watchdog
+                        systemctl restart pg-tls-server.service 2>/dev/null || true
+                        log_autofix_event iran pg-tls-server
+                        sync_traffic_state >/dev/null 2>&1 || true
+                    elif [[ -f "$FOREIGN_CONF" ]]; then
+                        for _cu in $DATA_SERVICE_GLOB; do
+                            [[ -f "$_cu" ]] || continue
+                            systemctl restart "$(basename "$_cu" .service)" 2>/dev/null || true
+                            log_autofix_event foreign "$(basename "$_cu" .service)"
+                        done
+                        if [[ -f "$TUNNEL_SERVICE" ]]; then
+                            systemctl restart reverse-tunnel 2>/dev/null || true
+                            log_autofix_event foreign reverse-tunnel
+                        fi
+                        systemctl restart pg-tunnel-mgmt 2>/dev/null || true
+                        log_autofix_event foreign pg-tunnel-mgmt
+                        sync_traffic_state >/dev/null 2>&1 || true
+                    fi
+                fi
+            fi
             exit 0
             ;;
         acct-init|acct-sync)
@@ -3970,7 +4008,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.25"
+BOT_REV = "8.26"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3984,7 +4022,7 @@ TEHRAN = timezone(timedelta(hours=3, minutes=30))
 CFG = {}
 STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
          "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
-         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {},
+         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {}, "alerts": {},
          "iran_last_ok": 0, "iran_down": False}
 
 
@@ -4058,6 +4096,24 @@ STR = {
         "autofix_active": "active",
         "autofix_down": "STILL DOWN",
         "autofix_unknown": "status unknown",
+        "alerts_title": "\U0001F515 <b>PG Tunnel \u2014 Alert Settings</b>",
+        "alerts_hint": "\U0001F7E2 on \u00b7 \U0001F515 silent \u00b7 \U0001F534 off \u2014 tap a report to cycle",
+        "alerts_global_mute": "\U0001F507 Mute non-critical 1h",
+        "alerts_global_unmute": "\U0001F50A Unmute non-critical (muted)",
+        "alerts_nc_on": "Non-critical alerts: on",
+        "alerts_nc_muted": "Non-critical alerts: muted (silent only)",
+        "al_reboot": "Reboot",
+        "al_oom": "OOM kill",
+        "al_chdown": "Channel down",
+        "al_iran_out": "Iran unreachable",
+        "al_iran_back": "Iran back",
+        "al_wd": "Watchdog",
+        "al_autofix": "Autofix restarts",
+        "al_ram": "RAM low",
+        "al_disk": "Disk usage",
+        "al_tune": "Tuning off",
+        "al_cert": "Cert expiry",
+        "al_daily": "Daily report",
         "watchdog_bad": "\U0001f6a8 <b>WATCHDOG ALERT (Iran):</b> %s",
         "shield_off": "\u26a0 Brute-force shield on Iran changed to inactive.",
         "ram_low": "\u26a0 Low RAM on %s: %d%% available.",
@@ -4128,8 +4184,8 @@ STR = {
         "btn_all": "All",
         "btn_repair": "\U0001f6e0 Repair",
         "btn_shield": "\U0001f6e1 Shield",
-        "btn_mute": "\U0001f515 Mute 1h",
-        "btn_unmute": "\U0001f50a Unmute",
+        "btn_mute": "\U0001F515 Alerts",
+        "btn_unmute": "\U0001F515 Alerts (muted)",
         "btn_lang": "\U0001f310 Language",
         "btn_back": "\u2b05 Back",
         "btn_both": "Both",
@@ -4179,6 +4235,24 @@ STR = {
         "autofix_active": "\u0641\u0639\u0627\u0644",
         "autofix_down": "\u0647\u0646\u0648\u0632 \u067e\u0627\u06cc\u06cc\u0646 \u0627\u0633\u062a",
         "autofix_unknown": "\u0648\u0636\u0639\u06cc\u062a \u0645\u0639\u0644\u0648\u0645 \u0646\u06cc\u0633\u062a",
+        "alerts_title": "\U0001F515 <b>PG Tunnel \u2014 \u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u0647\u0634\u062f\u0627\u0631\u0647\u0627</b>",
+        "alerts_hint": "\U0001F7E2 \u0631\u0648\u0634\u0646 \u00b7 \U0001F515 \u0628\u06cc\u200c\u0635\u062f\u0627 \u00b7 \U0001F534 \u062e\u0627\u0645\u0648\u0634 \u2014 \u0628\u0631\u0627\u06cc \u062a\u063a\u06cc\u06cc\u0631 \u0628\u0632\u0646\u06cc\u062f",
+        "alerts_global_mute": "\U0001F507 \u0628\u06cc\u200c\u0635\u062f\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc \u06f1 \u0633\u0627\u0639\u062a",
+        "alerts_global_unmute": "\U0001F50A \u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc (\u0628\u06cc\u200c\u0635\u062f\u0627)",
+        "alerts_nc_on": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc: \u0631\u0648\u0634\u0646",
+        "alerts_nc_muted": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc: \u0628\u06cc\u200c\u0635\u062f\u0627",
+        "al_reboot": "\u0631\u06cc\u0628\u0648\u062a",
+        "al_oom": "\u0645\u0631\u06af OOM",
+        "al_chdown": "\u0642\u0637\u0639 \u06a9\u0627\u0646\u0627\u0644",
+        "al_iran_out": "\u0642\u0637\u0639 \u062f\u0633\u062a\u0631\u0633\u06cc \u0627\u06cc\u0631\u0627\u0646",
+        "al_iran_back": "\u0628\u0627\u0632\u06af\u0634\u062a \u0627\u06cc\u0631\u0627\u0646",
+        "al_wd": "\u0648\u0627\u0686\u200c\u062f\u0627\u06af",
+        "al_autofix": "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u062e\u0648\u062f\u06a9\u0627\u0631",
+        "al_ram": "\u06a9\u0645\u0628\u0648\u062f \u0631\u0645",
+        "al_disk": "\u067e\u0631 \u0634\u062f\u0646 \u062f\u06cc\u0633\u06a9",
+        "al_tune": "\u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u062e\u0627\u0645\u0648\u0634",
+        "al_cert": "\u0627\u0646\u0642\u0636\u0627\u06cc \u06af\u0648\u0627\u0647\u06cc",
+        "al_daily": "\u06af\u0632\u0627\u0631\u0634 \u0631\u0648\u0632\u0627\u0646\u0647",
         "watchdog_bad": "\U0001f6a8 <b>\u0647\u0634\u062f\u0627\u0631 \u0648\u0627\u0686\u200c\u062f\u0627\u06af (\u0627\u06cc\u0631\u0627\u0646):</b> %s",
         "shield_off": "\u26a0 \u0633\u067e\u0631 \u0628\u0631\u0648\u062a\u200c\u0641\u0648\u0631\u0633 \u0627\u06cc\u0631\u0627\u0646 \u063a\u06cc\u0631\u0641\u0639\u0627\u0644 \u0634\u062f.",
         "ram_low": "\u26a0 \u06a9\u0645\u0628\u0648\u062f \u0631\u0645 \u062f\u0631 %s: \u0641\u0642\u0637 %d%% \u0628\u0627\u0642\u06cc \u0645\u0627\u0646\u062f\u0647.",
@@ -4249,8 +4323,8 @@ STR = {
         "btn_all": "\u0647\u0645\u0647",
         "btn_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631",
         "btn_shield": "\U0001f6e1 \u0633\u067e\u0631",
-        "btn_mute": "\U0001f515 \u0628\u06cc\u200c\u0635\u062f\u0627 \u06f1 \u0633\u0627\u0639\u062a",
-        "btn_unmute": "\U0001f50a \u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627",
+        "btn_mute": "\U0001F515 \u0647\u0634\u062f\u0627\u0631\u0647\u0627",
+        "btn_unmute": "\U0001F515 \u0647\u0634\u062f\u0627\u0631\u0647\u0627 (\u0628\u06cc\u200c\u0635\u062f\u0627)",
         "btn_lang": "\U0001f310 \u0632\u0628\u0627\u0646",
         "btn_back": "\u2b05 \u0628\u0627\u0632\u06af\u0634\u062a",
         "btn_both": "\u0647\u0631 \u062f\u0648",
@@ -4349,15 +4423,22 @@ def tg(method, params, timeout=20):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def send(chat_id, text):
+def send(chat_id, text, silent=False):
+    # v8.26: silent=True delivers with disable_notification (no sound)
     text = safe_clip(text)
+    p = {"chat_id": chat_id, "text": text,
+         "parse_mode": "HTML", "disable_web_page_preview": True}
+    if silent:
+        p["disable_notification"] = True
     try:
-        tg("sendMessage", {"chat_id": chat_id, "text": text,
-                           "parse_mode": "HTML", "disable_web_page_preview": True})
+        tg("sendMessage", p)
     except Exception:
         # Never drop a message: retry once as plain text.
         try:
-            tg("sendMessage", {"chat_id": chat_id, "text": text})
+            p2 = {"chat_id": chat_id, "text": text}
+            if silent:
+                p2["disable_notification"] = True
+            tg("sendMessage", p2)
         except Exception:
             pass
 
@@ -4425,13 +4506,45 @@ def main_menu_kb(chat_id):
         [{"text": trb(chat_id, "btn_optimize"), "callback_data": "m:optimize"},
          {"text": trb(chat_id, "btn_resources"), "callback_data": "m:resources"}],
         [{"text": trb(chat_id, "btn_update"), "callback_data": "m:update"},
-         {"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
+         {"text": trb(chat_id, mute_key), "callback_data": "m:alerts"},
          {"text": trb(chat_id, "btn_lang"), "callback_data": "m:lang"}],
     ]
 
 
 def show_main_menu(chat_id, text=None):
     kb_send(chat_id, text or tr(chat_id, "menu_title"), main_menu_kb(chat_id))
+
+
+def alerts_text(chat_id):
+    # NOTE: the state summary lines are part of the text ON PURPOSE:
+    # kb_edit skips edits whose text is unchanged, so the keyboard would
+    # never refresh on a state flip without them.
+    astate = (STATE.get("alerts", {}).get(str(chat_id), {}) or {})
+    counts = {"on": 0, "mute": 0, "off": 0}
+    for kind, _ in ALERT_KINDS:
+        counts[astate.get(kind, "on")] = counts.get(astate.get(kind, "on"), 0) + 1
+    if STATE["mute"].get(str(chat_id), 0) > time.time():
+        gline = tr(chat_id, "alerts_nc_muted")
+    else:
+        gline = tr(chat_id, "alerts_nc_on")
+    return "%s\n%s\n%s\n\U0001F7E2 %d \u00b7 \U0001F515 %d \u00b7 \U0001F534 %d" % (
+        tr(chat_id, "alerts_title"), tr(chat_id, "alerts_hint"), gline,
+        counts.get("on", 0), counts.get("mute", 0), counts.get("off", 0))
+
+
+def alerts_kb(chat_id):
+    rows = []
+    if STATE["mute"].get(str(chat_id), 0) > time.time():
+        rows.append([{"text": trb(chat_id, "alerts_global_unmute"), "callback_data": "al:global"}])
+    else:
+        rows.append([{"text": trb(chat_id, "alerts_global_mute"), "callback_data": "al:global"}])
+    astate = (STATE.get("alerts", {}).get(str(chat_id), {}) or {})
+    for kind, name_key in ALERT_KINDS:
+        icon = ALERT_ICON.get(astate.get(kind, "on"), "\U0001F7E2")
+        rows.append([{"text": "%s \u00b7 %s" % (trb(chat_id, name_key), icon),
+                      "callback_data": "al:" + kind}])
+    rows.append([{"text": trb(chat_id, "btn_back"), "callback_data": "m:menu"}])
+    return rows
 
 
 def restart_kb(chat_id):
@@ -4594,10 +4707,27 @@ def set_commands():
             pass
 
 
-def broadcast(text, critical=False):
+ALERT_KINDS = [
+    ("reboot", "al_reboot"), ("oom", "al_oom"), ("chdown", "al_chdown"),
+    ("iran_out", "al_iran_out"), ("iran_back", "al_iran_back"),
+    ("watchdog", "al_wd"), ("autofix", "al_autofix"), ("ram", "al_ram"),
+    ("disk", "al_disk"), ("tune", "al_tune"), ("cert", "al_cert"),
+    ("daily", "al_daily"),
+]
+ALERT_CYCLE = {"on": "mute", "mute": "off", "off": "on"}
+ALERT_ICON = {"on": "\U0001F7E2", "mute": "\U0001F515", "off": "\U0001F534"}
+
+
+def broadcast(text, critical=False, kind=""):
     now = time.time()
     for cid in allowed_chats():
-        if not critical:
+        # v8.26: per-chat alert settings (Alerts panel): off = never
+        # delivered, mute = delivered silently, on = normal delivery
+        st = str((STATE.get("alerts", {}).get(str(cid), {}) or {}).get(kind, "on") or "on")
+        if st == "off":
+            continue
+        silent = (st == "mute")
+        if not critical and not silent:
             if STATE["mute"].get(str(cid), 0) > now:
                 continue
             if datetime.now(TEHRAN).hour < 8:
@@ -4606,7 +4736,7 @@ def broadcast(text, critical=False):
         if STATE["win"].get(key, 0) > now - 300:
             continue
         STATE["win"][key] = now
-        send(cid, text)
+        send(cid, text, silent=silent)
 
 
 def parse_report(text):
@@ -5196,15 +5326,28 @@ def handle_update(upd):
             arg = data.split(":", 2)[2]
             confirm_and_run(chat, "shield", arg, "shield %s (Iran)" % arg, mid)
             return
-        if data == "m:mute":
-            STATE["mute"][str(chat)] = time.time() + 3600
-            if not kb_edit(chat, mid, tr(chat, "mute_on", d=60), main_menu_kb(chat)):
-                send(chat, tr(chat, "mute_on", d=60))
+        if data == "m:alerts":
+            if not kb_edit(chat, mid, alerts_text(chat), alerts_kb(chat)):
+                kb_send(chat, alerts_text(chat), alerts_kb(chat))
             return
-        if data == "m:unmute":
-            STATE["mute"][str(chat)] = 0
-            if not kb_edit(chat, mid, tr(chat, "mute_off"), main_menu_kb(chat)):
-                send(chat, tr(chat, "mute_off"))
+        if data == "al:global":
+            # v8.26: global non-critical mute toggle (1h / off)
+            if STATE["mute"].get(str(chat), 0) > time.time():
+                STATE["mute"][str(chat)] = 0
+            else:
+                STATE["mute"][str(chat)] = time.time() + 3600
+            save_state()
+            if not kb_edit(chat, mid, alerts_text(chat), alerts_kb(chat)):
+                kb_send(chat, alerts_text(chat), alerts_kb(chat))
+            return
+        if data.startswith("al:"):
+            kind = data[3:]
+            if any(k == kind for k, _ in ALERT_KINDS):
+                cur = (STATE.setdefault("alerts", {}).get(str(chat), {}) or {}).get(kind, "on")
+                STATE["alerts"].setdefault(str(chat), {})[kind] = ALERT_CYCLE.get(cur, "on")
+                save_state()
+            if not kb_edit(chat, mid, alerts_text(chat), alerts_kb(chat)):
+                kb_send(chat, alerts_text(chat), alerts_kb(chat))
             return
         if data == "m:update":
             if not kb_edit(chat, mid, tr(chat, "choose_update"), update_kb(chat)):
@@ -5340,12 +5483,12 @@ def handle_update(upd):
                         {"ref": ref})
 
 
-def warn_once_per_day(chat_key, text, critical=False):
+def warn_once_per_day(chat_key, text, critical=False, kind=""):
     today = datetime.now(TEHRAN).strftime("%Y-%m-%d")
     if STATE["warn_day"].get(chat_key) == today:
         return
     STATE["warn_day"][chat_key] = today
-    broadcast(text, critical=critical)
+    broadcast(text, critical=critical, kind=kind)
 
 
 def autofix_status_of(rep, unit):
@@ -5404,7 +5547,7 @@ def process_autofix(rep, role):
         else:
             stt = tr(0, "autofix_down")
         when = datetime.fromtimestamp(ep, TEHRAN).strftime("%H:%M")
-        broadcast(tr(0, "autofix_event") % (esc(str(unit)), tr(0, role), when, stt), critical=True)
+        broadcast(tr(0, "autofix_event") % (esc(str(unit)), tr(0, role), when, stt), critical=True, kind="autofix")
 
 
 def check_once():
@@ -5426,24 +5569,24 @@ def check_once():
         prev = STATE["prev"].get(role, {})
         up = int(float(rep.get("UPTIME_SEC", "0") or 0))
         if int(float(prev.get("UPTIME_SEC", up))) - up > 600:
-            broadcast("<b>REBOOT:</b> %s" % rep.get("HOST", role), critical=True)
+            broadcast("<b>REBOOT:</b> %s" % rep.get("HOST", role), critical=True, kind="reboot")
         if rep.get("OOM_KILLED", "none") not in ("none", "") and \
                 rep.get("OOM_KILLED") != prev.get("OOM_KILLED"):
             broadcast("OOM: %s: %s" % (rep.get("HOST", role),
-                                       html.escape(rep.get("OOM_KILLED", ""))), critical=True)
+                                       html.escape(rep.get("OOM_KILLED", ""))), critical=True, kind="oom")
         total = int(rep.get("RAM_TOTAL_KB", "1") or 1)
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         if total > 0 and avail * 100 // total < 15:
             warn_once_per_day("ram_%s" % role, "RAM low %s: %d%%" %
-                              (rep.get("HOST", role), avail * 100 // total))
+                              (rep.get("HOST", role), avail * 100 // total), kind="ram")
         disk = int(rep.get("DISK_PCT", "0") or 0)
         if disk > 85:
             warn_once_per_day("disk_%s" % role, "Disk %s: %d%%" %
-                              (rep.get("HOST", role), disk))
+                              (rep.get("HOST", role), disk), kind="disk")
         tun = rep.get("TUNING", "")
         if tun and not tun.startswith("bbr/fq"):
             warn_once_per_day("tune_%s" % role, "Tuning %s: %s" %
-                              (rep.get("HOST", role), tun))
+                              (rep.get("HOST", role), tun), kind="tune")
         STATE["prev"][role] = rep
     if loc:
         for k, v in sorted(loc.items()):
@@ -5453,26 +5596,26 @@ def check_once():
             f = f + 1 if v != "active" else 0
             STATE["fail"][k] = f
             if f == 3:
-                broadcast("CHANNEL DOWN: %s = %s" % (k, v), critical=True)
+                broadcast("CHANNEL DOWN: %s = %s" % (k, v), critical=True, kind="chdown")
     if irn is None:
         last = STATE.get("iran_last_ok", 0)
         if last and not STATE.get("iran_down") and time.time() - last > 180:
             STATE["iran_down"] = True
-            broadcast("IRAN UNREACHABLE via tunnel (3 min)", critical=True)
+            broadcast("IRAN UNREACHABLE via tunnel (3 min)", critical=True, kind="iran_out")
     else:
         STATE["iran_last_ok"] = time.time()
         if STATE.get("iran_down"):
             STATE["iran_down"] = False
-            broadcast("Iran reachable again via tunnel.", critical=True)
+            broadcast("Iran reachable again via tunnel.", critical=True, kind="iran_back")
         wd = irn.get("WATCHDOG", "")
         if wd and not wd.startswith("OK"):
-            broadcast("WATCHDOG (Iran): %s" % html.escape(wd), critical=True)
+            broadcast("WATCHDOG (Iran): %s" % html.escape(wd), critical=True, kind="watchdog")
         try:
             days = int(irn.get("CERT_DAYS_LEFT", "999"))
         except Exception:
             days = 999
         if 0 <= days <= 14:
-            warn_once_per_day("cert", "TLS cert (Iran) expires in %d days" % days)
+            warn_once_per_day("cert", "TLS cert (Iran) expires in %d days" % days, kind="cert")
 
 
 def sample_traffic(rep, role):
@@ -5522,7 +5665,7 @@ def daily_report():
         extra.append(gh)
     if extra:
         body += "\n" + "\n".join("! " + e for e in extra)
-    broadcast("\U0001F4C5 <b>Daily</b> \u2014 %s\n\n%s" % (title, body), critical=True)
+    broadcast("\U0001F4C5 <b>Daily</b> \u2014 %s\n\n%s" % (title, body), critical=True, kind="daily")
 
 
 def github_check():
@@ -5607,6 +5750,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
