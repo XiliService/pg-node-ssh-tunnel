@@ -95,11 +95,19 @@
 #       results are polled until an Iranian node answers (4+4+6s), IPs
 #       are spaced 1.5s, and the check runs in its own thread so the
 #       bot never blocks while waiting
+# v8.16: HOTFIX ipcheck parsing: the REAL check-host ping schema is
+#       [[["OK", <secs>, "<ip>"], ["TIMEOUT", <secs>], ...]] - the old
+#       parser expected TCP-style dicts, so every ping counted as 0/N
+#       'avg -' while the web UI showed all green. Now parses attempts
+#       correctly (node-level ok, ms average), shows a 'no ping reply'
+#       label instead of 'avg -', requests 12 nodes (more Iranian
+#       coverage) and the status panel no longer doubles the icons on
+#       TLS target / ports / cover domain / per-IP / last log lines
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.15"
+SCRIPT_VERSION="8.16"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3842,7 +3850,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.15"
+BOT_REV = "8.16"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3940,6 +3948,7 @@ STR = {
         "no_data": "no data",
         "ipcheck_progress": "\u23f3 Testing %d IP(s) \u2014 please wait...",
         "ipcheck_more": "Max 5 IPs per test \u2014 extra ones skipped.",
+        "ip_no_reply": "no ping reply (ICMP filtered or lost)",
         "ipcheck_fail": "failed (%s)",
         "ipcheck_usage": "\u2139 Usage: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 or several IPs, one per line",
         "not_allowed": "\u26d4 Unauthorized. This chat is not in the allow list.",
@@ -4045,6 +4054,7 @@ STR = {
         "no_data": "\u0628\u062f\u0648\u0646 \u062f\u0627\u062f\u0647",
         "ipcheck_progress": "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u0633\u062a %d \u0622\u062f\u0631\u0633 IP \u2014 \u06a9\u0645\u06cc \u0635\u0628\u0631 \u06a9\u0646\u06cc\u062f...",
         "ipcheck_more": "\u062d\u062f\u0627\u06a9\u062b\u0631 \u06f5 IP \u062f\u0631 \u0647\u0631 \u062a\u0633\u062a \u2014 \u0628\u0642\u06cc\u0647 \u0646\u0627\u062f\u06cc\u062f\u0647 \u06af\u0631\u0641\u062a\u0647 \u0634\u062f\u0646\u062f.",
+        "ip_no_reply": "\u067e\u0627\u0633\u062e\u06cc \u0627\u0632 \u067e\u06cc\u0646\u06af \u0646\u06cc\u0627\u0645\u062f (ICMP \u0641\u06cc\u0644\u062a\u0631 \u06cc\u0627 \u06af\u0645\u200c\u0634\u062f\u0647)",
         "ipcheck_fail": "\u0646\u0627\u0645\u0648\u0641\u0642 (%s)",
         "ipcheck_usage": "\u2139 \u0637\u0631\u06cc\u0642\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u06cc\u0627 \u0686\u0646\u062f IP\u060c \u0647\u0631 \u06a9\u062f\u0627\u0645 \u062f\u0631 \u06cc\u06a9 \u062e\u0637",
         "not_allowed": "\u26d4 \u063a\u06cc\u0631\u0645\u062c\u0627\u0632. \u0627\u06cc\u0646 \u0686\u062a \u062f\u0631 \u0644\u06cc\u0633\u062a \u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a.",
@@ -4361,7 +4371,11 @@ def do_ipcheck(chat_id, raw):
         if ok_n is None:
             lines.append("\u274C <code>%s</code> \u2014 %s" % (esc(ip), tr(chat_id, "ipcheck_fail", s=esc(str(ir_n)))))
         else:
-            lines.append("\U0001F310 <code>%s</code> \u2014 <b>%d/%d</b> \u00b7 %s %s" % (esc(ip), ok_n, ir_n if ir_n else 0, tr(chat_id, "avg_l"), esc(avg)))
+            if ok_n:
+                tail = "%s %s" % (tr(chat_id, "avg_l"), esc(avg))
+            else:
+                tail = tr(chat_id, "ip_no_reply")
+            lines.append("\U0001F310 <code>%s</code> \u2014 <b>%d/%d</b> \u00b7 %s" % (esc(ip), ok_n, ir_n if ir_n else 0, tail))
     if capped:
         lines.append("\u26A0 " + tr(chat_id, "ipcheck_more"))
     text = "\U0001F310 <b>IP Check</b>\n" + "\n".join(lines)
@@ -4528,13 +4542,13 @@ def status_text(chat_id, scope="both"):
         if "BIND_POOL" in rep:
             out.append("  %s: %s (%s: %s)" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?")), tr(chat_id, "last_good_l"), esc(rep.get("LAST_GOOD", "-"))))
         if rep.get("TLS_TARGET"):
-            out.append("  \U0001F3AF %s: <code>%s</code> \u00b7 %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "tls_target"), esc(rep.get("TLS_TARGET", "?")), tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+            out.append("  %s: <code>%s</code> \u00b7 %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "tls_target"), esc(rep.get("TLS_TARGET", "?")), tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
         elif rep.get("TLS_SNI"):
-            out.append("  \U0001F5BC %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+            out.append("  %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
         if rep.get("NODE_PORT"):
-            out.append("  \U0001F50C %s: %s <code>%s</code> \u00b7 %s <code>%s</code>" % (tr(chat_id, "ports_l"), tr(chat_id, "node_l"), esc(rep.get("NODE_PORT", "?")), tr(chat_id, "data_l"), esc(rep.get("DATA_PORTS", "?"))))
+            out.append("  %s: %s <code>%s</code> \u00b7 %s <code>%s</code>" % (tr(chat_id, "ports_l"), tr(chat_id, "node_l"), esc(rep.get("NODE_PORT", "?")), tr(chat_id, "data_l"), esc(rep.get("DATA_PORTS", "?"))))
         if rep.get("SSH_PORTS"):
-            out.append("  \U0001F50C %s: SSH [<code>%s</code>] \u00b7 %s [<code>%s</code>]" % (tr(chat_id, "ports_l"), esc(rep.get("SSH_PORTS", "?")), tr(chat_id, "local_l"), esc(rep.get("TUNNEL_LOCAL_PORTS", "?"))))
+            out.append("  %s: SSH [<code>%s</code>] \u00b7 %s [<code>%s</code>]" % (tr(chat_id, "ports_l"), esc(rep.get("SSH_PORTS", "?")), tr(chat_id, "local_l"), esc(rep.get("TUNNEL_LOCAL_PORTS", "?"))))
         total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         if total > 0:
@@ -4549,12 +4563,12 @@ def status_text(chat_id, scope="both"):
                     ip, b = item.rsplit(":", 1)
                     items.append("%s \u2014 %s" % (esc(ip), fmt_bytes(b)))
             if items:
-                out.append("  \U0001F464 %s: %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
+                out.append("  %s: %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
         for nat_item in (x.strip() for x in rep.get("NAT_RULES", "").split(";")):
             if nat_item:
                 out.append("  \U0001F9EF <code>%s</code>" % esc(nat_item))
         if rep.get("LATEST_LOG"):
-            out.append("  \U0001F4C4 %s: %s" % (tr(chat_id, "last_log_l"), esc(rep.get("LATEST_LOG", ""))))
+            out.append("  %s: %s" % (tr(chat_id, "last_log_l"), esc(rep.get("LATEST_LOG", ""))))
         if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
             out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"), esc(rep.get("AUTH_FAILS_24H")), esc(rep.get("AUTH_TOP_24H", "")) or "-"))
         out.append("")
@@ -4637,7 +4651,7 @@ def ipcheck(ip):
     try:
         def submit():
             return json.loads(urllib.request.urlopen(
-                ch_request("https://check-host.net/check-ping?host=%s&max_nodes=7" % ip),
+                ch_request("https://check-host.net/check-ping?host=%s&max_nodes=12" % ip),
                 timeout=15).read())["request_id"]
         try:
             rid = submit()
@@ -4662,14 +4676,29 @@ def ipcheck(ip):
         for node, val in res.items():
             if not (node.startswith("ir") or ".ir." in node):
                 continue
+            # v8.16 REAL ping schema (check-host.net/about/api):
+            #   val = [[["OK", <secs>, "<ip>"], ["TIMEOUT", <secs>], ...]]
+            #   val = None  -> node still checking (kept polling above)
+            #   val = [[null]] -> host could not be resolved
+            # The pre-v8.16 parser expected TCP-style dicts ({"time":..})
+            # so every ping attempt looked empty -> always '0/N, avg -'
+            # even when the web UI showed all-green.
+            attempts = val[0] if isinstance(val, list) and val else None
+            if not isinstance(attempts, list):
+                continue
             ir_n += 1
-            entry = val[0] if isinstance(val, list) and val else None
-            if isinstance(entry, list):
-                times = [r.get("time") for r in entry if r and "time" in r]
-                if times:
-                    ok_n += 1
-                    lats.extend(times)
-        avg = "%.0f ms" % (1000.0 * sum(lats) / len(lats)) if lats else "-"
+            node_ok = False
+            for a in attempts:
+                if isinstance(a, list) and a and a[0] == "OK":
+                    node_ok = True
+                    if len(a) > 1 and isinstance(a[1], (int, float)):
+                        lats.append(a[1] * 1000.0)
+                elif isinstance(a, dict) and isinstance(a.get("time"), (int, float)):
+                    node_ok = True
+                    lats.append(a["time"] * 1000.0)
+            if node_ok:
+                ok_n += 1
+        avg = "%.0f ms" % (sum(lats) / len(lats)) if lats else "-"
         return ok_n, ir_n, avg
     except Exception as e:
         return None, str(e), None
@@ -5222,6 +5251,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
