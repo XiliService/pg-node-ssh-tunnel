@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.4
+# PG Node SSH Tunnel Manager v8.5
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -44,11 +44,15 @@
 #       under real load can breach 96M; same class as the v8.3 fix) +
 #       live heal + new read-only 'pg-tunnel diagnose' snapshot for
 #       capture-at-drop troubleshooting
+# v8.5: Diagnose deepened: cgroup memory.stat (anon/file/sock split)
+#       + memory.peak + global memory PSI + per-process RSS + fixed
+#       established-session count on the foreign side - pinpoints
+#       exactly what balloons a channel at the moment it stalls
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.4"
+SCRIPT_VERSION="8.5"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2157,19 +2161,24 @@ diagnose_dump() {
         echo "${u}: $(systemctl is-active "$u" 2>/dev/null) | NRestarts=$(systemctl show "$u" -p NRestarts --value 2>/dev/null) | since $(systemctl show "$u" -p ActiveEnterTimestamp --value 2>/dev/null)"
     done
     echo
-    echo "--- cgroup memory (current / high,max events / psi) ---"
+    echo "--- cgroup memory (current / peak / events / psi / stat) ---"
     local cg=""
     for u in $units; do
         cg="/sys/fs/cgroup/system.slice/${u}.service"
         [[ -d "$cg" ]] || continue
-        echo "${u}: cur=$(cat "$cg/memory.current" 2>/dev/null) | $(grep -E '^(high|max|oom_kill)' "$cg/memory.events" 2>/dev/null | tr '\n' ' ')"
+        echo "${u}: cur=$(cat "$cg/memory.current" 2>/dev/null) peak=$(cat "$cg/memory.peak" 2>/dev/null || echo n/a) | $(grep -E '^(high|max|oom_kill)' "$cg/memory.events" 2>/dev/null | tr '\n' ' ')"
         echo "  psi: $(head -1 "$cg/memory.pressure" 2>/dev/null || echo n/a)"
+        echo "  stat: $(grep -E '^(anon|file|kernel|sock|slab|anon_thp) ' "$cg/memory.stat" 2>/dev/null | tr '\n' ' ')"
     done
+    echo "global psi: $(head -1 /proc/pressure/memory 2>/dev/null || echo n/a)"
+    echo
+    echo "--- process RSS (ssh / tls proxy / tls server) ---"
+    ps -eo pid,rss,comm,args --no-headers 2>/dev/null | awk '$4 ~ /tls_client|tls_server|pg-tunnel/ || $3 == "ssh" {printf "  pid=%s rss=%sKB comm=%s\n", $1, $2, $3}' | head -12
     echo
     echo "--- listeners (tunnel ports) ---"
     ss -tlnp 2>/dev/null | awk -v pl=":(${SEC_SSH:-2087}|${NODE_PORT:-62075}|$(echo "${DATA_PORTS:-}" | tr ',' '|'))$" '$4 ~ pl'
-    echo "--- established TLS sessions to :${SEC_SSH:-2087} ---"
-    ss -tn state established 2>/dev/null | awk -v p=":${SEC_SSH:-2087}$" '$3 ~ p' | wc -l
+    echo "--- established TLS sessions on :${SEC_SSH:-2087} (local or peer) ---"
+    ss -tn state established 2>/dev/null | awk -v p=":${SEC_SSH:-2087}$" '$3 ~ p || $4 ~ p' | wc -l
     echo
     echo "--- journal tails (last 15 lines each) ---"
     for u in $units; do
