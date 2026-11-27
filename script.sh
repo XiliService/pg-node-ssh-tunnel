@@ -89,11 +89,17 @@
 #       (NONINTERACTIVE=1 prints a machine-friendly last line); every
 #       status message now carries a Refresh button that re-fetches
 #       and re-renders it in place
+# v8.15: HOTFIX /ipcheck HTTP 403: check-host.net started rejecting
+#       the default 'Python-urllib' User-Agent; requests now carry a
+#       browser UA (both endpoints), 403/429 retry once after backoff,
+#       results are polled until an Iranian node answers (4+4+6s), IPs
+#       are spaced 1.5s, and the check runs in its own thread so the
+#       bot never blocks while waiting
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.14"
+SCRIPT_VERSION="8.15"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3836,7 +3842,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.14"
+BOT_REV = "8.15"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4348,7 +4354,9 @@ def do_ipcheck(chat_id, raw):
         except Exception:
             mid = None
     lines = []
-    for ip in ips:
+    for idx, ip in enumerate(ips):
+        if idx:
+            time.sleep(1.5)  # gentle spacing: bursts trigger rate limits
         ok_n, ir_n, avg = ipcheck(ip)
         if ok_n is None:
             lines.append("\u274C <code>%s</code> \u2014 %s" % (esc(ip), tr(chat_id, "ipcheck_fail", s=esc(str(ir_n)))))
@@ -4611,20 +4619,47 @@ def logs_text(chat_id, args):
     head = "\U0001F4DC <b>PG Tunnel \u2014 %s</b> (%s, %d)\n%s" % (tr(chat_id, "logs_h"), esc(target), n, "\u2500" * 18)
     return head + "\n<pre>" + html.escape(body[-3200:]) + "</pre>"
 
+CH_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 "
+         "Firefox/115.0")
+
+
+def ch_request(url):
+    return urllib.request.Request(url, headers={"Accept": "application/json",
+                                                 "User-Agent": CH_UA})
+
+
 def ipcheck(ip):
+    # v8.15: check-host.net began rejecting the default 'Python-urllib'
+    # User-Agent with HTTP 403 (seen live as 'failed (HTTP Error 403:
+    # Forbidden)'). Every request now carries a browser UA and 403/429
+    # get one retry after a backoff. Results are polled - nodes answer
+    # asynchronously and a single 4s read caught only the fastest ones.
     try:
-        req = urllib.request.Request(
-            "https://check-host.net/check-ping?host=%s&max_nodes=7" % ip,
-            headers={"Accept": "application/json"})
-        rid = json.loads(urllib.request.urlopen(req, timeout=15).read())["request_id"]
-        time.sleep(4)
-        req2 = urllib.request.Request("https://check-host.net/check-result/" + rid,
-                                      headers={"Accept": "application/json"})
-        res = json.loads(urllib.request.urlopen(req2, timeout=15).read())
+        def submit():
+            return json.loads(urllib.request.urlopen(
+                ch_request("https://check-host.net/check-ping?host=%s&max_nodes=7" % ip),
+                timeout=15).read())["request_id"]
+        try:
+            rid = submit()
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                time.sleep(3)
+                rid = submit()
+            else:
+                raise
+        res = {}
+        for delay in (4, 4, 6):
+            time.sleep(delay)
+            res = json.loads(urllib.request.urlopen(
+                ch_request("https://check-host.net/check-result/" + rid),
+                timeout=15).read()) or {}
+            if any(v for node, v in res.items()
+                   if node.startswith("ir") or ".ir." in node):
+                break
         ok_n = 0
         ir_n = 0
         lats = []
-        for node, val in (res or {}).items():
+        for node, val in res.items():
             if not (node.startswith("ir") or ".ir." in node):
                 continue
             ir_n += 1
@@ -4914,7 +4949,8 @@ def handle_update(upd):
                     send(chat, tr(chat, "update_ref_bad"))
                 return
             if re.search(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", text):
-                do_ipcheck(chat, text)
+                threading.Thread(target=do_ipcheck, args=(chat, text),
+                                 daemon=True).start()
             else:
                 send(chat, tr(chat, "ip_bad"))
             return
@@ -4944,7 +4980,8 @@ def handle_update(upd):
         if not args:
             send(chat, tr(chat, "ipcheck_usage"))
             return
-        do_ipcheck(chat, " ".join(args))
+        threading.Thread(target=do_ipcheck, args=(chat, " ".join(args)),
+                         daemon=True).start()
     elif cmd == "/restart":
         if not args:
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/restart"))
@@ -5185,6 +5222,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
