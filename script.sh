@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.3
+# PG Node SSH Tunnel Manager v8.4
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -40,11 +40,15 @@
 # v8.3: Raise TLS-server memory caps 192M/256M -> 384M/512M (the old
 #       cap throttled the proxy under real load and flapped the
 #       reverse channels); one-time live heal for existing installs
+# v8.4: Data-channel caps 96M/128M -> 192M/256M (kernel socket buffers
+#       under real load can breach 96M; same class as the v8.3 fix) +
+#       live heal + new read-only 'pg-tunnel diagnose' snapshot for
+#       capture-at-drop troubleshooting
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.3"
+SCRIPT_VERSION="8.4"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2097,6 +2101,97 @@ release_iran_tunnel_ports() {
     fi
 }
 
+heal_data_memory_caps() {
+    # v8.4: data-channel units carry ssh + tls_client, whose kernel socket
+    # buffers (2 sockets x up to 16MB under load) can breach the v7.9
+    # 96M cap during real traffic bursts - same failure class as the TLS
+    # server cap fixed in v8.3. Raise existing installs to 192M/256M
+    # live (set-property, zero downtime). Idempotent.
+    local du_file="" du_name=""
+    for du_file in /etc/systemd/system/pg-tunnel-data-*.service; do
+        [[ -f "$du_file" ]] || continue
+        if grep -q "MemoryHigh=96M" "$du_file" 2>/dev/null; then
+            sed -i 's/MemoryHigh=96M/MemoryHigh=192M/; s/MemoryMax=128M/MemoryMax=256M/' "$du_file"
+            du_name=$(basename "$du_file" .service)
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl set-property "$du_name" MemoryHigh=192M MemoryMax=256M >/dev/null 2>&1 || true
+        fi
+    done
+    return 0
+}
+
+diagnose_dump() {
+    # Read-only snapshot for troubleshooting (e.g. right after channels
+    # drop, BEFORE any repair). Safe: no restarts, no rule changes.
+    # Tolerant mode: an empty grep or a missing tool must never abort
+    # the snapshot - partial data beats no data.
+    set +e
+    local _dc _dl _dv _sec="2087" _node="62075" _data=""
+    for _dc in "$IRAN_CONF" "$FOREIGN_CONF"; do
+        [[ -f "$_dc" ]] || continue
+        while read -r _dl; do
+            case "$_dl" in
+                SEC_SSH=*) _sec="${_dl#SEC_SSH=}" ;;
+                NODE_PORT=*) _node="${_dl#NODE_PORT=}" ;;
+                DATA_PORTS=*) _data="${_dl#DATA_PORTS=}" ;;
+            esac
+        done < "$_dc"
+        break
+    done
+    SEC_SSH="$_sec" NODE_PORT="$_node" DATA_PORTS="$_data"
+    echo "=== PG Tunnel Diagnostics v${SCRIPT_VERSION} ($(date '+%Y-%m-%d %H:%M:%S')) ==="
+    echo "HOST: $(hostname) | UPTIME: $(uptime -p 2>/dev/null || true) | LOAD: $(cut -d' ' -f1-3 /proc/loadavg)"
+    echo "MEM: $(free -m 2>/dev/null | awk 'NR==2{printf "%s/%s MB used, %s MB free",$3,$2,$4}')"
+    local ports="${SEC_SSH:-} ${NODE_PORT:-62075} ${DATA_PORTS:-}"
+    echo "ROLE: $( [[ -f "$IRAN_CONF" ]] && echo iran || { [[ -f "$FOREIGN_CONF" ]] && echo foreign || echo unknown; } ) | PORTS: ${ports}"
+    echo
+    echo "--- units (active / restarts / since) ---"
+    local u="" units=""
+    units="pg-tunnel-mgmt"
+    for u in /etc/systemd/system/pg-tunnel-data-*.service; do
+        [[ -f "$u" ]] && units="$units $(basename "$u" .service)"
+    done
+    [[ -f "$TLS_SERVER_SERVICE" ]] && units="$units pg-tls-server"
+    [[ -f "$WATCHDOG_SERVICE" ]] && units="$units pg-tunnel-watchdog"
+    for u in $units; do
+        echo "${u}: $(systemctl is-active "$u" 2>/dev/null) | NRestarts=$(systemctl show "$u" -p NRestarts --value 2>/dev/null) | since $(systemctl show "$u" -p ActiveEnterTimestamp --value 2>/dev/null)"
+    done
+    echo
+    echo "--- cgroup memory (current / high,max events / psi) ---"
+    local cg=""
+    for u in $units; do
+        cg="/sys/fs/cgroup/system.slice/${u}.service"
+        [[ -d "$cg" ]] || continue
+        echo "${u}: cur=$(cat "$cg/memory.current" 2>/dev/null) | $(grep -E '^(high|max|oom_kill)' "$cg/memory.events" 2>/dev/null | tr '\n' ' ')"
+        echo "  psi: $(head -1 "$cg/memory.pressure" 2>/dev/null || echo n/a)"
+    done
+    echo
+    echo "--- listeners (tunnel ports) ---"
+    ss -tlnp 2>/dev/null | awk -v pl=":(${SEC_SSH:-2087}|${NODE_PORT:-62075}|$(echo "${DATA_PORTS:-}" | tr ',' '|'))$" '$4 ~ pl'
+    echo "--- established TLS sessions to :${SEC_SSH:-2087} ---"
+    ss -tn state established 2>/dev/null | awk -v p=":${SEC_SSH:-2087}$" '$3 ~ p' | wc -l
+    echo
+    echo "--- journal tails (last 15 lines each) ---"
+    for u in $units; do
+        echo "### ${u}:"
+        journalctl -u "$u" -n 15 --no-pager -o short 2>/dev/null | tail -15
+        echo
+    done
+    if [[ -f "${CONF_DIR}/watchdog.state" ]]; then
+        echo "--- watchdog.state ---"
+        tail -5 "${CONF_DIR}/watchdog.state"
+        echo
+    fi
+    if [[ -f "$IRAN_CONF" ]]; then
+        echo "--- nat OUTPUT rules ---"
+        iptables -t nat -S OUTPUT 2>/dev/null | grep -E "REDIRECT|DOCKER" | head -10
+        echo
+    fi
+    echo "--- kernel tuning ---"
+    sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_congestion_control net.ipv4.tcp_notsent_lowat 2>/dev/null
+    echo "=== END DIAGNOSTICS ==="
+}
+
 heal_tls_memory_caps() {
     # v8.3: the v7.9 MemoryHigh=192M cap proved too tight for the real
     # working set of the TLS camouflage server under production load
@@ -2203,6 +2298,8 @@ migrate_existing_state() {
 
     # v8.3: raise the too-tight TLS server memory caps (live, no restart).
     heal_tls_memory_caps
+    # v8.4: raise the too-tight data-channel caps (live, no restart).
+    heal_data_memory_caps
 }
 
 bootstrap_existing_accounting() {
@@ -2222,6 +2319,11 @@ handle_cli_subcommands() {
         shield-on)
             check_root
             enable_brute_force_shield || true
+            exit 0
+            ;;
+        diagnose)
+            check_root
+            diagnose_dump
             exit 0
             ;;
         shield-off)
@@ -2265,6 +2367,7 @@ handle_cli_subcommands() {
                 sync_traffic_state >/dev/null 2>&1 || true
             elif [[ -f "$FOREIGN_CONF" ]]; then
                 ensure_accounting_rules 2>/dev/null || true
+                heal_data_memory_caps
                 if [[ -f "$MGMT_SERVICE" ]]; then
                     if ! systemctl is-active --quiet pg-tunnel-mgmt; then
                         systemctl restart pg-tunnel-mgmt 2>/dev/null || true
@@ -2831,8 +2934,8 @@ RestartSec=3
 NoNewPrivileges=true
 ProtectHome=read-only
 PrivateTmp=true
-MemoryHigh=96M
-MemoryMax=128M
+MemoryHigh=192M
+MemoryMax=256M
 Nice=5
 CPUWeight=60
 
