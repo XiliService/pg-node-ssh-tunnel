@@ -144,11 +144,16 @@
 #       (38 STR labels cleaned EN+FA); ipcheck lines bulleted, help
 #       dropped per-command icons. Functional markers kept: channel
 #       up/down dots and alert icons
+# v8.25: cron auto-repair restart reports - every unit the hourly cron
+#       restarts is logged to autofix.events, exposed via AUTOFIX= in
+#       the report (both servers, same ssh path as the rest), and the
+#       bot's 60s monitor announces each event ~1 minute AFTER it
+#       happened so the outcome (active / STILL DOWN) is included
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.24"
+SCRIPT_VERSION="8.25"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1645,6 +1650,9 @@ emit_server_report() {
     echo "VERSION=v${SCRIPT_VERSION}"
     echo "HOST=$(hostname 2>/dev/null || echo unknown)"
     echo "SRV_TZ=$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
+    # v8.25: last 3 cron auto-repair restart events (epoch|role|unit);
+    # the bot reports each one ~1 min later, with the outcome
+    echo "AUTOFIX=$(tail -n 3 "$CONF_DIR/autofix.events" 2>/dev/null | tr '\n' ';')"
     echo "UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\nRAM_USED_KB=%d\n", t+0, a+0, (t-a)+0}' /proc/meminfo 2>/dev/null || true
     awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "SWAP_TOTAL_KB=%d\nSWAP_FREE_KB=%d\n", t+0, f+0}' /proc/meminfo 2>/dev/null || true
@@ -2615,12 +2623,15 @@ handle_cli_subcommands() {
                 heal_tls_memory_caps
                 if ! systemctl is-active --quiet ssh.service; then
                     systemctl restart ssh.service 2>/dev/null || true
+                    log_autofix_event iran ssh
                 fi
                 if [[ -f "$TLS_SERVER_SERVICE" ]] && ! systemctl is-active --quiet pg-tls-server.service; then
                     systemctl restart pg-tls-server.service 2>/dev/null || true
+                    log_autofix_event iran pg-tls-server
                 fi
                 if [[ -f "$WATCHDOG_SERVICE" ]] && ! systemctl is-active --quiet pg-tunnel-watchdog.service; then
                     systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
+                    log_autofix_event iran pg-tunnel-watchdog
                 fi
                 while read -r port; do
                     iptables -t nat -C OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || \
@@ -2635,6 +2646,7 @@ handle_cli_subcommands() {
                 if [[ -f "$MGMT_SERVICE" ]]; then
                     if ! systemctl is-active --quiet pg-tunnel-mgmt; then
                         systemctl restart pg-tunnel-mgmt 2>/dev/null || true
+                        log_autofix_event foreign pg-tunnel-mgmt
                     fi
                     local cu_file cu_name
                     for cu_file in $DATA_SERVICE_GLOB; do
@@ -2642,11 +2654,13 @@ handle_cli_subcommands() {
                         cu_name=$(basename "$cu_file" .service)
                         if ! systemctl is-active --quiet "$cu_name"; then
                             systemctl restart "$cu_name" 2>/dev/null || true
+                            log_autofix_event foreign "$cu_name"
                         fi
                     done
                 fi
                 if [[ -f "$TUNNEL_SERVICE" ]] && ! systemctl is-active --quiet reverse-tunnel; then
                     systemctl restart reverse-tunnel 2>/dev/null || true
+                    log_autofix_event foreign reverse-tunnel
                 fi
                 sync_traffic_state >/dev/null 2>&1 || true
             fi
@@ -2661,6 +2675,20 @@ handle_cli_subcommands() {
             exit 0
             ;;
     esac
+}
+
+log_autofix_event() {
+    # v8.25: record a cron auto-repair restart; picked up by the bot via
+    # AUTOFIX= in the report and announced ~1 min later (with outcome)
+    local role="$1" unit="$2" evf="${CONF_DIR}/autofix.events"
+    [[ -d "$CONF_DIR" ]] || return 0
+    printf '%s|%s|%s\n' "$(date +%s)" "$role" "$unit" >> "$evf" 2>/dev/null || true
+    local n
+    n=$(wc -l < "$evf" 2>/dev/null || echo 0)
+    if [[ "${n:-0}" -gt 20 ]]; then
+        tail -n 20 "$evf" > "${evf}.tmp" 2>/dev/null && mv -f "${evf}.tmp" "$evf" 2>/dev/null || true
+    fi
+    return 0
 }
 
 self_install() {
@@ -3942,7 +3970,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.24"
+BOT_REV = "8.25"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3956,7 +3984,7 @@ TEHRAN = timezone(timedelta(hours=3, minutes=30))
 CFG = {}
 STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
          "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
-         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0,
+         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {},
          "iran_last_ok": 0, "iran_down": False}
 
 
@@ -4026,6 +4054,10 @@ STR = {
         "channel_down": "\U0001f6a8 <b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
         "tunnel_unreachable": "\U0001f6a8 <b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
         "tunnel_back": "\u2705 Iran reachable again through the tunnel.",
+        "autofix_event": "\U0001F6E0 <b>AUTOFIX:</b> cron restarted <code>%s</code> (%s) at %s \u2014 %s",
+        "autofix_active": "active",
+        "autofix_down": "STILL DOWN",
+        "autofix_unknown": "status unknown",
         "watchdog_bad": "\U0001f6a8 <b>WATCHDOG ALERT (Iran):</b> %s",
         "shield_off": "\u26a0 Brute-force shield on Iran changed to inactive.",
         "ram_low": "\u26a0 Low RAM on %s: %d%% available.",
@@ -4143,6 +4175,10 @@ STR = {
         "channel_down": "\U0001f6a8 <b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
         "tunnel_unreachable": "\U0001f6a8 <b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
         "tunnel_back": "\u2705 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
+        "autofix_event": "\U0001F6E0 <b>\u0627\u0648\u062a\u0648\u0641\u06cc\u06a9\u0633:</b> \u06a9\u0631\u0648\u0646 \u0633\u0631\u0648\u06cc\u0633 <code>%s</code> (%s) \u0631\u0627 \u0633\u0627\u0639\u062a %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0631\u062f \u2014 %s",
+        "autofix_active": "\u0641\u0639\u0627\u0644",
+        "autofix_down": "\u0647\u0646\u0648\u0632 \u067e\u0627\u06cc\u06cc\u0646 \u0627\u0633\u062a",
+        "autofix_unknown": "\u0648\u0636\u0639\u06cc\u062a \u0645\u0639\u0644\u0648\u0645 \u0646\u06cc\u0633\u062a",
         "watchdog_bad": "\U0001f6a8 <b>\u0647\u0634\u062f\u0627\u0631 \u0648\u0627\u0686\u200c\u062f\u0627\u06af (\u0627\u06cc\u0631\u0627\u0646):</b> %s",
         "shield_off": "\u26a0 \u0633\u067e\u0631 \u0628\u0631\u0648\u062a\u200c\u0641\u0648\u0631\u0633 \u0627\u06cc\u0631\u0627\u0646 \u063a\u06cc\u0631\u0641\u0639\u0627\u0644 \u0634\u062f.",
         "ram_low": "\u26a0 \u06a9\u0645\u0628\u0648\u062f \u0631\u0645 \u062f\u0631 %s: \u0641\u0642\u0637 %d%% \u0628\u0627\u0642\u06cc \u0645\u0627\u0646\u062f\u0647.",
@@ -5312,6 +5348,65 @@ def warn_once_per_day(chat_key, text, critical=False):
     broadcast(text, critical=critical)
 
 
+def autofix_status_of(rep, unit):
+    u = str(unit or "").lower()
+    if not rep:
+        return None
+    if "pg-tunnel-mgmt" in u:
+        return rep.get("CHANNEL_MGMT") or None
+    if "pg-tunnel-data" in u:
+        port = u.split("data-")[-1].strip() if "data-" in u else ""
+        return (rep.get("CHANNEL_DATA_" + port) or None) if port else None
+    if "tls-server" in u:
+        return rep.get("TLS_SERVER") or None
+    if "watchdog" in u:
+        w = rep.get("WATCHDOG") or ""
+        return w.split()[0] if w else None
+    return None
+
+
+def process_autofix(rep, role):
+    # v8.25: announce cron auto-repair restarts ~1 minute AFTER they
+    # happened (AUTOFIX= field from the report), so the outcome can be
+    # included: active / STILL DOWN / status unknown
+    if not rep:
+        return
+    raw = str(rep.get("AUTOFIX", "") or "")
+    if not raw.strip():
+        return
+    seen = STATE.setdefault("autofix_seen", {})
+    now = time.time()
+    for ev in raw.split(";"):
+        ev = ev.strip()
+        if ev.count("|") != 2:
+            continue
+        ep_s, ev_role, unit = [x.strip() for x in ev.split("|")]
+        if ev_role != role:
+            continue
+        try:
+            ep = int(ep_s)
+        except Exception:
+            continue
+        key = role + "|" + unit + "|" + ep_s
+        if seen.get(key):
+            continue
+        if now - ep < 60:
+            continue  # the requested 1-minute delay
+        seen[key] = 1
+        if len(seen) > 200:
+            for k in list(seen)[:-100]:
+                del seen[k]
+        st = autofix_status_of(rep, unit)
+        if st is None:
+            stt = tr(0, "autofix_unknown")
+        elif str(st).lower() in ("active", "ok"):
+            stt = tr(0, "autofix_active")
+        else:
+            stt = tr(0, "autofix_down")
+        when = datetime.fromtimestamp(ep, TEHRAN).strftime("%H:%M")
+        broadcast(tr(0, "autofix_event") % (esc(str(unit)), tr(0, role), when, stt), critical=True)
+
+
 def check_once():
     loc = local_report()
     irn = None
@@ -5322,6 +5417,9 @@ def check_once():
     STATE["iran_tick"] = int(STATE.get("iran_tick", 0)) + 1
     if STATE["iran_tick"] % every == 1:
         irn = iran_report()
+    process_autofix(loc, "foreign")
+    if irn is not None:
+        process_autofix(irn, "iran")
     for role, rep in (("foreign", loc), ("iran", irn)):
         if rep is None:
             continue
@@ -5509,6 +5607,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
