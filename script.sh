@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.8
+# PG Node SSH Tunnel Manager v8.9
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -59,11 +59,15 @@
 #       update - a stale engine was the cause of rendering issues);
 #       HTML-hardening: escape every report value, tag-safe
 #       truncation, plain-text fallback so a message is never lost
+# v8.9: Bot messages redesigned - iconized, sectioned, spaced
+#       (status/traffic/logs/help/alerts, EN+FA); /ipcheck now
+#       accepts multiple IPs (one per line or space separated,
+#       max 5) with a progress message edited into the results
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.8"
+SCRIPT_VERSION="8.9"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3711,7 +3715,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.8"
+BOT_REV = "8.9"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3766,149 +3770,155 @@ def save_state():
 
 STR = {
     "en": {
-        "title": "<b>PG Tunnel Bot</b>",
+        "title": "\U0001f916 <b>PG Tunnel Bot</b>",
+        "status_h": "Status",
+        "traffic_h": "Traffic",
+        "logs_h": "Logs",
+        "tehran_t": "Tehran",
+        "ram_l": "RAM",
+        "disk_l": "Disk",
+        "cap_l": "Cap",
+        "avg_l": "avg",
         "foreign": "FOREIGN",
         "iran": "IRAN",
         "up": "up",
-        "channels": "Channels",
-        "cron": "Cron",
+        "channels": "\U0001f7e2 Channels",
+        "cron": "\u2699 Cron",
         "tuning": "Tuning",
-        "traffic": "Traffic",
+        "traffic": "\U0001f4e6 Traffic",
         "since": "since",
-        "tls": "TLS",
+        "tls": "\U0001f512 TLS",
         "sessions": "sessions",
-        "watchdog": "Watchdog",
-        "shield": "Shield",
-        "cert": "Cert",
-        "attacks": "Attacks 24h",
-        "bind_pool": "Bind pool",
-        "rebooted": "<b>REBOOT DETECTED:</b> %s server restarted (uptime reset).",
-        "oom": "<b>OOM KILL DETECTED:</b> %s kernel killed process %s.",
-        "channel_down": "<b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
-        "tunnel_unreachable": "<b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
-        "tunnel_back": "Iran reachable again through the tunnel.",
-        "watchdog_bad": "<b>WATCHDOG ALERT (Iran):</b> %s",
-        "shield_off": "Brute-force shield on Iran changed to inactive.",
-        "ram_low": "Low RAM on %s: %d%% available.",
-        "disk_high": "Disk usage on %s: %d%% used.",
-        "cert_low": "TLS certificate on Iran expires in %d days.",
-        "tuning_drift": "Kernel tuning on %s drifted: %s (run Network Optimizer).",
-        "cap_warn": "<b>TRAFFIC CAP:</b> %s used %d%% of its monthly cap.",
-        "days_left": "<b>TRAFFIC CAP:</b> %s will hit its cap in about %d days at current rate.",
-        "daily_title": "<b>Daily PG Tunnel Report</b> - %s (Tehran)",
-        "daily_ok": "All systems nominal.",
-        "prediction": "Traffic rate: %s/day - cap in ~%d days",
+        "watchdog": "\U0001f9ae Watchdog",
+        "shield": "\U0001f6e1 Shield",
+        "cert": "\U0001f4dc Cert",
+        "attacks": "\U0001f44a Attacks 24h",
+        "bind_pool": "\U0001f310 Bind",
+        "rebooted": "\U0001f6a8 <b>REBOOT:</b> %s server restarted (uptime reset).",
+        "oom": "\U0001f6a8 <b>OOM KILL:</b> %s kernel killed process %s.",
+        "channel_down": "\U0001f6a8 <b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
+        "tunnel_unreachable": "\U0001f6a8 <b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
+        "tunnel_back": "\u2705 Iran reachable again through the tunnel.",
+        "watchdog_bad": "\U0001f6a8 <b>WATCHDOG ALERT (Iran):</b> %s",
+        "shield_off": "\u26a0 Brute-force shield on Iran changed to inactive.",
+        "ram_low": "\u26a0 Low RAM on %s: %d%% available.",
+        "disk_high": "\u26a0 Disk usage on %s: %d%% used.",
+        "cert_low": "\u26a0 TLS certificate on Iran expires in %d days.",
+        "tuning_drift": "\u26a0 Kernel tuning on %s drifted: %s (run Network Optimizer).",
+        "cap_warn": "\U0001f6a8 <b>TRAFFIC CAP:</b> %s used %d%% of its monthly cap.",
+        "days_left": "\U0001f6a8 <b>TRAFFIC CAP:</b> %s will hit its cap in about %d days at current rate.",
+        "daily_title": "\U0001f4c5 <b>Daily PG Tunnel Report</b> \u2014 %s (Tehran)",
+        "daily_ok": "\u2705 All systems nominal.",
+        "prediction": "\U0001f4c8 Traffic rate: %s/day \u2014 cap in ~%d days",
         "no_data": "no data",
-        "ipcheck_result": "Direct IP <code>%s</code> from Iranian nodes: <b>%d/%d OK</b> (avg %s)",
-        "ipcheck_fail": "IP check failed: %s",
-        "ipcheck_usage": "Usage: /ipcheck &lt;ip&gt;",
-        "not_allowed": "Unauthorized. This chat is not in the allow list.",
-        "confirm": "Confirm action: <code>%s</code>?",
-        "confirmed": "Action executed.",
-        "cancelled": "Cancelled.",
-        "failed": "Action failed. Check logs.",
+        "ipcheck_progress": "\u23f3 Testing %d IP(s) \u2014 please wait...",
+        "ipcheck_more": "Max 5 IPs per test \u2014 extra ones skipped.",
+        "ipcheck_fail": "failed (%s)",
+        "ipcheck_usage": "\u2139 Usage: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 or several IPs, one per line",
+        "not_allowed": "\u26d4 Unauthorized. This chat is not in the allow list.",
+        "confirm": "\u26a0 Confirm action: <code>%s</code>?",
+        "confirmed": "\u2705 Action executed.",
+        "cancelled": "\u274c Cancelled.",
+        "failed": "\u274c Action failed. Check logs.",
         "invalid_port": "Unknown port or unit: %s",
-        "restart_done": "Channel %s restarted.",
-        "repair_done": "Repair finished for: %s",
-        "shield_done": "Shield %s on Iran.",
-        "mute_on": "Non-critical alerts muted for %d minutes.",
-        "mute_off": "Alerts unmuted.",
-        "lang_set": "Language set to English.",
-        "logs_tail": "Logs for %s (last %d lines):",
-        "logs_none": "No logs available.",
-        "logs_usage": "Usage: /logs [iran|foreign] [lines]",
-        "menu_title": "Main menu - tap a button:",
-        "choose_logs": "Which server's logs?",
-        "choose_restart": "Restart which channel?",
-        "choose_repair": "Repair which side?",
-        "choose_shield": "Iran port-22 shield:",
-        "ip_prompt": "Send the IP address to test as plain text (valid 3 min):",
-        "ip_bad": "That does not look like a valid IP.",
-        "btn_status": "\U0001F4CA Status",
-        "btn_traffic": "\U0001F4C8 Traffic",
-        "btn_logs": "\U0001F4DC Logs",
-        "btn_ipcheck": "\U0001F310 IP Test",
-        "btn_restart": "\U0001F501 Restart",
-        "btn_repair": "\U0001F6E0 Repair",
-        "btn_shield": "\U0001F6E1 Shield",
-        "btn_mute": "\U0001F515 Mute 1h",
-        "btn_unmute": "\U0001F50A Unmute",
-        "btn_lang": "\U0001F310 Language",
+        "restart_done": "\u2705 Channel %s restarted.",
+        "repair_done": "\u2705 Repair finished for: %s",
+        "shield_done": "\U0001f6e1 Shield %s on Iran.",
+        "mute_on": "\U0001f515 Non-critical alerts muted for %d minutes.",
+        "mute_off": "\U0001f50a Alerts unmuted.",
+        "lang_set": "\u2705 Language set to English.",
+        "logs_tail": "\U0001f4dc Logs for %s (last %d lines):",
+        "logs_none": "\U0001f4dc No logs available.",
+        "logs_usage": "\u2139 Usage: /logs [iran|foreign] [lines]",
+        "menu_title": "\U0001f39b <b>Main menu</b> \u2014 tap a button:",
+        "choose_logs": "\U0001f4dc Which server's logs?",
+        "choose_restart": "\U0001f501 Restart which channel?",
+        "choose_repair": "\U0001f6e0 Repair which side?",
+        "choose_shield": "\U0001f6e1 Iran port-22 shield:",
+        "ip_prompt": "\u270f Send the IP address(es) to test \u2014 one per line (valid 3 min):",
+        "ip_bad": "\u26a0 That does not look like a valid IP address.",
+        "btn_status": "\U0001f4ca Status",
+        "btn_traffic": "\U0001f4c8 Traffic",
+        "btn_logs": "\U0001f4dc Logs",
+        "btn_ipcheck": "\U0001f310 IP Test",
+        "btn_restart": "\U0001f501 Restart",
+        "btn_repair": "\U0001f6e0 Repair",
+        "btn_shield": "\U0001f6e1 Shield",
+        "btn_mute": "\U0001f515 Mute 1h",
+        "btn_unmute": "\U0001f50a Unmute",
+        "btn_lang": "\U0001f310 Language",
         "btn_back": "\u2b05 Back",
         "btn_both": "Both",
-        "help": ("<b>PG Tunnel Bot</b>\n"
-                 "/status - full status of both servers\n"
-                 "/traffic - usage, per-IP and cap prediction\n"
-                 "/logs [iran|foreign] [n] - recent tunnel logs\n"
-                 "/restart &lt;port|mgmt&gt; - restart one channel (confirm)\n"
-                 "/repair [iran|foreign|both] - revive dead services (confirm)\n"
-                 "/shield &lt;on|off&gt; - Iran port-22 shield (confirm)\n"
-                 "/ipcheck &lt;ip&gt; - test direct IP from Iranian nodes\n"
-                 "/mute [min] - mute non-critical alerts\n"
-                 "/lang - switch language\n"
-                 "/unmute - unmute alerts\n"
-                 "/menu - glass-button panel\n"
-                 "/help - this message"),
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status \u2014 full status of both servers\n\U0001f4c8 /traffic \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2753 /help \u2014 this message",
     },
     "fa": {
-        "title": "<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
+        "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
+        "status_h": "\u0648\u0636\u0639\u06cc\u062a",
+        "traffic_h": "\u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "logs_h": "\u0644\u0627\u06af\u200c\u0647\u0627",
+        "tehran_t": "\u062a\u0647\u0631\u0627\u0646",
+        "ram_l": "\u0631\u0645",
+        "disk_l": "\u062f\u06cc\u0633\u06a9",
+        "cap_l": "\u0633\u0642\u0641",
+        "avg_l": "\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646",
         "foreign": "\u062e\u0627\u0631\u062c",
         "iran": "\u0627\u06cc\u0631\u0627\u0646",
         "up": "\u0641\u0639\u0627\u0644",
-        "channels": "\u06a9\u0627\u0646\u0627\u0644\u200c\u0647\u0627",
-        "cron": "\u06a9\u0631\u0648\u0646",
+        "channels": "\U0001f7e2 \u06a9\u0627\u0646\u0627\u0644\u200c\u0647\u0627",
+        "cron": "\u2699 \u06a9\u0631\u0648\u0646",
         "tuning": "\u062a\u06cc\u0648\u0646\u06cc\u0646\u06af",
-        "traffic": "\u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "traffic": "\U0001f4e6 \u062a\u0631\u0627\u0641\u06cc\u06a9",
         "since": "\u0627\u0632",
-        "tls": "TLS",
+        "tls": "\U0001f512 TLS",
         "sessions": "\u062c\u0644\u0633\u0647",
-        "watchdog": "\u0648\u0627\u0686\u200c\u062f\u0627\u06af",
-        "shield": "\u0633\u067e\u0631",
-        "cert": "\u06af\u0648\u0627\u0647\u06cc",
-        "attacks": "\u062d\u0645\u0644\u0627\u062a \u06f2\u06f4\u0633",
-        "bind_pool": "\u0627\u0633\u062a\u062e\u0631 \u0628\u0627\u06cc\u0646\u062f",
-        "rebooted": "<b>\u0631\u06cc\u0628\u0648\u062a \u062a\u0634\u062e\u06cc\u0635 \u062f\u0627\u062f\u0647 \u0634\u062f:</b> \u0633\u0631\u0648\u0631 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f (\u0622\u067e\u200c\u062a\u0627\u06cc\u0645 \u0635\u0641\u0631 \u0634\u062f).",
-        "oom": "<b>\u06a9\u0634\u062a\u0646 \u067e\u0631\u0648\u0633\u0647 \u062a\u0648\u0633\u0637 OOM:</b> \u06a9\u0631\u0646\u0644 %s \u067e\u0631\u0648\u0633\u0647\u200c\u06cc %s \u0631\u0627 \u06a9\u0634\u062a.",
-        "channel_down": "<b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
-        "tunnel_unreachable": "<b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
-        "tunnel_back": "\u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
-        "watchdog_bad": "<b>\u0647\u0634\u062f\u0627\u0631 \u0648\u0627\u0686\u200c\u062f\u0627\u06af (\u0627\u06cc\u0631\u0627\u0646):</b> %s",
-        "shield_off": "\u0633\u067e\u0631 \u0628\u0631\u0648\u062a\u200c\u0641\u0648\u0631\u0633 \u0627\u06cc\u0631\u0627\u0646 \u063a\u06cc\u0631\u0641\u0639\u0627\u0644 \u0634\u062f.",
-        "ram_low": "\u06a9\u0645\u0628\u0648\u062f \u0631\u0645 \u062f\u0631 %s: \u0641\u0642\u0637 %d%% \u0628\u0627\u0642\u06cc \u0645\u0627\u0646\u062f\u0647.",
-        "disk_high": "\u0645\u0635\u0631\u0641 \u062f\u06cc\u0633\u06a9 \u062f\u0631 %s: %d%%.",
-        "cert_low": "\u06af\u0648\u0627\u0647\u06cc TLS \u0627\u06cc\u0631\u0627\u0646 \u062a\u0627 %d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0645\u0646\u0642\u0636\u06cc \u0645\u06cc\u200c\u0634\u0648\u062f.",
-        "tuning_drift": "\u062a\u06cc\u0648\u0646\u06cc\u0646\u06af \u06a9\u0631\u0646\u0644 %s \u0628\u0647\u200c\u0647\u0645 \u062e\u0648\u0631\u062f\u0647: %s (Optimize \u0631\u0627 \u0627\u062c\u0631\u0627 \u06a9\u0646\u06cc\u062f).",
-        "cap_warn": "<b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0647 %d%% \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647 \u0631\u0633\u06cc\u062f\u0647.",
-        "days_left": "<b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0627 \u0627\u06cc\u0646 \u0645\u0635\u0631\u0641 ~%d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0628\u0647 \u0633\u0642\u0641 \u0645\u06cc\u200c\u0631\u0633\u062f.",
-        "daily_title": "<b>\u06af\u0632\u0627\u0631\u0634 \u0631\u0648\u0632\u0627\u0646\u0647\u200c\u06cc \u062a\u0627\u0646\u0644 PG</b> - %s (\u062a\u0647\u0631\u0627\u0646)",
-        "daily_ok": "\u0647\u0645\u0647\u200c\u0686\u06cc\u0632 \u0633\u0627\u0644\u0645 \u0627\u0633\u062a.",
-        "prediction": "\u0646\u0631\u062e \u0645\u0635\u0631\u0641: %s \u062f\u0631 \u0631\u0648\u0632 - ~%d \u0631\u0648\u0632 \u062a\u0627 \u0633\u0642\u0641",
+        "watchdog": "\U0001f9ae \u0648\u0627\u0686\u200c\u062f\u0627\u06af",
+        "shield": "\U0001f6e1 \u0633\u067e\u0631",
+        "cert": "\U0001f4dc \u06af\u0648\u0627\u0647\u06cc",
+        "attacks": "\U0001f44a \u062d\u0645\u0644\u0627\u062a \u06f2\u06f4\u0633",
+        "bind_pool": "\U0001f310 \u0628\u0627\u06cc\u0646\u062f",
+        "rebooted": "\U0001f6a8 <b>\u0631\u06cc\u0628\u0648\u062a \u062a\u0634\u062e\u06cc\u0635 \u062f\u0627\u062f\u0647 \u0634\u062f:</b> \u0633\u0631\u0648\u0631 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f (\u0622\u067e\u200c\u062a\u0627\u06cc\u0645 \u0635\u0641\u0631 \u0634\u062f).",
+        "oom": "\U0001f6a8 <b>\u06a9\u0634\u062a\u0646 \u067e\u0631\u0648\u0633\u0647 \u062a\u0648\u0633\u0637 OOM:</b> \u06a9\u0631\u0646\u0644 %s \u067e\u0631\u0648\u0633\u0647\u200c\u06cc %s \u0631\u0627 \u06a9\u0634\u062a.",
+        "channel_down": "\U0001f6a8 <b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
+        "tunnel_unreachable": "\U0001f6a8 <b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
+        "tunnel_back": "\u2705 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
+        "watchdog_bad": "\U0001f6a8 <b>\u0647\u0634\u062f\u0627\u0631 \u0648\u0627\u0686\u200c\u062f\u0627\u06af (\u0627\u06cc\u0631\u0627\u0646):</b> %s",
+        "shield_off": "\u26a0 \u0633\u067e\u0631 \u0628\u0631\u0648\u062a\u200c\u0641\u0648\u0631\u0633 \u0627\u06cc\u0631\u0627\u0646 \u063a\u06cc\u0631\u0641\u0639\u0627\u0644 \u0634\u062f.",
+        "ram_low": "\u26a0 \u06a9\u0645\u0628\u0648\u062f \u0631\u0645 \u062f\u0631 %s: \u0641\u0642\u0637 %d%% \u0628\u0627\u0642\u06cc \u0645\u0627\u0646\u062f\u0647.",
+        "disk_high": "\u26a0 \u0645\u0635\u0631\u0641 \u062f\u06cc\u0633\u06a9 \u062f\u0631 %s: %d%%.",
+        "cert_low": "\u26a0 \u06af\u0648\u0627\u0647\u06cc TLS \u0627\u06cc\u0631\u0627\u0646 \u062a\u0627 %d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0645\u0646\u0642\u0636\u06cc \u0645\u06cc\u200c\u0634\u0648\u062f.",
+        "tuning_drift": "\u26a0 \u062a\u06cc\u0648\u0646\u06cc\u0646\u06af \u06a9\u0631\u0646\u0644 %s \u0628\u0647\u200c\u0647\u0645 \u062e\u0648\u0631\u062f\u0647: %s (Optimize \u0631\u0627 \u0627\u062c\u0631\u0627 \u06a9\u0646\u06cc\u062f).",
+        "cap_warn": "\U0001f6a8 <b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0647 %d%% \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647 \u0631\u0633\u06cc\u062f\u0647.",
+        "days_left": "\U0001f6a8 <b>\u0633\u0642\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9:</b> %s \u0628\u0627 \u0627\u06cc\u0646 \u0645\u0635\u0631\u0641 ~%d \u0631\u0648\u0632 \u062f\u06cc\u06af\u0631 \u0628\u0647 \u0633\u0642\u0641 \u0645\u06cc\u200c\u0631\u0633\u062f.",
+        "daily_title": "\U0001f4c5 <b>\u06af\u0632\u0627\u0631\u0634 \u0631\u0648\u0632\u0627\u0646\u0647\u200c\u06cc \u062a\u0627\u0646\u0644 PG</b> \u2014 %s (\u062a\u0647\u0631\u0627\u0646)",
+        "daily_ok": "\u2705 \u0647\u0645\u0647\u200c\u0686\u06cc\u0632 \u0633\u0627\u0644\u0645 \u0627\u0633\u062a.",
+        "prediction": "\U0001f4c8 \u0646\u0631\u062e \u0645\u0635\u0631\u0641: %s \u062f\u0631 \u0631\u0648\u0632 \u2014 ~%d \u0631\u0648\u0632 \u062a\u0627 \u0633\u0642\u0641",
         "no_data": "\u0628\u062f\u0648\u0646 \u062f\u0627\u062f\u0647",
-        "ipcheck_result": "IP \u062f\u0627\u06cc\u0631\u06a9\u062a <code>%s</code> \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc: <b>%d/%d \u0633\u0627\u0644\u0645</b> (\u0645\u06cc\u0627\u0646\u06af\u06cc\u0646 %s)",
-        "ipcheck_fail": "\u062a\u0633\u062a IP \u0646\u0627\u0645\u0648\u0641\u0642: %s",
-        "ipcheck_usage": "\u0637\u0631\u0632 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /ipcheck &lt;ip&gt;",
-        "not_allowed": "\u063a\u06cc\u0631\u0645\u062c\u0627\u0632. \u0627\u06cc\u0646 \u0686\u062a \u062f\u0631 \u0644\u06cc\u0633\u062a \u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a.",
-        "confirm": "\u062a\u0627\u06cc\u06cc\u062f \u0627\u062c\u0631\u0627\u06cc: <code>%s</code> \u061f",
-        "confirmed": "\u0627\u062c\u0631\u0627 \u0634\u062f.",
-        "cancelled": "\u0644\u063a\u0648 \u0634\u062f.",
-        "failed": "\u0627\u062c\u0631\u0627\u06cc \u062f\u0633\u062a\u0648\u0631 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062f. \u0644\u0627\u06af\u200c\u0647\u0627 \u0631\u0627 \u0628\u0628\u06cc\u0646\u06cc\u062f.",
-        "invalid_port": "\u067e\u0648\u0631\u062a/\u0633\u0631\u0648\u06cc\u0633 \u0646\u0627\u0634\u0646\u0627\u0633: %s",
-        "restart_done": "\u06a9\u0627\u0646\u0627\u0644 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f.",
-        "repair_done": "\u062a\u0639\u0645\u06cc\u0631 \u0627\u0646\u062c\u0627\u0645 \u0634\u062f \u0628\u0631\u0627\u06cc: %s",
-        "shield_done": "\u0633\u067e\u0631 \u0627\u06cc\u0631\u0627\u0646 %s \u0634\u062f.",
-        "mute_on": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc \u0628\u0631\u0627\u06cc %d \u062f\u0642\u06cc\u0642\u0647 \u0628\u06cc\u200c\u0635\u062f\u0627 \u0634\u062f.",
-        "mute_off": "\u0647\u0634\u062f\u0627\u0631\u0647\u0627 \u0648\u0635\u0644 \u0634\u062f.",
-        "lang_set": "\u0632\u0628\u0627\u0646 \u0641\u0627\u0631\u0633\u06cc \u0634\u062f.",
-        "logs_tail": "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc %s (\u0622\u062e\u0631\u06cc\u0646 %d \u062e\u0637):",
-        "logs_none": "\u0644\u0627\u06af\u06cc \u0645\u0648\u062c\u0648\u062f \u0646\u06cc\u0633\u062a.",
-        "logs_usage": "\u0637\u0631\u0632 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /logs [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]",
-        "menu_title": "\u0645\u0646\u0648\u06cc \u0627\u0635\u0644\u06cc \u2014 \u062f\u06a9\u0645\u0647 \u0645\u0648\u0631\u062f\u0646\u0638\u0631 \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f:",
-        "choose_logs": "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
-        "choose_restart": "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u062f\u0627\u0645 \u06a9\u0627\u0646\u0627\u0644\u061f",
-        "choose_repair": "\u062a\u0639\u0645\u06cc\u0631 \u06a9\u062f\u0627\u0645 \u0633\u0645\u062a\u061f",
-        "choose_shield": "\u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646:",
-        "ip_prompt": "\u0622\u062f\u0631\u0633 IP \u0628\u0631\u0627\u06cc \u062a\u0633\u062a \u0631\u0627 \u0628\u0647 \u0635\u0648\u0631\u062a \u0645\u062a\u0646 \u0633\u0627\u062f\u0647 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
-        "ip_bad": "\u0627\u06cc\u0646 \u06cc\u06a9 IP \u0645\u0639\u062a\u0628\u0631 \u0628\u0647 \u0646\u0638\u0631 \u0646\u0645\u06cc\u200c\u0631\u0633\u062f.",
+        "ipcheck_progress": "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u0633\u062a %d \u0622\u062f\u0631\u0633 IP \u2014 \u06a9\u0645\u06cc \u0635\u0628\u0631 \u06a9\u0646\u06cc\u062f...",
+        "ipcheck_more": "\u062d\u062f\u0627\u06a9\u062b\u0631 \u06f5 IP \u062f\u0631 \u0647\u0631 \u062a\u0633\u062a \u2014 \u0628\u0642\u06cc\u0647 \u0646\u0627\u062f\u06cc\u062f\u0647 \u06af\u0631\u0641\u062a\u0647 \u0634\u062f\u0646\u062f.",
+        "ipcheck_fail": "\u0646\u0627\u0645\u0648\u0641\u0642 (%s)",
+        "ipcheck_usage": "\u2139 \u0637\u0631\u06cc\u0642\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u06cc\u0627 \u0686\u0646\u062f IP\u060c \u0647\u0631 \u06a9\u062f\u0627\u0645 \u062f\u0631 \u06cc\u06a9 \u062e\u0637",
+        "not_allowed": "\u26d4 \u063a\u06cc\u0631\u0645\u062c\u0627\u0632. \u0627\u06cc\u0646 \u0686\u062a \u062f\u0631 \u0644\u06cc\u0633\u062a \u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a.",
+        "confirm": "\u26a0 \u062a\u0623\u06cc\u06cc\u062f \u0627\u062c\u0631\u0627\u06cc: <code>%s</code> \u061f",
+        "confirmed": "\u2705 \u0627\u062c\u0631\u0627 \u0634\u062f.",
+        "cancelled": "\u274c \u0644\u063a\u0648 \u0634\u062f.",
+        "failed": "\u274c \u0627\u062c\u0631\u0627\u06cc \u062f\u0633\u062a\u0648\u0631 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062f. \u0644\u0627\u06af\u200c\u0647\u0627 \u0631\u0627 \u0628\u0628\u06cc\u0646\u06cc\u062f.",
+        "invalid_port": "\u067e\u0648\u0631\u062a/\u0633\u0631\u0648\u06cc\u0633 \u0646\u0634\u0646\u0627\u0633: %s",
+        "restart_done": "\u2705 \u06a9\u0627\u0646\u0627\u0644 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f.",
+        "repair_done": "\u2705 \u062a\u0639\u0645\u06cc\u0631 \u0627\u0646\u062c\u0627\u0645 \u0634\u062f \u0628\u0631\u0627\u06cc: %s",
+        "shield_done": "\U0001f6e1 \u0633\u067e\u0631 \u0627\u06cc\u0631\u0627\u0646 %s \u0634\u062f.",
+        "mute_on": "\U0001f515 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc \u0628\u0631\u0627\u06cc %d \u062f\u0642\u06cc\u0642\u0647 \u0628\u06cc\u200c\u0635\u062f\u0627 \u0634\u062f.",
+        "mute_off": "\U0001f50a \u0647\u0634\u062f\u0627\u0631\u0647\u0627 \u0648\u0635\u0644 \u0634\u062f.",
+        "lang_set": "\u2705 \u0632\u0628\u0627\u0646 \u0641\u0627\u0631\u0633\u06cc \u0634\u062f.",
+        "logs_tail": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627\u06cc %s (\u0622\u062e\u0631\u06cc\u0646 %d \u062e\u0637):",
+        "logs_none": "\U0001f4dc \u0644\u0627\u06af\u06cc \u0645\u0648\u062c\u0648\u062f \u0646\u06cc\u0633\u062a.",
+        "logs_usage": "\u2139 \u0637\u0631\u06cc\u0642\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /logs [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]",
+        "menu_title": "\U0001f39b <b>\u0645\u0646\u0648\u06cc \u0627\u0635\u0644\u06cc</b> \u2014 \u062f\u06a9\u0645\u0647 \u0645\u0648\u0631\u062f\u0646\u0638\u0631 \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f:",
+        "choose_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "choose_restart": "\U0001f501 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u062f\u0627\u0645 \u06a9\u0627\u0646\u0627\u0644\u061f",
+        "choose_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631 \u06a9\u062f\u0627\u0645 \u0633\u0645\u062a\u061f",
+        "choose_shield": "\U0001f6e1 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646:",
+        "ip_prompt": "\u270f \u0622\u062f\u0631\u0633\u200c\u0647\u0627\u06cc IP \u0628\u0631\u0627\u06cc \u062a\u0633\u062a \u0631\u0627 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f \u2014 \u0647\u0631 \u06a9\u062f\u0627\u0645 \u062f\u0631 \u06cc\u06a9 \u062e\u0637 (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
+        "ip_bad": "\u26a0 \u0627\u06cc\u0646 \u06cc\u06a9 IP \u0645\u0639\u062a\u0628\u0631 \u0628\u0647 \u0646\u0638\u0631 \u0646\u0645\u06cc\u200c\u0631\u0633\u062f.",
         "btn_status": "\U0001f4ca \u0648\u0636\u0639\u06cc\u062a",
         "btn_traffic": "\U0001f4c8 \u062a\u0631\u0627\u0641\u06cc\u06a9",
         "btn_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627",
@@ -3921,19 +3931,7 @@ STR = {
         "btn_lang": "\U0001f310 \u0632\u0628\u0627\u0646",
         "btn_back": "\u2b05 \u0628\u0627\u0632\u06af\u0634\u062a",
         "btn_both": "\u0647\u0631 \u062f\u0648",
-        "help": ("<b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n"
-                 "/status - \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n"
-                 "/traffic - \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u067e\u06cc\u0634\u200c\u0628\u06cc\u0646\u06cc \u0633\u0642\u0641\n"
-                 "/logs [iran|foreign] [n] - \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n"
-                 "/restart &lt;port|mgmt&gt; - \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
-                 "/repair [iran|foreign|both] - \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
-                 "/shield &lt;on|off&gt; - \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n"
-                 "/ipcheck &lt;ip&gt; - \u062a\u0633\u062a IP \u062f\u0627\u06cc\u0631\u06a9\u062a \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\n"
-                 "/mute [\u062f\u0642\u06cc\u0642\u0647] - \u0642\u0637\u0639 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\u06cc \u063a\u06cc\u0631\u0628\u062d\u0631\u0627\u0646\u06cc\n"
-                 "/lang - \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n"
-                 "/unmute - \u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n"
-                 "/menu - \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n"
-                 "/help - \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645"),
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4134,13 +4132,46 @@ def lang_kb(chat_id):
              {"text": "\u0641\u0627\u0631\u0633\u06cc", "callback_data": "lang:fa"}]]
 
 
-def do_ipcheck(chat_id, ip):
-    ok_n, ir_n, avg = ipcheck(ip)
-    if ok_n is None:
-        send(chat_id, tr(chat_id, "ipcheck_fail", s=html.escape(str(ir_n))))
-    else:
-        send(chat_id, tr(chat_id, "ipcheck_result", ip=ip, d=ok_n,
-                         dd=ir_n if ir_n else 0, s=avg))
+def parse_ips(text):
+    out = []
+    for tok in re.split(r"[\s,]+", text or ""):
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def do_ipcheck(chat_id, raw):
+    ips = parse_ips(raw)
+    if not ips:
+        send(chat_id, tr(chat_id, "ip_bad"))
+        return
+    capped = len(ips) > 5
+    ips = ips[:5]
+    mid = None
+    if len(ips) > 1:
+        try:
+            r = tg("sendMessage", {"chat_id": chat_id, "text": tr(chat_id, "ipcheck_progress", d=len(ips))})
+            mid = (r.get("result") or {}).get("message_id")
+        except Exception:
+            mid = None
+    lines = []
+    for ip in ips:
+        ok_n, ir_n, avg = ipcheck(ip)
+        if ok_n is None:
+            lines.append("\u274C <code>%s</code> \u2014 %s" % (esc(ip), tr(chat_id, "ipcheck_fail", s=esc(str(ir_n)))))
+        else:
+            lines.append("\U0001F310 <code>%s</code> \u2014 <b>%d/%d</b> \u00b7 %s %s" % (esc(ip), ok_n, ir_n if ir_n else 0, tr(chat_id, "avg_l"), esc(avg)))
+    if capped:
+        lines.append("\u26A0 " + tr(chat_id, "ipcheck_more"))
+    text = "\U0001F310 <b>IP Check</b>\n" + "\n".join(lines)
+    if mid:
+        try:
+            tg("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": text,
+                                   "parse_mode": "HTML", "disable_web_page_preview": True})
+            return
+        except Exception:
+            pass
+    send(chat_id, text)
 
 
 CMDS_EN = [
@@ -4263,81 +4294,71 @@ def status_text(chat_id):
     now = datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M")
     loc = local_report()
     irn = iran_report()
-    out = ["<b>PG Tunnel</b> - %s (Tehran)" % now, ""]
-    for role, rep in ((label(chat_id, "foreign"), loc), (label(chat_id, "iran"), irn)):
+    sep = "\u2500" * 18
+    out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
+           "\U0001F4C5 %s (%s)" % (now, tr(chat_id, "tehran_t")), sep, ""]
+    for role_key, rep in (("foreign", loc), ("iran", irn)):
+        icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
+        name = tr(chat_id, role_key)
         if rep is None:
-            out.append("<b>%s:</b> %s" % (role, tr(chat_id, "tunnel_unreachable")
-                                          if role != label(chat_id, "foreign")
-                                          else tr(chat_id, "failed")))
+            msg = tr(chat_id, "failed") if role_key == "foreign" else tr(chat_id, "tunnel_unreachable")
+            out.append("\U0001F534 <b>%s</b> \u2014 %s" % (esc(name), msg))
             out.append("")
             continue
         up = fmt_uptime(rep.get("UPTIME_SEC", 0))
-        out.append("<b>%s:</b> %s | %s %s" % (role, esc(rep.get("VERSION", "?")),
-                                              tr(chat_id, "up"), up))
+        out.append("%s <b>%s</b> \u2014 %s \u00b7 %s %s" % (icon, esc(name), esc(rep.get("VERSION", "?")), tr(chat_id, "up"), up))
         chans = sorted(k for k in rep if k.startswith("CHANNEL_"))
         if chans:
-            vals = " | ".join("%s %s" % (k.replace("CHANNEL_DATA_", "").replace("CHANNEL_", ""),
-                                         esc(rep[k])) for k in chans)
-            out.append("  %s: %s" % (tr(chat_id, "channels"), vals))
+            vals = " ".join(("\U0001F7E2" if rep[k] == "active" else "\U0001F534") + "<code>%s</code>" % esc(k.replace("CHANNEL_DATA_", "").replace("CHANNEL_", "")) for k in chans)
+            out.append("  %s %s" % (tr(chat_id, "channels"), vals))
         if rep.get("TLS_SERVER"):
-            out.append("  %s: %s :%s | %s %s" % (tr(chat_id, "tls"), esc(rep["TLS_SERVER"]),
-                                                 esc(rep.get("SEC_SSH", "?")),
-                                                 tr(chat_id, "sessions"),
-                                                 esc(rep.get("TLS_SESSIONS", "?"))))
+            out.append("  %s: %s <code>:%s</code> \u00b7 %s %s" % (tr(chat_id, "tls"), esc(rep["TLS_SERVER"]), esc(rep.get("SEC_SSH", "?")), tr(chat_id, "sessions"), esc(rep.get("TLS_SESSIONS", "?"))))
         if "WATCHDOG" in rep:
-            out.append("  %s: %s" % (tr(chat_id, "watchdog"),
-                                     esc(rep.get("WATCHDOG", "?"))))
+            out.append("  %s: %s" % (tr(chat_id, "watchdog"), esc(rep.get("WATCHDOG", "?"))))
         if "SHIELD" in rep:
-            out.append("  %s: %s | %s: %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")),
-                                              tr(chat_id, "cert"),
-                                              esc(rep.get("CERT_DAYS_LEFT", "?"))))
+            out.append("  %s: %s \u00b7 %s: %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")), tr(chat_id, "cert"), esc(rep.get("CERT_DAYS_LEFT", "?"))))
         if "BIND_POOL" in rep:
             out.append("  %s: %s" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?"))))
-        out.append("  %s: %s | %s: %s" % (tr(chat_id, "cron"), esc(rep.get("CRON", "?")),
-                                          tr(chat_id, "tuning"), esc(rep.get("TUNING", "?"))))
-        out.append("  %s: D %s / U %s (%s %s)" % (
-            tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
-            fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
-            esc(rep.get("TRAFFIC_SINCE", "?"))))
+        total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
+        avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
+        if total > 0:
+            out.append("  \U0001F4A0 %s: %d%% \u00b7 %s: %s%%" % (tr(chat_id, "ram_l"), avail * 100 // total, tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
+        out.append("  %s \u00b7 %s" % (tr(chat_id, "cron") + ": " + esc(rep.get("CRON", "?")), esc(rep.get("TUNING", "?"))))
+        out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
         if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
-            out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"),
-                                          rep.get("AUTH_FAILS_24H"),
-                                          html.escape(rep.get("AUTH_TOP_24H", "")) or "-"))
+            out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"), esc(rep.get("AUTH_FAILS_24H")), esc(rep.get("AUTH_TOP_24H", "")) or "-"))
         out.append("")
     return "\n".join(out)
 
-
 def traffic_text(chat_id):
-    out = ["<b>Traffic</b>", ""]
+    out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"), ""]
     for role in ("foreign", "iran"):
         rep = local_report() if role == "foreign" else iran_report()
-        name = label(chat_id, role)
+        icon = "\U0001F30D" if role == "foreign" else "\U0001F1EE\U0001F1F7"
+        name = tr(chat_id, role)
         if rep is None:
-            out.append("<b>%s:</b> %s" % (name, tr(chat_id, "no_data")))
+            out.append("\U0001F534 <b>%s</b> \u2014 %s" % (esc(name), tr(chat_id, "no_data")))
+            out.append("")
             continue
-        out.append("<b>%s:</b> D %s / U %s (%s %s)" % (
-            name, fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
-            fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
-            esc(rep.get("TRAFFIC_SINCE", "?"))))
+        out.append("%s <b>%s</b>" % (icon, esc(name)))
+        out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
         per = rep.get("PER_IP", "")
         if per:
             for item in per.split(","):
                 if ":" in item:
                     ip, b = item.rsplit(":", 1)
-                    out.append("  %s: %s" % (html.escape(ip), fmt_bytes(b)))
+                    out.append("  \U0001F464 %s \u2014 %s" % (esc(ip), fmt_bytes(b)))
         cap = CFG.get("CAP_FOREIGN_GB" if role == "foreign" else "CAP_IRAN_GB", "0")
         try:
             capf = float(cap)
         except Exception:
             capf = 0.0
         if capf > 0:
-            used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) +
-                    float(rep.get("TRAFFIC_TX_B", 0) or 0)) / (1024 ** 3)
+            used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) + float(rep.get("TRAFFIC_TX_B", 0) or 0)) / (1024 ** 3)
             pct = int(used * 100 / capf)
-            out.append("  cap: %d%% of %g GB" % (pct, capf))
+            out.append("  \U0001F3AF %s: %d%% / %g GB" % (tr(chat_id, "cap_l"), pct, capf))
         out.append("")
     return "\n".join(out)
-
 
 def logs_text(chat_id, args):
     target = "foreign"
@@ -4360,9 +4381,8 @@ def logs_text(chat_id, args):
         body = ssh_iran("journalctl -u pg-tls-server -u pg-tunnel-watchdog --no-pager -n %d -o cat 2>/dev/null | tail -n %d" % (n, n)) or ""
     if not body.strip():
         return tr(chat_id, "logs_none")
-    head = tr(chat_id, "logs_tail", s=target, d=n)
+    head = "\U0001F4DC <b>PG Tunnel \u2014 %s</b> (%s, %d)\n%s" % (tr(chat_id, "logs_h"), esc(target), n, "\u2500" * 18)
     return head + "\n<pre>" + html.escape(body[-3200:]) + "</pre>"
-
 
 def ipcheck(ip):
     try:
@@ -4564,7 +4584,7 @@ def handle_update(upd):
     if aw and time.time() - aw < 180:
         STATE["await"].pop(str(chat), None)
         if not cmd.startswith("/"):
-            if re.fullmatch(r"[0-9.]+", text):
+            if re.search(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", text):
                 do_ipcheck(chat, text)
             else:
                 send(chat, tr(chat, "ip_bad"))
@@ -4592,10 +4612,10 @@ def handle_update(upd):
         STATE["mute"][str(chat)] = 0
         send(chat, tr(chat, "mute_off"))
     elif cmd == "/ipcheck":
-        if not args or not re.fullmatch(r"[0-9.]+", args[0]):
+        if not args:
             send(chat, tr(chat, "ipcheck_usage"))
             return
-        do_ipcheck(chat, args[0])
+        do_ipcheck(chat, " ".join(args))
     elif cmd == "/restart":
         if not args:
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/restart"))
@@ -4732,7 +4752,7 @@ def daily_report():
         extra.append(gh)
     if extra:
         body += "\n" + "\n".join("! " + e for e in extra)
-    broadcast("%s %s\n\n%s" % ("Daily:", title, body), critical=True)
+    broadcast("\U0001F4C5 <b>Daily</b> \u2014 %s\n\n%s" % (title, body), critical=True)
 
 
 def github_check():
