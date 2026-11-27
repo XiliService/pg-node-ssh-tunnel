@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.2
+# PG Node SSH Tunnel Manager v8.3
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -37,11 +37,14 @@
 #       running pg-tls-server (our own service) was falsely reported
 #       as an external occupant (ss -p shows only the comm name);
 #       ownership is now resolved via the listener PID cmdline
+# v8.3: Raise TLS-server memory caps 192M/256M -> 384M/512M (the old
+#       cap throttled the proxy under real load and flapped the
+#       reverse channels); one-time live heal for existing installs
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.2"
+SCRIPT_VERSION="8.3"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2094,6 +2097,22 @@ release_iran_tunnel_ports() {
     fi
 }
 
+heal_tls_memory_caps() {
+    # v8.3: the v7.9 MemoryHigh=192M cap proved too tight for the real
+    # working set of the TLS camouflage server under production load
+    # (constant memory.high reclaim stalled the single-threaded proxy
+    # and flapped the reverse channels ~once an hour). Raise the caps
+    # on existing installs once - applied live via set-property, so no
+    # service restart and zero downtime. Idempotent.
+    [[ -f "$TLS_SERVER_SERVICE" ]] || return 0
+    if grep -q "MemoryHigh=192M" "$TLS_SERVER_SERVICE" 2>/dev/null; then
+        sed -i 's/MemoryHigh=192M/MemoryHigh=384M/; s/MemoryMax=256M/MemoryMax=512M/' "$TLS_SERVER_SERVICE"
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl set-property pg-tls-server.service MemoryHigh=384M MemoryMax=512M >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 migrate_existing_state() {
     if [[ -f "$TUNNEL_SERVICE" ]]; then
         local changed=0
@@ -2181,6 +2200,9 @@ migrate_existing_state() {
         sysctl --system >/dev/null 2>&1 || true
     fi
     ensure_network_tuning >/dev/null 2>&1 || true
+
+    # v8.3: raise the too-tight TLS server memory caps (live, no restart).
+    heal_tls_memory_caps
 }
 
 bootstrap_existing_accounting() {
@@ -2225,6 +2247,7 @@ handle_cli_subcommands() {
             if [[ -f "$IRAN_CONF" ]]; then
                 local OUT_IP="" NODE_PORT="62075" DATA_PORTS="" SEC_SSH="" TLS_SNI="" TLS_SECRET=""
                 source "$IRAN_CONF"
+                heal_tls_memory_caps
                 if ! systemctl is-active --quiet ssh.service; then
                     systemctl restart ssh.service 2>/dev/null || true
                 fi
@@ -2498,8 +2521,8 @@ ProtectSystem=strict
 ReadWritePaths=/etc/pg-tunnel
 ProtectHome=true
 PrivateTmp=true
-MemoryHigh=192M
-MemoryMax=256M
+MemoryHigh=384M
+MemoryMax=512M
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
