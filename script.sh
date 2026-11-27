@@ -77,11 +77,17 @@
 # v8.12: release-marker bump only - validates the in-bot '/update'
 #       flow end to end on BOTH servers (button + command, custom
 #       branch ref, result panel, post-reply bot-sync)
+# v8.13: Bot per-server submenus: Status/Traffic (and every combined
+#       report button) now ask Foreign / Iran / Both, so each message
+#       shows one server; /status and /traffic take a scope argument.
+#       Status is now terminal-parity: report gained TLS_TARGET,
+#       TLS_SNI, AUTH_MODE, NODE_PORT, DATA_PORTS, LATEST_LOG
+#       (foreign) and SSH_PORTS, TUNNEL_LOCAL_PORTS, NAT_RULES (iran)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.12"
+SCRIPT_VERSION="8.13"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1587,6 +1593,22 @@ emit_server_report() {
         _tls=$(systemctl is-active pg-tls-server 2>/dev/null || true)
         echo "TLS_SERVER=${_tls:-unknown}"
         echo "SEC_SSH=${SEC_SSH:-unknown}"
+        echo "TLS_SNI=${TLS_SNI:-N/A}"
+        if [[ -n "${TLS_SECRET:-}" ]]; then
+            echo "AUTH_MODE=Trojan-Auth+WebCamo"
+        else
+            echo "AUTH_MODE=Legacy"
+        fi
+        echo "SSH_PORTS=$(ss -tlnp 2>/dev/null | awk '/sshd/ && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')"
+        echo "TUNNEL_LOCAL_PORTS=$(ss -tlnp 2>/dev/null | awk '/sshd/ && ($4 ~ /^127\./ || $4 ~ /^\[::1\]/) {sub(/.*:/,"",$4); if(!seen[$4]++) out=out (out?", ":"") $4} END{print out ? out : "None"}')"
+        local _nat=""
+        _nat=$(iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | awk '
+            NR > 2 && NF >= 10 {
+                rule = "#" $1 " " $4 " -> " $10
+                if ($4 == "REDIRECT") rule = rule ":" $12 " => :" $NF
+                print rule " (pkts:" $2 ", " $3 ")"
+            }' | head -n 6 | paste -sd ';' - || true)
+        echo "NAT_RULES=${_nat}"
         _wd="missing"
         [[ -f "$WATCHDOG_STATE" ]] && _wd=$(head -1 "$WATCHDOG_STATE" 2>/dev/null)
         echo "WATCHDOG=${_wd%%|*}"
@@ -1627,6 +1649,19 @@ emit_server_report() {
         done
         echo "BIND_POOL=${BIND_IPS:-default}"
         echo "LAST_GOOD=$(cat "$LAST_GOOD_IP_FILE" 2>/dev/null || echo none)"
+        echo "TLS_TARGET=${IR_IP:-N/A}:${SEC_SSH:-N/A}"
+        echo "TLS_SNI=${TLS_SNI:-N/A}"
+        if [[ -n "${TLS_SECRET:-}" ]]; then
+            echo "AUTH_MODE=Secret+WS-Camo"
+        else
+            echo "AUTH_MODE=Legacy"
+        fi
+        echo "NODE_PORT=${NODE_PORT:-N/A}"
+        echo "DATA_PORTS=${DATA_PORTS:-N/A}"
+        local _ll=""
+        _ll=$(journalctl -u pg-tunnel-mgmt --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
+        [[ -z "$_ll" && -f "$TUNNEL_SERVICE" ]] && _ll=$(journalctl -u reverse-tunnel --no-pager -n 1 --output=cat 2>/dev/null | cut -c1-56 || true)
+        echo "LATEST_LOG=${_ll}"
         _cr=disabled
         [[ -f "$CRON_FILE" ]] && _cr=$(head -1 "$CRON_FILE" | awk '{print $1}')
         echo "CRON=${_cr}"
@@ -3782,7 +3817,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.12"
+BOT_REV = "8.13"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3899,6 +3934,19 @@ STR = {
         "logs_usage": "\u2139 Usage: /logs [iran|foreign] [lines]",
         "menu_title": "\U0001f39b <b>Main menu</b> \u2014 tap a button:",
         "choose_logs": "\U0001f4dc Which server's logs?",
+        "choose_status": "\U0001f4ca Which server's status?",
+        "choose_traffic": "\U0001f4c8 Traffic for which server?",
+        "tls_target": "\U0001f3af TLS target",
+        "cover_l": "\U0001f5bc Cover domain",
+        "auth_l": "Auth",
+        "ports_l": "\U0001f50c Ports",
+        "node_l": "Node",
+        "data_l": "Data",
+        "local_l": "Local",
+        "last_good_l": "last good",
+        "per_ip_l": "\U0001f464 Per-IP",
+        "nat_l": "\U0001f9ef NAT rules",
+        "last_log_l": "\U0001f4c4 Last log",
         "choose_restart": "\U0001f501 Restart which channel?",
         "choose_repair": "\U0001f6e0 Repair which side?",
         "choose_shield": "\U0001f6e1 Iran port-22 shield:",
@@ -3922,7 +3970,7 @@ STR = {
         "update_ref_prompt": "\u270f Send the branch name or commit SHA to update from (valid 3 min):",
         "update_ref_bad": "\u26a0 Invalid ref \u2014 letters, digits, dot, dash, slash, underscore only.",
         "update_done": "\u2b05 <b>Update result:</b>\n%s",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status \u2014 full status of both servers\n\U0001f4c8 /traffic \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\u2753 /help \u2014 this message",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\u2753 /help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -3987,6 +4035,19 @@ STR = {
         "logs_usage": "\u2139 \u0637\u0631\u06cc\u0642\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /logs [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]",
         "menu_title": "\U0001f39b <b>\u0645\u0646\u0648\u06cc \u0627\u0635\u0644\u06cc</b> \u2014 \u062f\u06a9\u0645\u0647 \u0645\u0648\u0631\u062f\u0646\u0638\u0631 \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f:",
         "choose_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "choose_status": "\U0001f4ca \u0648\u0636\u0639\u06cc\u062a \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "choose_traffic": "\U0001f4c8 \u062a\u0631\u0627\u0641\u06cc\u06a9 \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "tls_target": "\U0001f3af \u0647\u062f\u0641 TLS",
+        "cover_l": "\U0001f5bc \u062f\u0627\u0645\u0646\u0647 \u067e\u0648\u0634\u0634\u06cc",
+        "auth_l": "\u0627\u062d\u0631\u0627\u0632 \u0647\u0648\u06cc\u062a",
+        "ports_l": "\U0001f50c \u067e\u0648\u0631\u062a\u200c\u0647\u0627",
+        "node_l": "\u0646\u0648\u062f",
+        "data_l": "\u062f\u06cc\u062a\u0627",
+        "local_l": "\u0644\u0648\u06a9\u0627\u0644",
+        "last_good_l": "\u0622\u062e\u0631\u06cc\u0646 \u0633\u0627\u0644\u0645",
+        "per_ip_l": "\U0001f464 \u062a\u0641\u06a9\u06cc\u06a9 IP",
+        "nat_l": "\U0001f9ef \u0642\u0648\u0627\u0646\u06cc\u0646 NAT",
+        "last_log_l": "\U0001f4c4 \u0622\u062e\u0631\u06cc\u0646 \u0644\u0627\u06af",
         "choose_restart": "\U0001f501 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u062f\u0627\u0645 \u06a9\u0627\u0646\u0627\u0644\u061f",
         "choose_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631 \u06a9\u062f\u0627\u0645 \u0633\u0645\u062a\u061f",
         "choose_shield": "\U0001f6e1 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646:",
@@ -4010,7 +4071,7 @@ STR = {
         "update_ref_prompt": "\u270f \u0646\u0627\u0645 \u0634\u0627\u062e\u0647 \u06cc\u0627 SHA \u06a9\u0627\u0645\u06cc\u062a \u0631\u0627 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
         "update_ref_bad": "\u26a0 \u0646\u0627\u0645\u0639\u062a\u0628\u0631 \u2014 \u0641\u0642\u0637 \u062d\u0631\u0641\u060c \u0631\u0642\u0645\u060c . _ / - .",
         "update_done": "\u2b05 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0622\u067e\u062f\u06cc\u062a:</b>\n%s",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4194,6 +4255,13 @@ def logs_kb(chat_id):
             ] + back_kb(chat_id)
 
 
+def scope_kb(chat_id, kind):
+    return [[{"text": trb(chat_id, "foreign"), "callback_data": "m:%s:foreign" % kind},
+             {"text": trb(chat_id, "iran"), "callback_data": "m:%s:iran" % kind},
+             {"text": trb(chat_id, "btn_both"), "callback_data": "m:%s:both" % kind}]
+            ] + back_kb(chat_id)
+
+
 def repair_kb(chat_id):
     return [[{"text": trb(chat_id, "foreign"), "callback_data": "m:repair:foreign"},
              {"text": trb(chat_id, "iran"), "callback_data": "m:repair:iran"},
@@ -4265,8 +4333,8 @@ def do_ipcheck(chat_id, raw):
 
 CMDS_EN = [
     ("menu", "Button panel - all actions"),
-    ("status", "Full status of both servers"),
-    ("traffic", "Traffic usage and per-IP"),
+    ("status", "Full status [both|iran|foreign]"),
+    ("traffic", "Traffic usage and per-IP [scope]"),
     ("logs", "Recent tunnel logs [iran|foreign] [n]"),
     ("restart", "Restart a channel <port|mgmt>"),
     ("repair", "Repair services [iran|foreign|both]"),
@@ -4281,8 +4349,8 @@ CMDS_EN = [
 
 CMDS_FA = [
     ("menu", "\u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc \u2014 \u0647\u0645\u0647\u200c\u06cc \u06a9\u0627\u0631\u0647\u0627"),
-    ("status", "\u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631"),
-    ("traffic", "\u0645\u0635\u0631\u0641 \u062a\u0631\u0627\u0641\u06cc\u06a9 \u0648 \u062a\u0641\u06a9\u06cc\u06a9 IP"),
+    ("status", "\u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
+    ("traffic", "\u0645\u0635\u0631\u0641 \u0648 \u062a\u0641\u06a9\u06cc\u06a9 IP [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
     ("logs", "\u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631 \u062a\u0627\u0646\u0644 [iran|foreign] [\u062a\u0639\u062f\u0627\u062f]"),
     ("restart", "\u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 <port|mgmt>"),
     ("repair", "\u062a\u0639\u0645\u06cc\u0631 \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627 [iran|foreign|both]"),
@@ -4381,14 +4449,17 @@ def label(chat_id, role):
     return tr(chat_id, "iran" if role == "iran" else "foreign")
 
 
-def status_text(chat_id):
+def status_text(chat_id, scope="both"):
     now = datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M")
-    loc = local_report()
-    irn = iran_report()
+    reps = []
+    if scope in ("both", "foreign"):
+        reps.append(("foreign", local_report()))
+    if scope in ("both", "iran"):
+        reps.append(("iran", iran_report()))
     sep = "\u2500" * 18
     out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
            "\U0001F4C5 %s (%s)" % (now, tr(chat_id, "tehran_t")), sep, ""]
-    for role_key, rep in (("foreign", loc), ("iran", irn)):
+    for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
         if rep is None:
@@ -4409,21 +4480,48 @@ def status_text(chat_id):
         if "SHIELD" in rep:
             out.append("  %s: %s \u00b7 %s: %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")), tr(chat_id, "cert"), esc(rep.get("CERT_DAYS_LEFT", "?"))))
         if "BIND_POOL" in rep:
-            out.append("  %s: %s" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?"))))
+            out.append("  %s: %s (%s: %s)" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?")), tr(chat_id, "last_good_l"), esc(rep.get("LAST_GOOD", "-"))))
+        if rep.get("TLS_TARGET"):
+            out.append("  \U0001F3AF %s: <code>%s</code> \u00b7 %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "tls_target"), esc(rep.get("TLS_TARGET", "?")), tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+        elif rep.get("TLS_SNI"):
+            out.append("  \U0001F5BC %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+        if rep.get("NODE_PORT"):
+            out.append("  \U0001F50C %s: %s <code>%s</code> \u00b7 %s <code>%s</code>" % (tr(chat_id, "ports_l"), tr(chat_id, "node_l"), esc(rep.get("NODE_PORT", "?")), tr(chat_id, "data_l"), esc(rep.get("DATA_PORTS", "?"))))
+        if rep.get("SSH_PORTS"):
+            out.append("  \U0001F50C %s: SSH [<code>%s</code>] \u00b7 %s [<code>%s</code>]" % (tr(chat_id, "ports_l"), esc(rep.get("SSH_PORTS", "?")), tr(chat_id, "local_l"), esc(rep.get("TUNNEL_LOCAL_PORTS", "?"))))
         total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         if total > 0:
             out.append("  \U0001F4A0 %s: %d%% \u00b7 %s: %s%%" % (tr(chat_id, "ram_l"), avail * 100 // total, tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
         out.append("  %s \u00b7 %s" % (tr(chat_id, "cron") + ": " + esc(rep.get("CRON", "?")), esc(rep.get("TUNING", "?"))))
         out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
+        per = rep.get("PER_IP", "")
+        if per:
+            items = []
+            for item in per.split(","):
+                if ":" in item:
+                    ip, b = item.rsplit(":", 1)
+                    items.append("%s \u2014 %s" % (esc(ip), fmt_bytes(b)))
+            if items:
+                out.append("  \U0001F464 %s: %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
+        for nat_item in (x.strip() for x in rep.get("NAT_RULES", "").split(";")):
+            if nat_item:
+                out.append("  \U0001F9EF <code>%s</code>" % esc(nat_item))
+        if rep.get("LATEST_LOG"):
+            out.append("  \U0001F4C4 %s: %s" % (tr(chat_id, "last_log_l"), esc(rep.get("LATEST_LOG", ""))))
         if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
             out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"), esc(rep.get("AUTH_FAILS_24H")), esc(rep.get("AUTH_TOP_24H", "")) or "-"))
         out.append("")
     return "\n".join(out)
 
-def traffic_text(chat_id):
+def traffic_text(chat_id, scope="both"):
     out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"), ""]
-    for role in ("foreign", "iran"):
+    roles = []
+    if scope in ("both", "foreign"):
+        roles.append("foreign")
+    if scope in ("both", "iran"):
+        roles.append("iran")
+    for role in roles:
         rep = local_report() if role == "foreign" else iran_report()
         icon = "\U0001F30D" if role == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role)
@@ -4623,12 +4721,22 @@ def handle_update(upd):
                 show_main_menu(chat)
             return
         if data == "m:status":
-            if not kb_edit(chat, mid, status_text(chat), main_menu_kb(chat)):
-                send(chat, status_text(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_status"), scope_kb(chat, "status")):
+                kb_send(chat, tr(chat, "choose_status"), scope_kb(chat, "status"))
+            return
+        if data.startswith("m:status:"):
+            scope = data.split(":", 2)[2]
+            if not kb_edit(chat, mid, status_text(chat, scope), main_menu_kb(chat)):
+                send(chat, status_text(chat, scope))
             return
         if data == "m:traffic":
-            if not kb_edit(chat, mid, traffic_text(chat), main_menu_kb(chat)):
-                send(chat, traffic_text(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_traffic"), scope_kb(chat, "traffic")):
+                kb_send(chat, tr(chat, "choose_traffic"), scope_kb(chat, "traffic"))
+            return
+        if data.startswith("m:traffic:"):
+            scope = data.split(":", 2)[2]
+            if not kb_edit(chat, mid, traffic_text(chat, scope), main_menu_kb(chat)):
+                send(chat, traffic_text(chat, scope))
             return
         if data == "m:logs":
             if not kb_edit(chat, mid, tr(chat, "choose_logs"), logs_kb(chat)):
@@ -4750,9 +4858,9 @@ def handle_update(upd):
     elif cmd == "/help":
         send(chat, tr(chat, "help"))
     elif cmd == "/status":
-        send(chat, status_text(chat))
+        send(chat, status_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
     elif cmd == "/traffic":
-        send(chat, traffic_text(chat))
+        send(chat, traffic_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
     elif cmd == "/logs":
         send(chat, logs_text(chat, args))
     elif cmd == "/lang":
@@ -5008,6 +5116,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 PYEOF
     chmod 644 "${TG_BOT_PY}"
