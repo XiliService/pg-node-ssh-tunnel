@@ -138,11 +138,17 @@
 #       (no timestamps), so during a live incident an OLD restart-storm
 #       tail was indistinguishable from a fresh one. Both log paths now
 #       render with timestamps ('-o short')
+# v8.24: Unified message format (user request): every panel now uses
+#       the Resources style - bullet lines '- <b>Label:</b> value',
+#       one header icon + server flags only, field icons removed
+#       (38 STR labels cleaned EN+FA); ipcheck lines bulleted, help
+#       dropped per-command icons. Functional markers kept: channel
+#       up/down dots and alert icons
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.23"
+SCRIPT_VERSION="8.24"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3936,7 +3942,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.23"
+BOT_REV = "8.24"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4003,18 +4009,18 @@ STR = {
         "foreign": "FOREIGN",
         "iran": "IRAN",
         "up": "up",
-        "channels": "\U0001f7e2 Channels",
-        "cron": "\u2699 Cron",
+        "channels": "Channels",
+        "cron": "Cron",
         "tuning": "Tuning",
-        "traffic": "\U0001f4e6 Traffic",
+        "traffic": "Traffic",
         "since": "since",
-        "tls": "\U0001f512 TLS",
+        "tls": "TLS",
         "sessions": "sessions",
-        "watchdog": "\U0001f9ae Watchdog",
-        "shield": "\U0001f6e1 Shield",
-        "cert": "\U0001f4dc Cert",
-        "attacks": "\U0001f44a Attacks 24h",
-        "bind_pool": "\U0001f310 Bind",
+        "watchdog": "Watchdog",
+        "shield": "Shield",
+        "cert": "Cert",
+        "attacks": "Attacks 24h",
+        "bind_pool": "Bind",
         "rebooted": "\U0001f6a8 <b>REBOOT:</b> %s server restarted (uptime reset).",
         "oom": "\U0001f6a8 <b>OOM KILL:</b> %s kernel killed process %s.",
         "channel_down": "\U0001f6a8 <b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
@@ -4038,10 +4044,10 @@ STR = {
         "btn_resources": "\U0001f5a5 Resources",
         "choose_resources": "\U0001f5a5 Resources for which server?",
         "res_h": "Resources",
-        "cpu_l": "\U0001f9e0 CPU",
-        "swap_l": "\U0001f504 Swap",
-        "procs_l": "\U0001f465 Procs",
-        "top_l": "\U0001f3cb Top RAM",
+        "cpu_l": "CPU",
+        "swap_l": "Swap",
+        "procs_l": "Procs",
+        "top_l": "Top RAM",
         "load_l": "load",
         "cores_l": "cores",
         "avail_l": "avail",
@@ -4066,17 +4072,17 @@ STR = {
         "choose_logs": "\U0001f4dc Which server's logs?",
         "choose_status": "\U0001f4ca Which server's status?",
         "choose_traffic": "\U0001f4c8 Traffic for which server?",
-        "tls_target": "\U0001f3af TLS target",
-        "cover_l": "\U0001f5bc Cover domain",
+        "tls_target": "TLS target",
+        "cover_l": "Cover domain",
         "auth_l": "Auth",
-        "ports_l": "\U0001f50c Ports",
+        "ports_l": "Ports",
         "node_l": "Node",
         "data_l": "Data",
         "local_l": "Local",
         "last_good_l": "last good",
-        "per_ip_l": "\U0001f464 Per-IP",
-        "nat_l": "\U0001f9ef NAT rules",
-        "last_log_l": "\U0001f4c4 Last log",
+        "per_ip_l": "Per-IP",
+        "nat_l": "NAT rules",
+        "last_log_l": "Last log",
         "choose_restart": "\U0001f501 Restart which channel?",
         "choose_repair": "\U0001f6e0 Repair which side?",
         "choose_shield": "\U0001f6e1 Iran port-22 shield:",
@@ -4105,7 +4111,7 @@ STR = {
         "btn_refresh": "\U0001f504 Refresh",
         "choose_optimize": "\U0001f680 Run the optimizer on which server?",
         "optimize_done": "\U0001f680 <b>Optimizer result:</b>\n%s",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt|all&gt; \u2014 restart channel(s) (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n\u2753 /help \u2014 this message",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n/menu \u2014 button panel\n/status [both|iran|foreign] \u2014 full status\n/traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n/logs [iran|foreign] [n] \u2014 recent logs\n/restart &lt;port|mgmt|all&gt; \u2014 restart channel(s)\n/repair [iran|foreign|both] \u2014 revive dead services\n/shield &lt;on|off&gt; \u2014 Iran port-22 shield\n/ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n/mute [min] \xb7 /unmute \u2014 alert control\n/lang \u2014 switch language\n/update [ref] [both|iran|foreign] \u2014 update script from GitHub\n/optimize [both|iran|foreign] \u2014 apply kernel tuning\n/resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n/help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -4120,18 +4126,18 @@ STR = {
         "foreign": "\u062e\u0627\u0631\u062c",
         "iran": "\u0627\u06cc\u0631\u0627\u0646",
         "up": "\u0641\u0639\u0627\u0644",
-        "channels": "\U0001f7e2 \u06a9\u0627\u0646\u0627\u0644\u200c\u0647\u0627",
-        "cron": "\u2699 \u06a9\u0631\u0648\u0646",
+        "channels": "\u06a9\u0627\u0646\u0627\u0644\u200c\u0647\u0627",
+        "cron": "\u06a9\u0631\u0648\u0646",
         "tuning": "\u062a\u06cc\u0648\u0646\u06cc\u0646\u06af",
-        "traffic": "\U0001f4e6 \u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "traffic": "\u062a\u0631\u0627\u0641\u06cc\u06a9",
         "since": "\u0627\u0632",
-        "tls": "\U0001f512 TLS",
+        "tls": "TLS",
         "sessions": "\u062c\u0644\u0633\u0647",
-        "watchdog": "\U0001f9ae \u0648\u0627\u0686\u200c\u062f\u0627\u06af",
-        "shield": "\U0001f6e1 \u0633\u067e\u0631",
-        "cert": "\U0001f4dc \u06af\u0648\u0627\u0647\u06cc",
-        "attacks": "\U0001f44a \u062d\u0645\u0644\u0627\u062a \u06f2\u06f4\u0633",
-        "bind_pool": "\U0001f310 \u0628\u0627\u06cc\u0646\u062f",
+        "watchdog": "\u0648\u0627\u0686\u200c\u062f\u0627\u06af",
+        "shield": "\u0633\u067e\u0631",
+        "cert": "\u06af\u0648\u0627\u0647\u06cc",
+        "attacks": "\u062d\u0645\u0644\u0627\u062a \u06f2\u06f4\u0633",
+        "bind_pool": "\u0628\u0627\u06cc\u0646\u062f",
         "rebooted": "\U0001f6a8 <b>\u0631\u06cc\u0628\u0648\u062a \u062a\u0634\u062e\u06cc\u0635 \u062f\u0627\u062f\u0647 \u0634\u062f:</b> \u0633\u0631\u0648\u0631 %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u0634\u062f (\u0622\u067e\u200c\u062a\u0627\u06cc\u0645 \u0635\u0641\u0631 \u0634\u062f).",
         "oom": "\U0001f6a8 <b>\u06a9\u0634\u062a\u0646 \u067e\u0631\u0648\u0633\u0647 \u062a\u0648\u0633\u0637 OOM:</b> \u06a9\u0631\u0646\u0644 %s \u067e\u0631\u0648\u0633\u0647\u200c\u06cc %s \u0631\u0627 \u06a9\u0634\u062a.",
         "channel_down": "\U0001f6a8 <b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
@@ -4155,10 +4161,10 @@ STR = {
         "btn_resources": "\U0001f5a5 \u0645\u0646\u0627\u0628\u0639",
         "choose_resources": "\U0001f5a5 \u0645\u0646\u0627\u0628\u0639 \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
         "res_h": "\u0645\u0646\u0627\u0628\u0639",
-        "cpu_l": "\U0001f9e0 \u067e\u0631\u062f\u0627\u0632\u0646\u062f\u0647",
-        "swap_l": "\U0001f504 \u0633\u0648\u0627\u067e",
-        "procs_l": "\U0001f465 \u067e\u0631\u0648\u0633\u0647\u200c\u0647\u0627",
-        "top_l": "\U0001f3cb \u067e\u0631\u0645\u0635\u0631\u0641\u200c\u062a\u0631\u06cc\u0646 RAM",
+        "cpu_l": "\u067e\u0631\u062f\u0627\u0632\u0646\u062f\u0647",
+        "swap_l": "\u0633\u0648\u0627\u067e",
+        "procs_l": "\u067e\u0631\u0648\u0633\u0647\u200c\u0647\u0627",
+        "top_l": "\u067e\u0631\u0645\u0635\u0631\u0641\u200c\u062a\u0631\u06cc\u0646 RAM",
         "load_l": "\u0628\u0627\u0631",
         "cores_l": "\u0647\u0633\u062a\u0647",
         "avail_l": "\u0622\u0632\u0627\u062f",
@@ -4183,17 +4189,17 @@ STR = {
         "choose_logs": "\U0001f4dc \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
         "choose_status": "\U0001f4ca \u0648\u0636\u0639\u06cc\u062a \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
         "choose_traffic": "\U0001f4c8 \u062a\u0631\u0627\u0641\u06cc\u06a9 \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
-        "tls_target": "\U0001f3af \u0647\u062f\u0641 TLS",
-        "cover_l": "\U0001f5bc \u062f\u0627\u0645\u0646\u0647 \u067e\u0648\u0634\u0634\u06cc",
+        "tls_target": "\u0647\u062f\u0641 TLS",
+        "cover_l": "\u062f\u0627\u0645\u0646\u0647 \u067e\u0648\u0634\u0634\u06cc",
         "auth_l": "\u0627\u062d\u0631\u0627\u0632 \u0647\u0648\u06cc\u062a",
-        "ports_l": "\U0001f50c \u067e\u0648\u0631\u062a\u200c\u0647\u0627",
+        "ports_l": "\u067e\u0648\u0631\u062a\u200c\u0647\u0627",
         "node_l": "\u0646\u0648\u062f",
         "data_l": "\u062f\u06cc\u062a\u0627",
         "local_l": "\u0644\u0648\u06a9\u0627\u0644",
         "last_good_l": "\u0622\u062e\u0631\u06cc\u0646 \u0633\u0627\u0644\u0645",
-        "per_ip_l": "\U0001f464 \u062a\u0641\u06a9\u06cc\u06a9 IP",
-        "nat_l": "\U0001f9ef \u0642\u0648\u0627\u0646\u06cc\u0646 NAT",
-        "last_log_l": "\U0001f4c4 \u0622\u062e\u0631\u06cc\u0646 \u0644\u0627\u06af",
+        "per_ip_l": "\u062a\u0641\u06a9\u06cc\u06a9 IP",
+        "nat_l": "\u0642\u0648\u0627\u0646\u06cc\u0646 NAT",
+        "last_log_l": "\u0622\u062e\u0631\u06cc\u0646 \u0644\u0627\u06af",
         "choose_restart": "\U0001f501 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u062f\u0627\u0645 \u06a9\u0627\u0646\u0627\u0644\u061f",
         "choose_repair": "\U0001f6e0 \u062a\u0639\u0645\u06cc\u0631 \u06a9\u062f\u0627\u0645 \u0633\u0645\u062a\u061f",
         "choose_shield": "\U0001f6e1 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646:",
@@ -4222,7 +4228,7 @@ STR = {
         "btn_refresh": "\U0001f504 \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc",
         "choose_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u0631\u0648\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631 \u0627\u062c\u0631\u0627 \u0634\u0648\u062f\u061f",
         "optimize_done": "\U0001f680 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc:</b>\n%s",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt|all&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0627\u0646\u0627\u0644(\u200c\u0647\u0627) (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n/menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n/status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644\n/traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n/logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n/restart &lt;port|mgmt|all&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0627\u0646\u0627\u0644(\u200c\u0647\u0627)\n/repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647\n/shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646\n/ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n/mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n/lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n/update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub\n/optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644\n/resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n/help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4485,16 +4491,16 @@ def do_ipcheck(chat_id, raw):
             time.sleep(1.5)  # gentle spacing: bursts trigger rate limits
         ok_n, ir_n, avg = ipcheck(ip)
         if ok_n is None:
-            lines.append("\u274C <code>%s</code> \u2014 %s" % (esc(ip), tr(chat_id, "ipcheck_fail", s=esc(str(ir_n)))))
+            lines.append("- <code>%s</code> \u2014 %s" % (esc(ip), tr(chat_id, "ipcheck_fail", s=esc(str(ir_n)))))
         else:
             if ok_n:
                 tail = "%s %s" % (tr(chat_id, "avg_l"), esc(avg))
             else:
                 tail = tr(chat_id, "ip_no_reply")
-            lines.append("\U0001F310 <code>%s</code> \u2014 <b>%d/%d</b> \u00b7 %s" % (esc(ip), ok_n, ir_n if ir_n else 0, tail))
+            lines.append("- <code>%s</code> \u2014 <b>%d/%d</b> \u00b7 %s" % (esc(ip), ok_n, ir_n if ir_n else 0, tail))
     if capped:
-        lines.append("\u26A0 " + tr(chat_id, "ipcheck_more"))
-    text = "\U0001F310 <b>IP Check</b>\n" + "\n".join(lines)
+        lines.append(tr(chat_id, "ipcheck_more"))
+    text = "\U0001F310 <b>PG Tunnel \u2014 IP Check</b>\n" + "\u2500" * 18 + "\n\n" + "\n".join(lines)
     if mid:
         try:
             tg("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": text,
@@ -4629,14 +4635,14 @@ def label(chat_id, role):
 
 def status_text(chat_id, scope="both"):
     now = datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M")
+    sep = "\u2500" * 18
+    out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
+           sep, ""]
     reps = []
     if scope in ("both", "foreign"):
         reps.append(("foreign", local_report()))
     if scope in ("both", "iran"):
         reps.append(("iran", iran_report()))
-    sep = "\u2500" * 18
-    out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
-           "\U0001F4C5 %s (%s)" % (now, tr(chat_id, "tehran_t")), sep, ""]
     for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
@@ -4650,35 +4656,35 @@ def status_text(chat_id, scope="both"):
         chans = sorted(k for k in rep if k.startswith("CHANNEL_"))
         if chans:
             vals = " ".join(("\U0001F7E2" if rep[k] == "active" else "\U0001F534") + "<code>%s</code>" % esc(k.replace("CHANNEL_DATA_", "").replace("CHANNEL_", "")) for k in chans)
-            out.append("  %s %s" % (tr(chat_id, "channels"), vals))
-        if rep.get("TLS_SERVER"):
-            out.append("  %s: %s <code>:%s</code> \u00b7 %s %s" % (tr(chat_id, "tls"), esc(rep["TLS_SERVER"]), esc(rep.get("SEC_SSH", "?")), tr(chat_id, "sessions"), esc(rep.get("TLS_SESSIONS", "?"))))
-        if "WATCHDOG" in rep:
-            out.append("  %s: %s" % (tr(chat_id, "watchdog"), esc(rep.get("WATCHDOG", "?"))))
-        if "SHIELD" in rep:
-            out.append("  %s: %s \u00b7 %s: %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")), tr(chat_id, "cert"), esc(rep.get("CERT_DAYS_LEFT", "?"))))
+            out.append("- <b>%s:</b> %s" % (tr(chat_id, "channels"), vals))
         if "BIND_POOL" in rep:
-            out.append("  %s: %s (%s: %s)" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?")), tr(chat_id, "last_good_l"), esc(rep.get("LAST_GOOD", "-"))))
+            out.append("- <b>%s:</b> %s (%s: %s)" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?")), tr(chat_id, "last_good_l"), esc(rep.get("LAST_GOOD", "-"))))
         if rep.get("TLS_TARGET"):
-            out.append("  %s: <code>%s</code> \u00b7 %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "tls_target"), esc(rep.get("TLS_TARGET", "?")), tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+            out.append("- <b>%s:</b> <code>%s</code> \u00b7 %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "tls_target"), esc(rep.get("TLS_TARGET", "?")), tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
         elif rep.get("TLS_SNI"):
-            out.append("  %s: <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
+            out.append("- <b>%s:</b> <code>%s</code> \u00b7 %s: %s" % (tr(chat_id, "cover_l"), esc(rep.get("TLS_SNI", "?")), tr(chat_id, "auth_l"), esc(rep.get("AUTH_MODE", "-"))))
         if rep.get("NODE_PORT"):
-            out.append("  %s: %s <code>%s</code> \u00b7 %s <code>%s</code>" % (tr(chat_id, "ports_l"), tr(chat_id, "node_l"), esc(rep.get("NODE_PORT", "?")), tr(chat_id, "data_l"), esc(rep.get("DATA_PORTS", "?"))))
+            out.append("- <b>%s:</b> %s <code>%s</code> \u00b7 %s <code>%s</code>" % (tr(chat_id, "ports_l"), tr(chat_id, "node_l"), esc(rep.get("NODE_PORT", "?")), tr(chat_id, "data_l"), esc(rep.get("DATA_PORTS", "?"))))
         if rep.get("SSH_PORTS"):
-            out.append("  %s: SSH [<code>%s</code>] \u00b7 %s [<code>%s</code>]" % (tr(chat_id, "ports_l"), esc(rep.get("SSH_PORTS", "?")), tr(chat_id, "local_l"), esc(rep.get("TUNNEL_LOCAL_PORTS", "?"))))
+            out.append("- <b>%s:</b> SSH [<code>%s</code>] \u00b7 %s [<code>%s</code>]" % (tr(chat_id, "ports_l"), esc(rep.get("SSH_PORTS", "?")), tr(chat_id, "local_l"), esc(rep.get("TUNNEL_LOCAL_PORTS", "?"))))
+        if rep.get("TLS_SERVER"):
+            out.append("- <b>%s:</b> %s <code>:%s</code> \u00b7 %s %s" % (tr(chat_id, "tls"), esc(rep["TLS_SERVER"]), esc(rep.get("SEC_SSH", "?")), tr(chat_id, "sessions"), esc(rep.get("TLS_SESSIONS", "?"))))
+        if "WATCHDOG" in rep:
+            out.append("- <b>%s:</b> %s" % (tr(chat_id, "watchdog"), esc(rep.get("WATCHDOG", "?"))))
+        if "SHIELD" in rep:
+            out.append("- <b>%s:</b> %s \u00b7 <b>%s:</b> %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")), tr(chat_id, "cert"), esc(rep.get("CERT_DAYS_LEFT", "?"))))
         total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         if total > 0:
-            out.append("  \U0001F4A0 %s: %d%% \u00b7 %s: %s%%" % (tr(chat_id, "ram_l"), avail * 100 // total, tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
+            out.append("- <b>%s:</b> %d%% \u00b7 <b>%s:</b> %s%%" % (tr(chat_id, "ram_l"), avail * 100 // total, tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
         _cv = str(rep.get("CRON", "?"))
         if " " not in _cv and _cv.isdigit():
-            _cv = "@:" + _cv.zfill(2)  # pre-v8.22 minute-only value
+            _cv = "@:" + _cv.zfill(2)
         _tz = str(rep.get("SRV_TZ", ""))
         if _tz and _tz not in ("unknown", ""):
             _cv = "%s (%s)" % (_cv, _tz)
-        out.append("  %s \u00b7 %s" % (tr(chat_id, "cron") + ": " + esc(_cv), esc(rep.get("TUNING", "?"))))
-        out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
+        out.append("- <b>%s:</b> %s \u00b7 %s" % (tr(chat_id, "cron"), esc(_cv), esc(rep.get("TUNING", "?"))))
+        out.append("- <b>%s:</b> %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
         per = rep.get("PER_IP", "")
         if per:
             items = []
@@ -4687,19 +4693,25 @@ def status_text(chat_id, scope="both"):
                     ip, b = item.rsplit(":", 1)
                     items.append("%s \u2014 %s" % (esc(ip), fmt_bytes(b)))
             if items:
-                out.append("  %s: %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
+                out.append("- <b>%s:</b> %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
+        nat_first = True
         for nat_item in (x.strip() for x in rep.get("NAT_RULES", "").split(";")):
             if nat_item:
-                out.append("  \U0001F9EF <code>%s</code>" % esc(nat_item))
+                if nat_first:
+                    out.append("- <b>%s:</b> <code>%s</code>" % (tr(chat_id, "nat_l"), esc(nat_item)))
+                    nat_first = False
+                else:
+                    out.append("  <code>%s</code>" % esc(nat_item))
         if rep.get("LATEST_LOG"):
-            out.append("  %s: %s" % (tr(chat_id, "last_log_l"), esc(rep.get("LATEST_LOG", ""))))
+            out.append("- <b>%s:</b> %s" % (tr(chat_id, "last_log_l"), esc(rep.get("LATEST_LOG", ""))))
         if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
-            out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"), esc(rep.get("AUTH_FAILS_24H")), esc(rep.get("AUTH_TOP_24H", "")) or "-"))
+            out.append("- <b>%s:</b> %s (%s)" % (tr(chat_id, "attacks"), esc(rep.get("AUTH_FAILS_24H")), esc(rep.get("AUTH_TOP_24H", "")) or "-"))
         out.append("")
     return "\n".join(out)
 
 def traffic_text(chat_id, scope="both"):
-    out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"), ""]
+    out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"),
+           "\u2500" * 18, ""]
     roles = []
     if scope in ("both", "foreign"):
         roles.append("foreign")
@@ -4714,13 +4726,16 @@ def traffic_text(chat_id, scope="both"):
             out.append("")
             continue
         out.append("%s <b>%s</b>" % (icon, esc(name)))
-        out.append("  %s: %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
+        out.append("- <b>%s:</b> %s / %s \u00b7 %s %s" % (tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)), fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"), esc(rep.get("TRAFFIC_SINCE", "?"))))
         per = rep.get("PER_IP", "")
         if per:
+            items = []
             for item in per.split(","):
                 if ":" in item:
                     ip, b = item.rsplit(":", 1)
-                    out.append("  \U0001F464 %s \u2014 %s" % (esc(ip), fmt_bytes(b)))
+                    items.append("%s \u2014 %s" % (esc(ip), fmt_bytes(b)))
+            if items:
+                out.append("- <b>%s:</b> %s" % (tr(chat_id, "per_ip_l"), " \u00b7 ".join(items)))
         cap = CFG.get("CAP_FOREIGN_GB" if role == "foreign" else "CAP_IRAN_GB", "0")
         try:
             capf = float(cap)
@@ -4729,7 +4744,7 @@ def traffic_text(chat_id, scope="both"):
         if capf > 0:
             used = (float(rep.get("TRAFFIC_RX_B", 0) or 0) + float(rep.get("TRAFFIC_TX_B", 0) or 0)) / (1024 ** 3)
             pct = int(used * 100 / capf)
-            out.append("  \U0001F3AF %s: %d%% / %g GB" % (tr(chat_id, "cap_l"), pct, capf))
+            out.append("- <b>%s:</b> %d%% / %g GB" % (tr(chat_id, "cap_l"), pct, capf))
         out.append("")
     return "\n".join(out)
 
@@ -4754,8 +4769,6 @@ def resources_text(chat_id, scope="both"):
         l5 = str(rep.get("LOAD5", "?"))
         l15 = str(rep.get("LOAD15", "?"))
         if "?" in (l5, l15):
-            # pre-v8.18 reports packed LOAD1/5/15 on one line, so LOAD5/15
-            # ended up inside the LOAD1 value; recover them when present.
             m5 = re.search(r"LOAD5=([0-9.]+)", l1)
             m15 = re.search(r"LOAD15=([0-9.]+)", l1)
             l1 = l1.split()[0] if l1.split() else "?"
@@ -4767,29 +4780,28 @@ def resources_text(chat_id, scope="both"):
         cores = rep.get("CPU_CORES", "")
         tail = (" \u00b7 %s %s" % (cores, tr(chat_id, "cores_l"))) if cores else ""
         if rep.get("CPU_USAGE_PCT"):
-            out.append("  %s: %s%% \u00b7 %s %s%s" % (tr(chat_id, "cpu_l"), esc(rep.get("CPU_USAGE_PCT", "?")), tr(chat_id, "load_l"), load, tail))
+            out.append("- <b>%s:</b> %s%% \u00b7 %s %s%s" % (tr(chat_id, "cpu_l"), esc(rep.get("CPU_USAGE_PCT", "?")), tr(chat_id, "load_l"), load, tail))
         else:
-            out.append("  %s: %s %s%s" % (tr(chat_id, "cpu_l"), tr(chat_id, "load_l"), load, tail))
+            out.append("- <b>%s:</b> %s %s%s" % (tr(chat_id, "cpu_l"), tr(chat_id, "load_l"), load, tail))
         total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
         avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
         used = int(rep.get("RAM_USED_KB", str(total - avail)) or 0)
         if total > 0:
-            out.append("  \U0001F4A0 %s: %s / %s (%d%%) \u00b7 %s %s" % (tr(chat_id, "ram_l"), fmt_bytes(used * 1024), fmt_bytes(total * 1024), used * 100 // total, tr(chat_id, "avail_l"), fmt_bytes(avail * 1024)))
+            out.append("- <b>%s:</b> %s / %s (%d%%) \u00b7 %s %s" % (tr(chat_id, "ram_l"), fmt_bytes(used * 1024), fmt_bytes(total * 1024), used * 100 // total, tr(chat_id, "avail_l"), fmt_bytes(avail * 1024)))
         st = int(rep.get("SWAP_TOTAL_KB", "0") or 0)
         sf = int(rep.get("SWAP_FREE_KB", "0") or 0)
         if st > 0:
-            out.append("  %s: %s / %s" % (tr(chat_id, "swap_l"), fmt_bytes((st - sf) * 1024), fmt_bytes(st * 1024)))
+            out.append("- <b>%s:</b> %s / %s" % (tr(chat_id, "swap_l"), fmt_bytes((st - sf) * 1024), fmt_bytes(st * 1024)))
         if rep.get("DISK_TOTAL_GB"):
-            out.append("  \U0001F4BE %s: %s / %s GB (%s%%)" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_USED_GB", "?")), esc(rep.get("DISK_TOTAL_GB", "?")), esc(rep.get("DISK_PCT", "?"))))
+            out.append("- <b>%s:</b> %s / %s GB (%s%%)" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_USED_GB", "?")), esc(rep.get("DISK_TOTAL_GB", "?")), esc(rep.get("DISK_PCT", "?"))))
         else:
-            out.append("  \U0001F4BE %s: %s%%" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
+            out.append("- <b>%s:</b> %s%%" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
         if rep.get("PROCS"):
-            out.append("  %s: %s" % (tr(chat_id, "procs_l"), esc(rep.get("PROCS", "?"))))
+            out.append("- <b>%s:</b> %s" % (tr(chat_id, "procs_l"), esc(rep.get("PROCS", "?"))))
         if rep.get("TOP_RSS"):
-            out.append("  %s: %s" % (tr(chat_id, "top_l"), " \u00b7 ".join(esc(x) for x in rep.get("TOP_RSS", "").split(",") if x)))
+            out.append("- <b>%s:</b> %s" % (tr(chat_id, "top_l"), " \u00b7 ".join(esc(x) for x in rep.get("TOP_RSS", "").split(",") if x)))
         out.append("")
     return "\n".join(out)
-
 
 def logs_text(chat_id, args):
     target = "foreign"
@@ -5497,6 +5509,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
