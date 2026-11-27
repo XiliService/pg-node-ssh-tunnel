@@ -103,11 +103,17 @@
 #       label instead of 'avg -', requests 12 nodes (more Iranian
 #       coverage) and the status panel no longer doubles the icons on
 #       TLS target / ports / cover domain / per-IP / last log lines
+# v8.17: Bot Resources panel: new 'Resources' button + '/resources
+#       [both|iran|foreign]' (per-server submenu + live refresh)
+#       showing CPU usage% (sampled), load, cores, RAM used/total/
+#       avail, swap, disk used/total, process count and top-RSS
+#       processes; report gained CPU_USAGE_PCT, CPU_CORES,
+#       RAM_USED_KB, SWAP_*, DISK_*_GB, PROCS, TOP_RSS
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.16"
+SCRIPT_VERSION="8.17"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1593,10 +1599,23 @@ emit_server_report() {
     echo "VERSION=v${SCRIPT_VERSION}"
     echo "HOST=$(hostname 2>/dev/null || echo unknown)"
     echo "UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
-    awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\n", t+0, a+0}' /proc/meminfo 2>/dev/null || true
-    echo "DISK_PCT=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5+0}')"
+    awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\nRAM_USED_KB=%d\n", t+0, a+0, (t-a)+0}' /proc/meminfo 2>/dev/null || true
+    awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "SWAP_TOTAL_KB=%d\nSWAP_FREE_KB=%d\n", t+0, f+0}' /proc/meminfo 2>/dev/null || true
+    df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); printf "DISK_PCT=%d\nDISK_USED_GB=%.1f\nDISK_TOTAL_GB=%.1f\n", $5+0, $3/1048576, $2/1048576}' || true
     read -r _l1 _l5 _l15 _rest < /proc/loadavg 2>/dev/null || true
     echo "LOAD1=${_l1:-0} LOAD5=${_l5:-0} LOAD15=${_l15:-0}"
+    # v8.17: live CPU usage sampled from /proc/stat over 0.3s (idle+iowait
+    # vs total deltas); cores, process count and top-RSS processes.
+    local _cs1 _cs2 _cp _tp
+    _cs1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat 2>/dev/null || echo "0 0")
+    sleep 0.3
+    _cs2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat 2>/dev/null || echo "0 0")
+    _cp=$(awk -v a="$_cs1" -v b="$_cs2" 'BEGIN{split(a,x," "); split(b,y," "); dt=y[1]-x[1]; di=y[2]-x[2]; if (dt<=0) print 0; else printf "%d", (100*(dt-di))/dt}')
+    echo "CPU_USAGE_PCT=${_cp:-0}"
+    echo "CPU_CORES=$(nproc 2>/dev/null || echo 1)"
+    echo "PROCS=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)"
+    _tp=$(ps -eo rss,comm --sort=-rss 2>/dev/null | awk 'NR>1{m=int($1/1024); if(m<1) next; printf "%s:%dMB,", $2, m; if(++n>=3) exit}' | sed 's/,$//')
+    echo "TOP_RSS=${_tp}"
     local _oom
     _oom=$(dmesg -T 2>/dev/null | grep -i "out of memory" | tail -1 | grep -oE "Killed process [0-9]+ \([^)]+\)" | grep -oE "\([^)]+\)" | tr -d '()' || true)
     echo "OOM_KILLED=${_oom:-none}"
@@ -3850,7 +3869,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.16"
+BOT_REV = "8.17"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3949,6 +3968,16 @@ STR = {
         "ipcheck_progress": "\u23f3 Testing %d IP(s) \u2014 please wait...",
         "ipcheck_more": "Max 5 IPs per test \u2014 extra ones skipped.",
         "ip_no_reply": "no ping reply (ICMP filtered or lost)",
+        "btn_resources": "\U0001f5a5 Resources",
+        "choose_resources": "\U0001f5a5 Resources for which server?",
+        "res_h": "Resources",
+        "cpu_l": "\U0001f9e0 CPU",
+        "swap_l": "\U0001f504 Swap",
+        "procs_l": "\U0001f465 Procs",
+        "top_l": "\U0001f3cb Top RAM",
+        "load_l": "load",
+        "cores_l": "cores",
+        "avail_l": "avail",
         "ipcheck_fail": "failed (%s)",
         "ipcheck_usage": "\u2139 Usage: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 or several IPs, one per line",
         "not_allowed": "\u26d4 Unauthorized. This chat is not in the allow list.",
@@ -4008,7 +4037,7 @@ STR = {
         "btn_refresh": "\U0001f504 Refresh",
         "choose_optimize": "\U0001f680 Run the optimizer on which server?",
         "optimize_done": "\U0001f680 <b>Optimizer result:</b>\n%s",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\u2753 /help \u2014 this message",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n\u2753 /help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -4055,6 +4084,16 @@ STR = {
         "ipcheck_progress": "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u0633\u062a %d \u0622\u062f\u0631\u0633 IP \u2014 \u06a9\u0645\u06cc \u0635\u0628\u0631 \u06a9\u0646\u06cc\u062f...",
         "ipcheck_more": "\u062d\u062f\u0627\u06a9\u062b\u0631 \u06f5 IP \u062f\u0631 \u0647\u0631 \u062a\u0633\u062a \u2014 \u0628\u0642\u06cc\u0647 \u0646\u0627\u062f\u06cc\u062f\u0647 \u06af\u0631\u0641\u062a\u0647 \u0634\u062f\u0646\u062f.",
         "ip_no_reply": "\u067e\u0627\u0633\u062e\u06cc \u0627\u0632 \u067e\u06cc\u0646\u06af \u0646\u06cc\u0627\u0645\u062f (ICMP \u0641\u06cc\u0644\u062a\u0631 \u06cc\u0627 \u06af\u0645\u200c\u0634\u062f\u0647)",
+        "btn_resources": "\U0001f5a5 \u0645\u0646\u0627\u0628\u0639",
+        "choose_resources": "\U0001f5a5 \u0645\u0646\u0627\u0628\u0639 \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631\u061f",
+        "res_h": "\u0645\u0646\u0627\u0628\u0639",
+        "cpu_l": "\U0001f9e0 \u067e\u0631\u062f\u0627\u0632\u0646\u062f\u0647",
+        "swap_l": "\U0001f504 \u0633\u0648\u0627\u067e",
+        "procs_l": "\U0001f465 \u067e\u0631\u0648\u0633\u0647\u200c\u0647\u0627",
+        "top_l": "\U0001f3cb \u067e\u0631\u0645\u0635\u0631\u0641\u200c\u062a\u0631\u06cc\u0646 RAM",
+        "load_l": "\u0628\u0627\u0631",
+        "cores_l": "\u0647\u0633\u062a\u0647",
+        "avail_l": "\u0622\u0632\u0627\u062f",
         "ipcheck_fail": "\u0646\u0627\u0645\u0648\u0641\u0642 (%s)",
         "ipcheck_usage": "\u2139 \u0637\u0631\u06cc\u0642\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647: /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u06cc\u0627 \u0686\u0646\u062f IP\u060c \u0647\u0631 \u06a9\u062f\u0627\u0645 \u062f\u0631 \u06cc\u06a9 \u062e\u0637",
         "not_allowed": "\u26d4 \u063a\u06cc\u0631\u0645\u062c\u0627\u0632. \u0627\u06cc\u0646 \u0686\u062a \u062f\u0631 \u0644\u06cc\u0633\u062a \u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a.",
@@ -4114,7 +4153,7 @@ STR = {
         "btn_refresh": "\U0001f504 \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc",
         "choose_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u0631\u0648\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631 \u0627\u062c\u0631\u0627 \u0634\u0648\u062f\u061f",
         "optimize_done": "\U0001f680 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc:</b>\n%s",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F5A5 /resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4272,7 +4311,8 @@ def main_menu_kb(chat_id):
         [{"text": trb(chat_id, "btn_restart"), "callback_data": "m:restart"},
          {"text": trb(chat_id, "btn_repair"), "callback_data": "m:repair"},
          {"text": trb(chat_id, "btn_shield"), "callback_data": "m:shield"}],
-        [{"text": trb(chat_id, "btn_optimize"), "callback_data": "m:optimize"}],
+        [{"text": trb(chat_id, "btn_optimize"), "callback_data": "m:optimize"},
+         {"text": trb(chat_id, "btn_resources"), "callback_data": "m:resources"}],
         [{"text": trb(chat_id, "btn_update"), "callback_data": "m:update"},
          {"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
          {"text": trb(chat_id, "btn_lang"), "callback_data": "m:lang"}],
@@ -4311,6 +4351,12 @@ def status_result_kb(chat_id, scope):
     # same m:status:<scope> callback, which re-fetches the reports and
     # editMessageText's this very message in place.
     return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:status:%s" % scope}]
+            ] + back_kb(chat_id)
+
+
+def resources_result_kb(chat_id, scope):
+    # Same live-refresh pattern as the status panel.
+    return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:resources:%s" % scope}]
             ] + back_kb(chat_id)
 
 
@@ -4403,6 +4449,7 @@ CMDS_EN = [
     ("lang", "Switch language EN/FA"),
     ("update", "Update script from GitHub [ref] [both|iran|foreign]"),
     ("optimize", "Apply kernel tuning [both|iran|foreign]"),
+    ("resources", "RAM/CPU/disk usage [both|iran|foreign]"),
     ("help", "Command help"),
 ]
 
@@ -4420,6 +4467,7 @@ CMDS_FA = [
     ("lang", "\u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646 EN/FA"),
     ("update", "\u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub [\u0634\u0627\u062e\u0647] [both|iran|foreign]"),
     ("optimize", "\u0627\u062c\u0631\u0627\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
+    ("resources", "\u0645\u0635\u0631\u0641 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9 [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
     ("help", "\u0631\u0627\u0647\u0646\u0645\u0627\u06cc \u062f\u0633\u062a\u0648\u0631\u0627\u062a"),
 ]
 
@@ -4608,6 +4656,51 @@ def traffic_text(chat_id, scope="both"):
             out.append("  \U0001F3AF %s: %d%% / %g GB" % (tr(chat_id, "cap_l"), pct, capf))
         out.append("")
     return "\n".join(out)
+
+def resources_text(chat_id, scope="both"):
+    sep = "\u2500" * 18
+    out = ["\U0001F5A5 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "res_h"), sep, ""]
+    reps = []
+    if scope in ("both", "foreign"):
+        reps.append(("foreign", local_report()))
+    if scope in ("both", "iran"):
+        reps.append(("iran", iran_report()))
+    for role_key, rep in reps:
+        icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
+        name = tr(chat_id, role_key)
+        if rep is None:
+            msg = tr(chat_id, "failed") if role_key == "foreign" else tr(chat_id, "tunnel_unreachable")
+            out.append("\U0001F534 <b>%s</b> \u2014 %s" % (esc(name), msg))
+            out.append("")
+            continue
+        out.append("%s <b>%s</b> \u2014 %s \u00b7 %s %s" % (icon, esc(name), esc(rep.get("VERSION", "?")), tr(chat_id, "up"), fmt_uptime(rep.get("UPTIME_SEC", 0))))
+        load = "%s/%s/%s" % (rep.get("LOAD1", "?"), rep.get("LOAD5", "?"), rep.get("LOAD15", "?"))
+        cores = rep.get("CPU_CORES", "")
+        tail = (" \u00b7 %s %s" % (cores, tr(chat_id, "cores_l"))) if cores else ""
+        if rep.get("CPU_USAGE_PCT"):
+            out.append("  %s: %s%% \u00b7 %s %s%s" % (tr(chat_id, "cpu_l"), esc(rep.get("CPU_USAGE_PCT", "?")), tr(chat_id, "load_l"), load, tail))
+        else:
+            out.append("  %s: %s %s%s" % (tr(chat_id, "cpu_l"), tr(chat_id, "load_l"), load, tail))
+        total = int(rep.get("RAM_TOTAL_KB", "0") or 0)
+        avail = int(rep.get("RAM_AVAIL_KB", "0") or 0)
+        used = int(rep.get("RAM_USED_KB", str(total - avail)) or 0)
+        if total > 0:
+            out.append("  \U0001F4A0 %s: %s / %s (%d%%) \u00b7 %s %s" % (tr(chat_id, "ram_l"), fmt_bytes(used * 1024), fmt_bytes(total * 1024), used * 100 // total, tr(chat_id, "avail_l"), fmt_bytes(avail * 1024)))
+        st = int(rep.get("SWAP_TOTAL_KB", "0") or 0)
+        sf = int(rep.get("SWAP_FREE_KB", "0") or 0)
+        if st > 0:
+            out.append("  %s: %s / %s" % (tr(chat_id, "swap_l"), fmt_bytes((st - sf) * 1024), fmt_bytes(st * 1024)))
+        if rep.get("DISK_TOTAL_GB"):
+            out.append("  \U0001F4BE %s: %s / %s GB (%s%%)" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_USED_GB", "?")), esc(rep.get("DISK_TOTAL_GB", "?")), esc(rep.get("DISK_PCT", "?"))))
+        else:
+            out.append("  \U0001F4BE %s: %s%%" % (tr(chat_id, "disk_l"), esc(rep.get("DISK_PCT", "?"))))
+        if rep.get("PROCS"):
+            out.append("  %s: %s" % (tr(chat_id, "procs_l"), esc(rep.get("PROCS", "?"))))
+        if rep.get("TOP_RSS"):
+            out.append("  %s: %s" % (tr(chat_id, "top_l"), " \u00b7 ".join(esc(x) for x in rep.get("TOP_RSS", "").split(",") if x)))
+        out.append("")
+    return "\n".join(out)
+
 
 def logs_text(chat_id, args):
     target = "foreign"
@@ -4859,6 +4952,15 @@ def handle_update(upd):
             if not kb_edit(chat, mid, traffic_text(chat, scope), main_menu_kb(chat)):
                 send(chat, traffic_text(chat, scope))
             return
+        if data == "m:resources":
+            if not kb_edit(chat, mid, tr(chat, "choose_resources"), scope_kb(chat, "resources")):
+                kb_send(chat, tr(chat, "choose_resources"), scope_kb(chat, "resources"))
+            return
+        if data.startswith("m:resources:"):
+            scope = data.split(":", 2)[2]
+            if not kb_edit(chat, mid, resources_text(chat, scope), resources_result_kb(chat, scope)):
+                kb_send(chat, resources_text(chat, scope), resources_result_kb(chat, scope))
+            return
         if data == "m:logs":
             if not kb_edit(chat, mid, tr(chat, "choose_logs"), logs_kb(chat)):
                 kb_send(chat, tr(chat, "choose_logs"), logs_kb(chat))
@@ -4992,6 +5094,9 @@ def handle_update(upd):
                 status_result_kb(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
     elif cmd == "/traffic":
         send(chat, traffic_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
+    elif cmd == "/resources":
+        scope = args[0] if args and args[0] in ("both", "iran", "foreign") else "both"
+        kb_send(chat, resources_text(chat, scope), resources_result_kb(chat, scope))
     elif cmd == "/logs":
         send(chat, logs_text(chat, args))
     elif cmd == "/lang":
@@ -5251,6 +5356,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
