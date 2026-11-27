@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.7
+# PG Node SSH Tunnel Manager v8.8
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -55,11 +55,15 @@
 # v8.7: Bot panel edits in place (editMessageText) - one live panel
 #       instead of a new message per button tap; dedup re-taps,
 #       results and confirmations render in the same message
+# v8.8: Bot engine auto-sync (BOT_REV marker + rewrite on script
+#       update - a stale engine was the cause of rendering issues);
+#       HTML-hardening: escape every report value, tag-safe
+#       truncation, plain-text fallback so a message is never lost
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.7"
+SCRIPT_VERSION="8.8"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2211,6 +2215,23 @@ diagnose_dump() {
     echo "=== END DIAGNOSTICS ==="
 }
 
+heal_tgbot_script() {
+    # Keep the deployed bot engine in sync with the script. The .py file
+    # was previously (re)written only by the install wizard, so a plain
+    # script update left an OLD bot engine running. When the embedded
+    # revision (BOT_REV) differs from the script version, rewrite the
+    # engine and restart the service. Zero impact when no bot installed.
+    [[ -f "$TG_BOT_CONF" && -f "$TG_BOT_PY" ]] || return 0
+    local cur_rev=""
+    cur_rev=$(grep -m1 '^BOT_REV = ' "$TG_BOT_PY" 2>/dev/null | cut -d'"' -f2)
+    [[ -n "$cur_rev" && "$cur_rev" == "$SCRIPT_VERSION" ]] && return 0
+    write_tgbot_script
+    if [[ -f "$TG_BOT_UNIT" ]]; then
+        systemctl restart pg-tgbot.service >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 heal_tls_memory_caps() {
     # v8.3: the v7.9 MemoryHigh=192M cap proved too tight for the real
     # working set of the TLS camouflage server under production load
@@ -2319,6 +2340,8 @@ migrate_existing_state() {
     heal_tls_memory_caps
     # v8.4: raise the too-tight data-channel caps (live, no restart).
     heal_data_memory_caps
+    # v8.8: keep the telegram bot engine in sync with the script.
+    heal_tgbot_script
 }
 
 bootstrap_existing_accounting() {
@@ -2387,6 +2410,7 @@ handle_cli_subcommands() {
             elif [[ -f "$FOREIGN_CONF" ]]; then
                 ensure_accounting_rules 2>/dev/null || true
                 heal_data_memory_caps
+                heal_tgbot_script
                 if [[ -f "$MGMT_SERVICE" ]]; then
                     if ! systemctl is-active --quiet pg-tunnel-mgmt; then
                         systemctl restart pg-tunnel-mgmt 2>/dev/null || true
@@ -3687,6 +3711,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+BOT_REV = "8.8"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3954,6 +3979,36 @@ def fmt_uptime(sec):
     return "%dm" % m
 
 
+def esc(v):
+    # Report values are interpolated into HTML messages - always escape.
+    return html.escape(str(v if v is not None else ""))
+
+
+def safe_clip(text, limit=3800):
+    # Telegram hard limit is 4096; never cut inside an HTML tag and
+    # re-close anything left open so parse_mode never breaks. Cut at
+    # 3800 to leave room for closers; pathological tag soup gets its
+    # markup stripped instead of producing hundreds of closers.
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    lt = cut.rfind("<")
+    if lt > cut.rfind(">"):
+        cut = cut[:lt]
+    cut = cut.rstrip() + " ..."
+    need = 0
+    for tag in ("b", "code", "pre", "i", "u"):
+        need += len(re.findall(r"<%s(?:\s[^>]*)?>" % tag, cut)) - cut.count("</%s>" % tag)
+    if need > 30:
+        return re.sub(r"</?(?:b|code|pre|i|u)>", "", cut)
+    for tag in ("b", "code", "pre", "i", "u"):
+        opens = len(re.findall(r"<%s(?:\s[^>]*)?>" % tag, cut))
+        closes = cut.count("</%s>" % tag)
+        if opens > closes:
+            cut += ("</%s>" % tag) * (opens - closes)
+    return cut
+
+
 def tg(method, params, timeout=20):
     url = "https://api.telegram.org/bot%s/%s" % (CFG.get("BOT_TOKEN", ""), method)
     data = json.dumps(params).encode("utf-8")
@@ -3964,16 +4019,21 @@ def tg(method, params, timeout=20):
 
 
 def send(chat_id, text):
+    text = safe_clip(text)
     try:
-        tg("sendMessage", {"chat_id": chat_id, "text": text[:3900],
+        tg("sendMessage", {"chat_id": chat_id, "text": text,
                            "parse_mode": "HTML", "disable_web_page_preview": True})
     except Exception:
-        pass
+        # Never drop a message: retry once as plain text.
+        try:
+            tg("sendMessage", {"chat_id": chat_id, "text": text})
+        except Exception:
+            pass
 
 
 def kb_send(chat_id, text, kb):
     try:
-        tg("sendMessage", {"chat_id": chat_id, "text": text[:3900],
+        tg("sendMessage", {"chat_id": chat_id, "text": safe_clip(text),
                            "parse_mode": "HTML", "disable_web_page_preview": True,
                            "reply_markup": {"inline_keyboard": kb}})
     except Exception:
@@ -3988,15 +4048,23 @@ def kb_edit(chat_id, mid, text, kb):
     key = "edit_%s" % mid
     if STATE.get(key) == text:
         return True
+    text = safe_clip(text)
     try:
         tg("editMessageText", {"chat_id": chat_id, "message_id": mid,
-                               "text": text[:3900], "parse_mode": "HTML",
+                               "text": text, "parse_mode": "HTML",
                                "disable_web_page_preview": True,
                                "reply_markup": {"inline_keyboard": kb}})
         STATE[key] = text
         return True
     except Exception:
-        return False
+        try:
+            tg("editMessageText", {"chat_id": chat_id, "message_id": mid,
+                                   "text": text,
+                                   "reply_markup": {"inline_keyboard": kb}})
+            STATE[key] = text
+            return True
+        except Exception:
+            return False
 
 
 def trb(chat_id, key):
@@ -4204,33 +4272,33 @@ def status_text(chat_id):
             out.append("")
             continue
         up = fmt_uptime(rep.get("UPTIME_SEC", 0))
-        out.append("<b>%s:</b> %s | %s %s" % (role, rep.get("VERSION", "?"),
+        out.append("<b>%s:</b> %s | %s %s" % (role, esc(rep.get("VERSION", "?")),
                                               tr(chat_id, "up"), up))
         chans = sorted(k for k in rep if k.startswith("CHANNEL_"))
         if chans:
             vals = " | ".join("%s %s" % (k.replace("CHANNEL_DATA_", "").replace("CHANNEL_", ""),
-                                         rep[k]) for k in chans)
+                                         esc(rep[k])) for k in chans)
             out.append("  %s: %s" % (tr(chat_id, "channels"), vals))
         if rep.get("TLS_SERVER"):
-            out.append("  %s: %s :%s | %s %s" % (tr(chat_id, "tls"), rep["TLS_SERVER"],
-                                                 rep.get("SEC_SSH", "?"),
+            out.append("  %s: %s :%s | %s %s" % (tr(chat_id, "tls"), esc(rep["TLS_SERVER"]),
+                                                 esc(rep.get("SEC_SSH", "?")),
                                                  tr(chat_id, "sessions"),
-                                                 rep.get("TLS_SESSIONS", "?")))
+                                                 esc(rep.get("TLS_SESSIONS", "?"))))
         if "WATCHDOG" in rep:
             out.append("  %s: %s" % (tr(chat_id, "watchdog"),
-                                     html.escape(rep.get("WATCHDOG", "?"))))
+                                     esc(rep.get("WATCHDOG", "?"))))
         if "SHIELD" in rep:
-            out.append("  %s: %s | %s: %s" % (tr(chat_id, "shield"), rep.get("SHIELD", "?"),
+            out.append("  %s: %s | %s: %s" % (tr(chat_id, "shield"), esc(rep.get("SHIELD", "?")),
                                               tr(chat_id, "cert"),
-                                              rep.get("CERT_DAYS_LEFT", "?")))
+                                              esc(rep.get("CERT_DAYS_LEFT", "?"))))
         if "BIND_POOL" in rep:
-            out.append("  %s: %s" % (tr(chat_id, "bind_pool"), rep.get("BIND_POOL", "?")))
-        out.append("  %s: %s | %s: %s" % (tr(chat_id, "cron"), rep.get("CRON", "?"),
-                                          tr(chat_id, "tuning"), rep.get("TUNING", "?")))
+            out.append("  %s: %s" % (tr(chat_id, "bind_pool"), esc(rep.get("BIND_POOL", "?"))))
+        out.append("  %s: %s | %s: %s" % (tr(chat_id, "cron"), esc(rep.get("CRON", "?")),
+                                          tr(chat_id, "tuning"), esc(rep.get("TUNING", "?"))))
         out.append("  %s: D %s / U %s (%s %s)" % (
             tr(chat_id, "traffic"), fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
             fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
-            rep.get("TRAFFIC_SINCE", "?")))
+            esc(rep.get("TRAFFIC_SINCE", "?"))))
         if rep.get("AUTH_FAILS_24H", "0") not in ("0", ""):
             out.append("  %s: %s (%s)" % (tr(chat_id, "attacks"),
                                           rep.get("AUTH_FAILS_24H"),
@@ -4250,7 +4318,7 @@ def traffic_text(chat_id):
         out.append("<b>%s:</b> D %s / U %s (%s %s)" % (
             name, fmt_bytes(rep.get("TRAFFIC_RX_B", 0)),
             fmt_bytes(rep.get("TRAFFIC_TX_B", 0)), tr(chat_id, "since"),
-            rep.get("TRAFFIC_SINCE", "?")))
+            esc(rep.get("TRAFFIC_SINCE", "?"))))
         per = rep.get("PER_IP", "")
         if per:
             for item in per.split(","):
@@ -4900,6 +4968,7 @@ EOF
                 ;;
             2)
                 if [[ -f "$TG_BOT_CONF" ]]; then
+                    write_tgbot_script
                     write_tgbot_unit
                     systemctl restart pg-tgbot.service 2>/dev/null || true
                     sleep 1
