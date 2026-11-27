@@ -117,11 +117,16 @@
 # v8.19: Restart-All: the Restart submenu gains an 'All' button
 #       ('/restart all' too) - restarts every data channel (sorted)
 #       and mgmt LAST, with a per-unit summary line
+# v8.20: one-message confirmations for COMMANDS too: /restart, /repair,
+#       /optimize, /shield, /update and the custom-ref flow now create
+#       an anchor message and edit it through prompt -> result (and
+#       cancel), exactly like button-triggered actions - no more
+#       separate confirmation messages cluttering the chat
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.19"
+SCRIPT_VERSION="8.20"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3882,7 +3887,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.19"
+BOT_REV = "8.20"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4831,17 +4836,38 @@ def confirm_and_run(chat_id, action, arg, desc, mid=None, meta=None):
     STATE["pending"][str(chat_id)] = {"action": action, "arg": arg,
                                       "data": nonce, "ts": time.time(),
                                       "mid": mid, "meta": meta}
-    kb = {"inline_keyboard": [
-        [{"text": "OK", "callback_data": nonce},
-         {"text": "Cancel", "callback_data": "cancel"}]]}
+    # v8.20: kb must be a ROW LIST - kb_edit wraps it itself. Passing a
+    # dict here double-wrapped reply_markup, the in-place edit failed on
+    # real Telegram and every confirmation fell back to a NEW message
+    # (the actual root of the separate-confirm-message complaint).
+    kb = [[{"text": "OK", "callback_data": nonce},
+           {"text": "Cancel", "callback_data": "cancel"}]]
     text = tr(chat_id, "confirm", s=desc)
     if mid and kb_edit(chat_id, mid, text, kb):
         return
     try:
         tg("sendMessage", {"chat_id": chat_id, "text": text,
-                           "parse_mode": "HTML", "reply_markup": kb})
+                           "parse_mode": "HTML",
+                           "reply_markup": {"inline_keyboard": kb}})
     except Exception:
         pass
+
+
+def confirm_inline(chat_id, action, arg, desc, meta=None):
+    # Commands arrive with no panel message to edit - the confirm prompt
+    # and the result used to land in NEW messages, cluttering the chat.
+    # Create the anchor message first (a zero-width placeholder), then
+    # run the two-step confirm inside it: prompt, cancel and result all
+    # EDIT this one message - 'everything in one message', now also for
+    # command-triggered actions. Falls back to the old behavior only if
+    # the anchor could not be sent.
+    mid = None
+    try:
+        r = tg("sendMessage", {"chat_id": chat_id, "text": "\u200b"})
+        mid = (r.get("result") or {}).get("message_id")
+    except Exception:
+        pass
+    confirm_and_run(chat_id, action, arg, desc, mid, meta)
 
 
 def finish_panel(chat_id, mid, text):
@@ -5130,9 +5156,9 @@ def handle_update(upd):
             if kind == "ref":
                 cand = text.strip().split()[0] if text.strip() else ""
                 if re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", cand):
-                    confirm_and_run(chat, "update", "both",
-                                    "pg-tunnel update-ref %s (both servers)" % cand,
-                                    None, {"ref": cand})
+                    confirm_inline(chat, "update", "both",
+                                   "pg-tunnel update-ref %s (both servers)" % cand,
+                                   {"ref": cand})
                 else:
                     send(chat, tr(chat, "update_ref_bad"))
                 return
@@ -5178,18 +5204,18 @@ def handle_update(upd):
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/restart"))
             return
         arg = args[0]
-        confirm_and_run(chat, "restart", arg, "systemctl restart pg-tunnel-* %s" % arg)
+        confirm_inline(chat, "restart", arg, "systemctl restart pg-tunnel-* %s" % arg)
     elif cmd == "/repair":
         arg = args[0] if args and args[0] in ("iran", "foreign", "both") else "both"
-        confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
+        confirm_inline(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
     elif cmd == "/optimize":
         arg = args[0] if args and args[0] in ("iran", "foreign", "both") else "both"
-        confirm_and_run(chat, "optimize", arg, "pg-tunnel optimize (%s)" % arg)
+        confirm_inline(chat, "optimize", arg, "pg-tunnel optimize (%s)" % arg)
     elif cmd == "/shield":
         if not args or args[0] not in ("on", "off"):
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/shield on|off"))
             return
-        confirm_and_run(chat, "shield", args[0], "shield %s (Iran)" % args[0])
+        confirm_inline(chat, "shield", args[0], "shield %s (Iran)" % args[0])
     elif cmd == "/update":
         ref = "main"
         scope = "both"
@@ -5203,8 +5229,8 @@ def handle_update(upd):
                     return
                 if len(args) > 1 and args[1] in ("both", "iran", "foreign"):
                     scope = args[1]
-        confirm_and_run(chat, "update", scope,
-                        "pg-tunnel update-ref %s (%s)" % (ref, scope), None,
+        confirm_inline(chat, "update", scope,
+                        "pg-tunnel update-ref %s (%s)" % (ref, scope),
                         {"ref": ref})
 
 
@@ -5413,6 +5439,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
