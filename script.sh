@@ -83,11 +83,17 @@
 #       Status is now terminal-parity: report gained TLS_TARGET,
 #       TLS_SNI, AUTH_MODE, NODE_PORT, DATA_PORTS, LATEST_LOG
 #       (foreign) and SSH_PORTS, TUNNEL_LOCAL_PORTS, NAT_RULES (iran)
+# v8.14: Bot optimizer + status refresh: new 'Optimize' menu button and
+#       '/optimize [both|iran|foreign]' (confirm) run the same tuning as
+#       terminal option 4 via non-interactive CLI 'pg-tunnel optimize'
+#       (NONINTERACTIVE=1 prints a machine-friendly last line); every
+#       status message now carries a Refresh button that re-fetches
+#       and re-renders it in place
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.13"
+SCRIPT_VERSION="8.14"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2474,6 +2480,11 @@ handle_cli_subcommands() {
             echo "[OK] bot engine synced to v${SCRIPT_VERSION}"
             exit 0
             ;;
+        optimize)
+            check_root
+            NONINTERACTIVE=1 optimizer
+            exit $?
+            ;;
         shield-off)
             check_root
             disable_brute_force_shield
@@ -3584,6 +3595,14 @@ EOF
         [[ "$(cat "$_q" 2>/dev/null || true)" != "00000000" ]] && _rps=$((_rps + 1))
     done
     echo "  RPS-Enabled RX Queues   : ${_rps}"
+    if [[ "${NONINTERACTIVE:-}" == "1" ]]; then
+        # Non-interactive path (CLI 'pg-tunnel optimize' / Telegram bot):
+        # print a single machine-friendly summary line LAST so callers
+        # that capture output (the bot shows the last line) get a
+        # meaningful result.
+        echo "[OK] optimizer applied (CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo ?), qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo ?), lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo ?))"
+        return 0
+    fi
     echo
     read -p "Press Enter to return to menu..."
 }
@@ -3817,7 +3836,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.13"
+BOT_REV = "8.14"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -3970,7 +3989,11 @@ STR = {
         "update_ref_prompt": "\u270f Send the branch name or commit SHA to update from (valid 3 min):",
         "update_ref_bad": "\u26a0 Invalid ref \u2014 letters, digits, dot, dash, slash, underscore only.",
         "update_done": "\u2b05 <b>Update result:</b>\n%s",
-        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\u2753 /help \u2014 this message",
+        "btn_optimize": "\U0001f680 Optimize",
+        "btn_refresh": "\U0001f504 Refresh",
+        "choose_optimize": "\U0001f680 Run the optimizer on which server?",
+        "optimize_done": "\U0001f680 <b>Optimizer result:</b>\n%s",
+        "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n\U0001f39b /menu \u2014 button panel\n\U0001f4ca /status [both|iran|foreign] \u2014 full status of both servers\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n\U0001f4dc /logs [iran|foreign] [n] \u2014 recent logs\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 restart one channel (confirm)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 revive dead services (confirm)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 Iran port-22 shield (confirm)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n\U0001f515 /mute [min] \xb7 \U0001f50a /unmute \u2014 alert control\n\U0001f310 /lang \u2014 switch language\n\u2b05 /update [ref] [both|iran|foreign] \u2014 update script from GitHub (confirm)\n\U0001F680 /optimize [both|iran|foreign] \u2014 apply kernel tuning (confirm)\n\u2753 /help \u2014 this message",
     },
     "fa": {
         "title": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>",
@@ -4071,7 +4094,11 @@ STR = {
         "update_ref_prompt": "\u270f \u0646\u0627\u0645 \u0634\u0627\u062e\u0647 \u06cc\u0627 SHA \u06a9\u0627\u0645\u06cc\u062a \u0631\u0627 \u0628\u0641\u0631\u0633\u062a\u06cc\u062f (\u06f3 \u062f\u0642\u06cc\u0642\u0647 \u0627\u0639\u062a\u0628\u0627\u0631):",
         "update_ref_bad": "\u26a0 \u0646\u0627\u0645\u0639\u062a\u0628\u0631 \u2014 \u0641\u0642\u0637 \u062d\u0631\u0641\u060c \u0631\u0642\u0645\u060c . _ / - .",
         "update_done": "\u2b05 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0622\u067e\u062f\u06cc\u062a:</b>\n%s",
-        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
+        "btn_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc",
+        "btn_refresh": "\U0001f504 \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc",
+        "choose_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u0631\u0648\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631 \u0627\u062c\u0631\u0627 \u0634\u0648\u062f\u061f",
+        "optimize_done": "\U0001f680 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc:</b>\n%s",
+        "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n\U0001f39b /menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n\U0001f4ca /status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644 \u0647\u0631 \u062f\u0648 \u0633\u0631\u0648\u0631\n\U0001f4c8 /traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n\U0001f4dc /logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n\U0001f501 /restart &lt;port|mgmt&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06cc\u06a9 \u06a9\u0627\u0646\u0627\u0644 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e0 /repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f6e1 /shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646 (\u0628\u0627 \u062a\u0623\u06cc\u06cc\u062f)\n\U0001f310 /ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n\U0001f515 /mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 \U0001f50a /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n\U0001f310 /lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n\u2b05 /update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\U0001F680 /optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 (\u0628\u0627 \u062a\u0627\u06cc\u06cc\u062f)\n\u2753 /help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
     },
 }
 
@@ -4229,6 +4256,7 @@ def main_menu_kb(chat_id):
         [{"text": trb(chat_id, "btn_restart"), "callback_data": "m:restart"},
          {"text": trb(chat_id, "btn_repair"), "callback_data": "m:repair"},
          {"text": trb(chat_id, "btn_shield"), "callback_data": "m:shield"}],
+        [{"text": trb(chat_id, "btn_optimize"), "callback_data": "m:optimize"}],
         [{"text": trb(chat_id, "btn_update"), "callback_data": "m:update"},
          {"text": trb(chat_id, mute_key), "callback_data": "m:mute"},
          {"text": trb(chat_id, "btn_lang"), "callback_data": "m:lang"}],
@@ -4259,6 +4287,14 @@ def scope_kb(chat_id, kind):
     return [[{"text": trb(chat_id, "foreign"), "callback_data": "m:%s:foreign" % kind},
              {"text": trb(chat_id, "iran"), "callback_data": "m:%s:iran" % kind},
              {"text": trb(chat_id, "btn_both"), "callback_data": "m:%s:both" % kind}]
+            ] + back_kb(chat_id)
+
+
+def status_result_kb(chat_id, scope):
+    # Lives under every status message: tapping refresh re-enters the
+    # same m:status:<scope> callback, which re-fetches the reports and
+    # editMessageText's this very message in place.
+    return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:status:%s" % scope}]
             ] + back_kb(chat_id)
 
 
@@ -4344,6 +4380,7 @@ CMDS_EN = [
     ("unmute", "Unmute alerts"),
     ("lang", "Switch language EN/FA"),
     ("update", "Update script from GitHub [ref] [both|iran|foreign]"),
+    ("optimize", "Apply kernel tuning [both|iran|foreign]"),
     ("help", "Command help"),
 ]
 
@@ -4360,6 +4397,7 @@ CMDS_FA = [
     ("unmute", "\u0648\u0635\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627"),
     ("lang", "\u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646 EN/FA"),
     ("update", "\u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub [\u0634\u0627\u062e\u0647] [both|iran|foreign]"),
+    ("optimize", "\u0627\u062c\u0631\u0627\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644 [\u0647\u0631 \u062f\u0648/\u062e\u0627\u0631\u062c/\u0627\u06cc\u0631\u0627\u0646]"),
     ("help", "\u0631\u0627\u0647\u0646\u0645\u0627\u06cc \u062f\u0633\u062a\u0648\u0631\u0627\u062a"),
 ]
 
@@ -4658,6 +4696,23 @@ def run_update(chat_id, scope, ref, mid=None):
         threading.Thread(target=_sync, daemon=True).start()
 
 
+def run_optimize(chat_id, scope, mid=None):
+    parts = []
+    if scope in ("foreign", "both"):
+        try:
+            r = subprocess.run([LOCAL_CMD, "optimize"], capture_output=True,
+                               text=True, timeout=300)
+            lines = (r.stdout or "").strip().splitlines()
+            parts.append("\U0001F30D " + (lines[-1] if lines else "no output"))
+        except Exception as e:
+            parts.append("\U0001F30D " + tr(chat_id, "failed") + " (%s)" % html.escape(str(e)))
+    if scope in ("iran", "both"):
+        out = ssh_iran(LOCAL_CMD + " optimize", timeout=300)
+        lines = (out or "").strip().splitlines()
+        parts.append("\U0001F1EE\U0001F1F7 " + (lines[-1] if lines else tr(chat_id, "failed")))
+    finish_panel(chat_id, mid, tr(chat_id, "optimize_done", s="\n".join(parts)))
+
+
 def run_action(chat_id, action, arg, mid=None, meta=None):
     if action == "restart":
         unit = "pg-tunnel-mgmt" if arg == "mgmt" else "pg-tunnel-data-" + arg
@@ -4685,6 +4740,8 @@ def run_action(chat_id, action, arg, mid=None, meta=None):
         finish_panel(chat_id, mid, tr(chat_id, "repair_done", s=", ".join(done) or arg))
     elif action == "update":
         run_update(chat_id, arg, (meta or {}).get("ref", "main"), mid)
+    elif action == "optimize":
+        run_optimize(chat_id, arg, mid)
     elif action == "shield":
         out = ssh_iran(LOCAL_CMD + (" shield-on" if arg == "on" else " shield-off"))
         finish_panel(chat_id, mid, tr(chat_id, "shield_done", s=arg) if out is not None
@@ -4726,8 +4783,8 @@ def handle_update(upd):
             return
         if data.startswith("m:status:"):
             scope = data.split(":", 2)[2]
-            if not kb_edit(chat, mid, status_text(chat, scope), main_menu_kb(chat)):
-                send(chat, status_text(chat, scope))
+            if not kb_edit(chat, mid, status_text(chat, scope), status_result_kb(chat, scope)):
+                kb_send(chat, status_text(chat, scope), status_result_kb(chat, scope))
             return
         if data == "m:traffic":
             if not kb_edit(chat, mid, tr(chat, "choose_traffic"), scope_kb(chat, "traffic")):
@@ -4767,6 +4824,14 @@ def handle_update(upd):
         if data.startswith("m:repair:"):
             arg = data.split(":", 2)[2]
             confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg, mid)
+            return
+        if data == "m:optimize":
+            if not kb_edit(chat, mid, tr(chat, "choose_optimize"), scope_kb(chat, "optimize")):
+                kb_send(chat, tr(chat, "choose_optimize"), scope_kb(chat, "optimize"))
+            return
+        if data.startswith("m:optimize:"):
+            arg = data.split(":", 2)[2]
+            confirm_and_run(chat, "optimize", arg, "pg-tunnel optimize (%s)" % arg, mid)
             return
         if data == "m:shield":
             if not kb_edit(chat, mid, tr(chat, "choose_shield"), shield_kb(chat)):
@@ -4858,7 +4923,8 @@ def handle_update(upd):
     elif cmd == "/help":
         send(chat, tr(chat, "help"))
     elif cmd == "/status":
-        send(chat, status_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
+        kb_send(chat, status_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"),
+                status_result_kb(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
     elif cmd == "/traffic":
         send(chat, traffic_text(chat, args[0] if args and args[0] in ("both", "iran", "foreign") else "both"))
     elif cmd == "/logs":
@@ -4888,6 +4954,9 @@ def handle_update(upd):
     elif cmd == "/repair":
         arg = args[0] if args and args[0] in ("iran", "foreign", "both") else "both"
         confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
+    elif cmd == "/optimize":
+        arg = args[0] if args and args[0] in ("iran", "foreign", "both") else "both"
+        confirm_and_run(chat, "optimize", arg, "pg-tunnel optimize (%s)" % arg)
     elif cmd == "/shield":
         if not args or args[0] not in ("on", "off"):
             send(chat, tr(chat, "ipcheck_usage").replace("/ipcheck", "/shield on|off"))
@@ -5116,6 +5185,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 PYEOF
