@@ -5268,7 +5268,7 @@ main_menu() {
     done
 }
 
-handle_cli_subcommands "${1:-}"
+handle_cli_subcommands "$@"
 check_root
 self_install
 bootstrap_existing_accounting
