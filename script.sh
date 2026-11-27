@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v8.6
+# PG Node SSH Tunnel Manager v8.7
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -52,11 +52,14 @@
 #       the balloon is kernel socket memory (sock=240MB, anon=0) from
 #       parallel forwarded connections; tight caps collapsed the
 #       channel into a 100% PSI reclaim storm during speed tests
+# v8.7: Bot panel edits in place (editMessageText) - one live panel
+#       instead of a new message per button tap; dedup re-taps,
+#       results and confirmations render in the same message
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.6"
+SCRIPT_VERSION="8.7"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3977,6 +3980,25 @@ def kb_send(chat_id, text, kb):
         pass
 
 
+def kb_edit(chat_id, mid, text, kb):
+    # Edit the existing panel message in place instead of spawning a
+    # new one for every button tap - the chat keeps a single live panel.
+    # Dedup guard: re-tapping with unchanged content is a no-op (also
+    # avoids Telegram's 'message is not modified' error).
+    key = "edit_%s" % mid
+    if STATE.get(key) == text:
+        return True
+    try:
+        tg("editMessageText", {"chat_id": chat_id, "message_id": mid,
+                               "text": text[:3900], "parse_mode": "HTML",
+                               "disable_web_page_preview": True,
+                               "reply_markup": {"inline_keyboard": kb}})
+        STATE[key] = text
+        return True
+    except Exception:
+        return False
+
+
 def trb(chat_id, key):
     d = STR.get(lang_of(chat_id), STR["en"])
     return d.get(key, STR["en"].get(key, key))
@@ -4045,7 +4067,6 @@ def lang_kb(chat_id):
 
 
 def do_ipcheck(chat_id, ip):
-    send(chat_id, "...")
     ok_n, ir_n, avg = ipcheck(ip)
     if ok_n is None:
         send(chat_id, tr(chat_id, "ipcheck_fail", s=html.escape(str(ir_n))))
@@ -4304,33 +4325,41 @@ def ipcheck(ip):
         return None, str(e), None
 
 
-def confirm_and_run(chat_id, action, arg, desc):
+def confirm_and_run(chat_id, action, arg, desc, mid=None):
     nonce = "go%d" % (int(time.time() * 1000) % 1000000000)
     STATE["pending"][str(chat_id)] = {"action": action, "arg": arg,
-                                      "data": nonce, "ts": time.time()}
+                                      "data": nonce, "ts": time.time(),
+                                      "mid": mid}
     kb = {"inline_keyboard": [
         [{"text": "OK", "callback_data": nonce},
          {"text": "Cancel", "callback_data": "cancel"}]]}
+    text = tr(chat_id, "confirm", s=desc)
+    if mid and kb_edit(chat_id, mid, text, kb):
+        return
     try:
-        tg("sendMessage", {"chat_id": chat_id,
-                           "text": tr(chat_id, "confirm", s=desc),
+        tg("sendMessage", {"chat_id": chat_id, "text": text,
                            "parse_mode": "HTML", "reply_markup": kb})
     except Exception:
         pass
 
 
-def run_action(chat_id, action, arg):
+def finish_panel(chat_id, mid, text):
+    if not (mid and kb_edit(chat_id, mid, text, main_menu_kb(chat_id))):
+        send(chat_id, text)
+
+
+def run_action(chat_id, action, arg, mid=None):
     if action == "restart":
         unit = "pg-tunnel-mgmt" if arg == "mgmt" else "pg-tunnel-data-" + arg
         try:
             r = subprocess.run(["systemctl", "restart", unit],
                                capture_output=True, text=True, timeout=90)
             if r.returncode == 0:
-                send(chat_id, tr(chat_id, "restart_done", s=arg))
+                finish_panel(chat_id, mid, tr(chat_id, "restart_done", s=arg))
             else:
-                send(chat_id, tr(chat_id, "failed"))
+                finish_panel(chat_id, mid, tr(chat_id, "failed"))
         except Exception:
-            send(chat_id, tr(chat_id, "failed"))
+            finish_panel(chat_id, mid, tr(chat_id, "failed"))
     elif action == "repair":
         done = []
         if arg in ("foreign", "both"):
@@ -4343,17 +4372,19 @@ def run_action(chat_id, action, arg):
         if arg in ("iran", "both"):
             ssh_iran(LOCAL_CMD + " cron-auto-repair", timeout=200)
             done.append("iran")
-        send(chat_id, tr(chat_id, "repair_done", s=", ".join(done) or arg))
+        finish_panel(chat_id, mid, tr(chat_id, "repair_done", s=", ".join(done) or arg))
     elif action == "shield":
         out = ssh_iran(LOCAL_CMD + (" shield-on" if arg == "on" else " shield-off"))
-        send(chat_id, tr(chat_id, "shield_done", s=arg) if out is not None
-             else tr(chat_id, "failed"))
+        finish_panel(chat_id, mid, tr(chat_id, "shield_done", s=arg) if out is not None
+                     else tr(chat_id, "failed"))
 
 
 def handle_update(upd):
     cbq = upd.get("callback_query")
     if cbq:
-        chat = cbq.get("message", {}).get("chat", {}).get("id")
+        _m = cbq.get("message") or {}
+        chat = _m.get("chat", {}).get("id")
+        mid = _m.get("message_id")
         if chat is None:
             return
         if chat not in allowed_chats():
@@ -4370,70 +4401,84 @@ def handle_update(upd):
             pass
         if data.startswith("lang:"):
             STATE["chats"][str(chat)] = data.split(":", 1)[1]
-            show_main_menu(chat, tr(chat, "lang_set"))
+            if not kb_edit(chat, mid, tr(chat, "lang_set"), main_menu_kb(chat)):
+                show_main_menu(chat, tr(chat, "lang_set"))
             return
         if data == "m:menu":
-            show_main_menu(chat)
+            if not kb_edit(chat, mid, tr(chat, "menu_title"), main_menu_kb(chat)):
+                show_main_menu(chat)
             return
         if data == "m:status":
-            send(chat, status_text(chat))
+            if not kb_edit(chat, mid, status_text(chat), main_menu_kb(chat)):
+                send(chat, status_text(chat))
             return
         if data == "m:traffic":
-            send(chat, traffic_text(chat))
+            if not kb_edit(chat, mid, traffic_text(chat), main_menu_kb(chat)):
+                send(chat, traffic_text(chat))
             return
         if data == "m:logs":
-            kb_send(chat, tr(chat, "choose_logs"), logs_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_logs"), logs_kb(chat)):
+                kb_send(chat, tr(chat, "choose_logs"), logs_kb(chat))
             return
         if data in ("m:logs:foreign", "m:logs:iran"):
-            send(chat, logs_text(chat, [data.split(":")[2]]))
+            if not kb_edit(chat, mid, logs_text(chat, [data.split(":")[2]]), back_kb(chat)):
+                send(chat, logs_text(chat, [data.split(":")[2]]))
             return
         if data == "m:ipcheck":
             STATE["await"][str(chat)] = time.time()
-            kb_send(chat, tr(chat, "ip_prompt"), back_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "ip_prompt"), back_kb(chat)):
+                kb_send(chat, tr(chat, "ip_prompt"), back_kb(chat))
             return
         if data == "m:restart":
-            kb_send(chat, tr(chat, "choose_restart"), restart_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_restart"), restart_kb(chat)):
+                kb_send(chat, tr(chat, "choose_restart"), restart_kb(chat))
             return
         if data.startswith("m:restart:"):
             arg = data.split(":", 2)[2]
             confirm_and_run(chat, "restart", arg,
-                            "systemctl restart pg-tunnel-* %s" % arg)
+                            "systemctl restart pg-tunnel-* %s" % arg, mid)
             return
         if data == "m:repair":
-            kb_send(chat, tr(chat, "choose_repair"), repair_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_repair"), repair_kb(chat)):
+                kb_send(chat, tr(chat, "choose_repair"), repair_kb(chat))
             return
         if data.startswith("m:repair:"):
             arg = data.split(":", 2)[2]
-            confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg)
+            confirm_and_run(chat, "repair", arg, "pg-tunnel cron-auto-repair %s" % arg, mid)
             return
         if data == "m:shield":
-            kb_send(chat, tr(chat, "choose_shield"), shield_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "choose_shield"), shield_kb(chat)):
+                kb_send(chat, tr(chat, "choose_shield"), shield_kb(chat))
             return
         if data.startswith("m:shield:"):
             arg = data.split(":", 2)[2]
-            confirm_and_run(chat, "shield", arg, "shield %s (Iran)" % arg)
+            confirm_and_run(chat, "shield", arg, "shield %s (Iran)" % arg, mid)
             return
         if data == "m:mute":
             STATE["mute"][str(chat)] = time.time() + 3600
-            send(chat, tr(chat, "mute_on", d=60))
+            if not kb_edit(chat, mid, tr(chat, "mute_on", d=60), main_menu_kb(chat)):
+                send(chat, tr(chat, "mute_on", d=60))
             return
         if data == "m:unmute":
             STATE["mute"][str(chat)] = 0
-            send(chat, tr(chat, "mute_off"))
+            if not kb_edit(chat, mid, tr(chat, "mute_off"), main_menu_kb(chat)):
+                send(chat, tr(chat, "mute_off"))
             return
         if data == "m:lang":
-            kb_send(chat, tr(chat, "title"), lang_kb(chat))
+            if not kb_edit(chat, mid, tr(chat, "title"), lang_kb(chat)):
+                kb_send(chat, tr(chat, "title"), lang_kb(chat))
             return
         if data == "cancel":
-            STATE["pending"].pop(str(chat), None)
-            send(chat, tr(chat, "cancelled"))
+            pend = STATE["pending"].pop(str(chat), None)
+            if not kb_edit(chat, mid, tr(chat, "cancelled"), main_menu_kb(chat)):
+                send(chat, tr(chat, "cancelled"))
             return
         pend = STATE["pending"].pop(str(chat), None)
         if (not pend or pend.get("data") != data or
                 time.time() - pend.get("ts", 0) > 120):
             send(chat, tr(chat, "cancelled"))
             return
-        run_action(chat, pend["action"], pend.get("arg"))
+        run_action(chat, pend["action"], pend.get("arg"), pend.get("mid"))
         return
     msg = upd.get("message") or upd.get("edited_message")
     if not msg or "text" not in msg:
