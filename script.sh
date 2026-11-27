@@ -72,11 +72,16 @@
 #       'set -o pipefail', killed the whole manager silently before
 #       the menu (v8.6 -> v8.10 jump on the foreign/bot server);
 #       guarded the pipeline, empty rev now falls through to the heal
+#       + main entry now passes "$@" so 'update-ref <ref>' keeps its
+#       ref (previously it silently compared against 'main')
+# v8.12: release-marker bump only - validates the in-bot '/update'
+#       flow end to end on BOTH servers (button + command, custom
+#       branch ref, result panel, post-reply bot-sync)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.11"
+SCRIPT_VERSION="8.12"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3777,7 +3782,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.11"
+BOT_REV = "8.12"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
