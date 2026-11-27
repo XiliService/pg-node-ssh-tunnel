@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# PG Node SSH Tunnel Manager v7.8
+# PG Node SSH Tunnel Manager v7.9
 # GitHub: https://github.com/XiliService/pg-node-ssh-tunnel
 # Script File: script.sh
 # English Only | Production Ready | Trojan-Style TLS 1.3 + Real Cert + Multi-IP Failover
@@ -22,11 +22,14 @@
 # v7.7: CPU-aware SSH cipher selection (AES-NI vs ChaCha20)
 # v7.8: SSH key-only wizard removed on user request (any leftover block
 #       from earlier versions is cleaned up automatically on update)
+# v7.9: Resource-efficient profile - 8MB socket buffers, systemd memory
+#       caps on every unit (kill->3s restart instead of server OOM),
+#       data channels at lower CPU weight, stale-channel auto-cleanup
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="7.8"
+SCRIPT_VERSION="7.9"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1254,6 +1257,17 @@ ensure_network_tuning() {
     [[ "$cur" == "fq" ]] || sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     cur=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)
     [[ "$cur" == "131072" ]] || sysctl -w net.ipv4.tcp_notsent_lowat=131072 >/dev/null 2>&1 || true
+    # Memory-lean socket buffers (8MB cap): clamp live values if an older
+    # optimizer set 16MB, so kernel buffer bloat cannot exhaust small VPSes.
+    local rmax wmax tmax
+    rmax=$(sysctl -n net.core.rmem_max 2>/dev/null || true)
+    [[ -z "$rmax" || "$rmax" -le 8388608 ]] || sysctl -w net.core.rmem_max=8388608 >/dev/null 2>&1 || true
+    wmax=$(sysctl -n net.core.wmem_max 2>/dev/null || true)
+    [[ -z "$wmax" || "$wmax" -le 8388608 ]] || sysctl -w net.core.wmem_max=8388608 >/dev/null 2>&1 || true
+    tmax=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}' || true)
+    [[ -z "$tmax" || "$tmax" -le 8388608 ]] || sysctl -w "net.ipv4.tcp_rmem=4096 262144 8388608" >/dev/null 2>&1 || true
+    tmax=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $3}' || true)
+    [[ -z "$tmax" || "$tmax" -le 8388608 ]] || sysctl -w "net.ipv4.tcp_wmem=4096 262144 8388608" >/dev/null 2>&1 || true
     if [[ "${1:-}" == "full" ]]; then
         local q
         for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
@@ -1425,6 +1439,45 @@ get_redirect_ports() {
         echo "$p"
         seen="${seen}${p} "
     done
+    return 0
+}
+
+cleanup_stale_data_units() {
+    # Decommission data-channel units whose port left the configured set
+    # (e.g. after reducing the channel count). Current channels untouched.
+    local keep_csv="${1:-}" f name port
+    local keep=",${keep_csv},"
+    for f in $DATA_SERVICE_GLOB; do
+        [[ -f "$f" ]] || continue
+        name=$(basename "$f" .service)
+        port="${name#pg-tunnel-data-}"
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        [[ "$keep" == *",${port},"* ]] && continue
+        systemctl stop "$name" 2>/dev/null || true
+        systemctl disable "$name" 2>/dev/null || true
+        rm -f "$f"
+        echo "  -> Removed stale channel unit (port ${port} no longer configured)."
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    return 0
+}
+
+cleanup_stale_redirects() {
+    # Remove this project's REDIRECT rules for ports that left the
+    # configured set (e.g. after reducing the channel count). Targeted -D
+    # only; unrelated rules (Docker etc.) are never touched.
+    local out_ip="${1:-}" node_port="${2:-62075}" data_ports="${3:-}"
+    local line port keep=""
+    [[ -n "$out_ip" ]] || return 0
+    while read -r port; do
+        keep="${keep},${port},"
+    done < <(get_redirect_ports "$node_port" "$data_ports")
+    while read -r line; do
+        port=$(printf '%s\n' "$line" | sed -n "s/^-A OUTPUT -d ${out_ip}\/32 -p tcp -m tcp --dport \([0-9]\+\) -j REDIRECT --to-ports [0-9]\+$/\1/p")
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        [[ "$keep" == *",${port},"* ]] && continue
+        iptables -t nat -D OUTPUT -p tcp -d "$out_ip" --dport "$port" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    done < <(iptables -t nat -S OUTPUT 2>/dev/null)
     return 0
 }
 
@@ -1986,6 +2039,15 @@ migrate_existing_state() {
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl restart ssh.service >/dev/null 2>&1 || true
     fi
+
+    # v7.9: memory-lean socket buffers (8MB per socket). Heal the persisted
+    # optimizer values and clamp live ones so upgraded servers shed the old
+    # 16MB kernel buffers automatically, without a manual Optimizer re-run.
+    if [[ -f /etc/sysctl.d/99-pg-tunnel-optimize.conf ]]; then
+        sed -i 's/16777216/8388608/g; s/1048576/262144/g' /etc/sysctl.d/99-pg-tunnel-optimize.conf
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+    ensure_network_tuning >/dev/null 2>&1 || true
 }
 
 bootstrap_existing_accounting() {
@@ -2288,6 +2350,8 @@ ProtectSystem=strict
 ReadWritePaths=/etc/pg-tunnel
 ProtectHome=true
 PrivateTmp=true
+MemoryHigh=192M
+MemoryMax=256M
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
@@ -2330,6 +2394,7 @@ EOF
         iptables -t nat -A OUTPUT -p tcp -d "$OUT_IP" --dport "$port" -j REDIRECT --to-ports "$port"
         echo "  -> Redirected $OUT_IP:$port"
     done < <(get_redirect_ports "$NODE_PORT" "$DATA_PORTS")
+    cleanup_stale_redirects "$OUT_IP" "$NODE_PORT" "$DATA_PORTS"
 
     setup_accounting_persistence
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -2563,6 +2628,8 @@ RestartSec=3
 NoNewPrivileges=true
 ProtectHome=read-only
 PrivateTmp=true
+MemoryHigh=96M
+MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target
@@ -2593,6 +2660,10 @@ RestartSec=3
 NoNewPrivileges=true
 ProtectHome=read-only
 PrivateTmp=true
+MemoryHigh=96M
+MemoryMax=128M
+Nice=5
+CPUWeight=60
 
 [Install]
 WantedBy=multi-user.target
@@ -2626,6 +2697,8 @@ EOF
 
     sleep 3
     echo
+    cleanup_stale_data_units "$DATA_PORTS"
+
     echo -e "${CYAN}--- Parallel Channel Status ---${NC}"
     if systemctl is-active --quiet pg-tunnel-mgmt; then
         echo -e "  mgmt (Node ${NODE_PORT}) : ${GREEN}ACTIVE${NC}"
@@ -3014,12 +3087,12 @@ optimizer() {
     cat > /etc/sysctl.d/99-pg-tunnel-optimize.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 16777216
-net.ipv4.tcp_wmem = 4096 1048576 16777216
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 262144 8388608
+net.ipv4.tcp_wmem = 4096 262144 8388608
 net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 4096
 net.ipv4.tcp_fastopen = 3
