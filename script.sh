@@ -134,11 +134,15 @@
 #       used a foreign :01 stagger - migrated once); report gained the
 #       full schedule + SRV_TZ and the bot status shows both. Watchdog
 #       stays immediate (unchanged)
+# v8.23: HOTFIX triage blindspot: '/logs' used journalctl '-o cat'
+#       (no timestamps), so during a live incident an OLD restart-storm
+#       tail was indistinguishable from a fresh one. Both log paths now
+#       render with timestamps ('-o short')
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="8.22"
+SCRIPT_VERSION="8.23"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -3932,7 +3936,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "8.22"
+BOT_REV = "8.23"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4798,14 +4802,17 @@ def logs_text(chat_id, args):
         return tr(chat_id, "logs_usage")
     if target == "foreign":
         try:
+            # v8.23: timestamps ON - '-o cat' stripped them and an old
+            # incident's log tail looked like a fresh one during triage.
             out = subprocess.run(["journalctl", "-u", "pg-tunnel-mgmt", "-u", "pg-tunnel-data-*",
-                                  "--no-pager", "-n", str(n), "-o", "cat"],
+                                  "--no-pager", "-n", str(n), "-o", "short"],
                                  capture_output=True, text=True, timeout=60)
             body = out.stdout
         except Exception:
             body = ""
     else:
-        body = ssh_iran("journalctl -u pg-tls-server -u pg-tunnel-watchdog --no-pager -n %d -o cat 2>/dev/null | tail -n %d" % (n, n)) or ""
+        # v8.23: timestamps ON (was '-o cat' - see foreign branch note).
+        body = ssh_iran("journalctl -u pg-tls-server -u pg-tunnel-watchdog --no-pager -n %d -o short 2>/dev/null | tail -n %d" % (n, n)) or ""
     if not body.strip():
         return tr(chat_id, "logs_none")
     head = "\U0001F4DC <b>PG Tunnel \u2014 %s</b> (%s, %d)\n%s" % (tr(chat_id, "logs_h"), esc(target), n, "\u2500" * 18)
@@ -5490,6 +5497,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
