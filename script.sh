@@ -169,12 +169,20 @@
 #       -> 'IRAN UNREACHABLE'). The guard restarts the unit when its
 #       cgroup RSS >= TLS_RSS_GUARD_MB (default 384, same 10-min
 #       cooldown, event -> AUTOFIX). Also: TLS handshake timeout (15s)
-#       and an mtime/TTL cache for the per-connection conf read
+#       ssl_handshake_timeout=15) and an mtime/TTL cache for the per-connection conf read
+# v9.2: (a) AUTOFIX events are BATCHED into one message per burst (the
+#       12h refresh restarts 5 units - five separate messages was noise;
+#       events collect for 90s after the first due one, then flush as a
+#       single bulleted report; report now carries the last 6 events)
+#       (b) non-critical warnings during 00-08 Tehran are delivered
+#       SILENTLY instead of dropped (a RAM-low warning swallowed at
+#       06:45 was never re-sent - user saw nothing before the incident)
+#       (c) hourly cron revives a dead pg-tgbot unit (foreign)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="9.1"
+SCRIPT_VERSION="9.2"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1723,9 +1731,9 @@ emit_server_report() {
     echo "VERSION=v${SCRIPT_VERSION}"
     echo "HOST=$(hostname 2>/dev/null || echo unknown)"
     echo "SRV_TZ=$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
-    # v8.25: last 3 cron auto-repair restart events (epoch|role|unit);
-    # the bot reports each one ~1 min later, with the outcome
-    echo "AUTOFIX=$(tail -n 3 "$CONF_DIR/autofix.events" 2>/dev/null | tr '\n' ';')"
+    # v8.25/v9.2: last 6 cron auto-repair restart events (epoch|role|unit);
+    # the bot batches them into one message ~1-2 min later, with outcomes
+    echo "AUTOFIX=$(tail -n 6 "$CONF_DIR/autofix.events" 2>/dev/null | tr '\n' ';')"
     echo "UPTIME_SEC=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{printf "RAM_TOTAL_KB=%d\nRAM_AVAIL_KB=%d\nRAM_USED_KB=%d\n", t+0, a+0, (t-a)+0}' /proc/meminfo 2>/dev/null || true
     awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{printf "SWAP_TOTAL_KB=%d\nSWAP_FREE_KB=%d\n", t+0, f+0}' /proc/meminfo 2>/dev/null || true
@@ -2730,6 +2738,11 @@ handle_cli_subcommands() {
                             log_autofix_event foreign "$cu_name"
                         fi
                     done
+                    # v9.2: hourly safety net - revive a dead bot unit
+                    if [[ -f "$TG_BOT_CONF" && -f "$TG_BOT_PY" ]] && ! systemctl is-active --quiet pg-tgbot; then
+                        systemctl restart pg-tgbot 2>/dev/null || true
+                        log_autofix_event foreign pg-tgbot
+                    fi
                 fi
                 if [[ -f "$TUNNEL_SERVICE" ]] && ! systemctl is-active --quiet reverse-tunnel; then
                     systemctl restart reverse-tunnel 2>/dev/null || true
@@ -4082,7 +4095,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "9.1"
+BOT_REV = "9.2"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4096,7 +4109,7 @@ TEHRAN = timezone(timedelta(hours=3, minutes=30))
 CFG = {}
 STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
          "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
-         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {}, "alerts": {},
+         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {}, "autofix_pending": [], "alerts": {},
          "iran_last_ok": 0, "iran_down": False}
 
 
@@ -4166,7 +4179,8 @@ STR = {
         "channel_down": "\U0001f6a8 <b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
         "tunnel_unreachable": "\U0001f6a8 <b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
         "tunnel_back": "\u2705 Iran reachable again through the tunnel.",
-        "autofix_event": "\U0001F6E0 <b>AUTOFIX:</b> auto-repair restarted <code>%s</code> (%s) at %s \u2014 %s",
+        "autofix_head": "\U0001F6E0 <b>AUTOFIX:</b> %d auto-repair(s)",
+        "autofix_line": "- <code>%s</code> (%s) at %s \u2014 %s",
         "autofix_active": "active",
         "autofix_down": "STILL DOWN",
         "autofix_unknown": "status unknown",
@@ -4305,7 +4319,8 @@ STR = {
         "channel_down": "\U0001f6a8 <b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
         "tunnel_unreachable": "\U0001f6a8 <b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
         "tunnel_back": "\u2705 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
-        "autofix_event": "\U0001F6E0 <b>\u0627\u0648\u062a\u0648\u0641\u06cc\u06a9\u0633:</b> \u062a\u0639\u0645\u06cc\u0631 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0633\u0631\u0648\u06cc\u0633 <code>%s</code> (%s) \u0631\u0627 \u0633\u0627\u0639\u062a %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0631\u062f \u2014 %s",
+        "autofix_head": "\U0001F6E0 <b>\u062e\u0648\u062f\u062a\u0639\u0645\u06cc\u0631\u06cc:</b> %d \u0645\u0648\u0631\u062f",
+        "autofix_line": "- <code>%s</code> (%s) \u0633\u0627\u0639\u062a %s \u2014 %s",
         "autofix_active": "\u0641\u0639\u0627\u0644",
         "autofix_down": "\u0647\u0646\u0648\u0632 \u067e\u0627\u06cc\u06cc\u0646 \u0627\u0633\u062a",
         "autofix_unknown": "\u0648\u0636\u0639\u06cc\u062a \u0645\u0639\u0644\u0648\u0645 \u0646\u06cc\u0633\u062a",
@@ -4805,7 +4820,10 @@ def broadcast(text, critical=False, kind=""):
             if STATE["mute"].get(str(cid), 0) > now:
                 continue
             if datetime.now(TEHRAN).hour < 8:
-                continue
+                # v9.2: night hours deliver SILENTLY instead of dropping -
+                # a RAM-low warning swallowed at 06:45 (before the 09:26
+                # incident) was never re-sent after 08:00
+                silent = True
         key = re.sub(r"<[^>]+>", "", text)[:60]
         if STATE["win"].get(key, 0) > now - 300:
             continue
@@ -5583,9 +5601,10 @@ def autofix_status_of(rep, unit):
 
 
 def process_autofix(rep, role):
-    # v8.25: announce cron auto-repair restarts ~1 minute AFTER they
-    # happened (AUTOFIX= field from the report), so the outcome can be
-    # included: active / STILL DOWN / status unknown
+    # v9.2: collect due cron auto-repair events (age >= 60s, the
+    # requested 1-minute delay) into STATE["autofix_pending"]; the
+    # buffer is flushed by flush_autofix() as ONE message per burst -
+    # a 12h refresh restarts 5 units and five separate messages is noise
     if not rep:
         return
     raw = str(rep.get("AUTOFIX", "") or "")
@@ -5621,7 +5640,23 @@ def process_autofix(rep, role):
         else:
             stt = tr(0, "autofix_down")
         when = datetime.fromtimestamp(ep, TEHRAN).strftime("%H:%M")
-        broadcast(tr(0, "autofix_event") % (esc(str(unit)), tr(0, role), when, stt), critical=True, kind="autofix")
+        STATE.setdefault("autofix_pending", []).append(
+            (now, tr(0, "autofix_line") % (esc(str(unit)), tr(0, role), when, stt)))
+
+
+def flush_autofix():
+    # v9.2: send the collected batch once the oldest entry is 90s old
+    # (leaves time for the other server's report tick to join the same
+    # message) or at 8 lines; single events ride the same path
+    pend = STATE.get("autofix_pending") or []
+    if not pend:
+        return
+    now = time.time()
+    if now - pend[0][0] < 90 and len(pend) < 8:
+        return
+    lines = [p[1] for p in pend]
+    STATE["autofix_pending"] = []
+    broadcast(tr(0, "autofix_head", d=len(lines)) + "\n" + "\n".join(lines), critical=True, kind="autofix")
 
 
 def check_once():
@@ -5637,6 +5672,7 @@ def check_once():
     process_autofix(loc, "foreign")
     if irn is not None:
         process_autofix(irn, "iran")
+    flush_autofix()
     for role, rep in (("foreign", loc), ("iran", irn)):
         if rep is None:
             continue
@@ -5824,6 +5860,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
