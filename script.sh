@@ -189,11 +189,23 @@
 #       than 60s is refreshed in the background (stale-while-revalidate);
 #       a failed fetch invalidates the cache so panels never show
 #       stale-good data during an outage
+# v9.4: (a) the panel Refresh buttons now FORCE a live fetch (they
+#       previously hit the bot cache and showed the same numbers again)
+#       (b) server-side report cache: emit_server_report caches its
+#       output for REPORT_CACHE_TTL seconds (default 20, atomic tmp+mv)
+#       - the probe chain (journalctl/iptables/ss/CPU sample) runs at
+#       most once per window per server even under concurrent requests,
+#       so a forced refresh costs just the transfer (~1-2s over the
+#       tunnel) while data is at most TTL old (c) AUTOFIX stale-replay
+#       guard: events older than 10 minutes are history, not news - a
+#       bot restart (script update) must not re-announce them (live
+#       case: the 04:30 refresh replayed at 14:12 after the v9.3
+#       update restart)
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="9.3"
+SCRIPT_VERSION="9.4"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -1730,6 +1742,30 @@ cleanup_stale_redirects() {
 }
 
 emit_server_report() {
+    # v9.4: server-side report cache. The full probe chain
+    # (journalctl/iptables/ss/CPU sampling) runs at most once per TTL
+    # window per server even under concurrent requests (bot panels +
+    # monitor loop + panel API) - request management on the tunnel path;
+    # a forced bot refresh then costs just the transfer (~1-2s).
+    set +e
+    local _rc="${CONF_DIR}/report.cache" _ttl="${REPORT_CACHE_TTL:-20}" _age=999999
+    case "$_ttl" in (*[!0-9]*|"") _ttl=20;; esac
+    if [ -f "$_rc" ]; then
+        _age=$(( $(date +%s) - $(stat -c %Y "$_rc" 2>/dev/null || echo 0) ))
+    fi
+    if [ "$_age" -lt "$_ttl" ]; then
+        cat "$_rc" 2>/dev/null
+        return 0
+    fi
+    local _out
+    _out=$(_emit_server_report_live)
+    printf '%s\n' "$_out" > "${_rc}.tmp" 2>/dev/null
+    mv -f "${_rc}.tmp" "$_rc" 2>/dev/null
+    printf '%s\n' "$_out"
+    return 0
+}
+
+_emit_server_report_live() {
     # Machine-readable one-shot status snapshot (KEY=VALUE lines) used by
     # the Telegram bot and any external monitoring. Keys are append-only.
     # Tolerant mode: a failing probe (missing chain, journalctl hiccup)
@@ -4106,7 +4142,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "9.3"
+BOT_REV = "9.4"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4671,6 +4707,12 @@ def scope_kb(chat_id, kind):
             ] + back_kb(chat_id)
 
 
+def traffic_result_kb(chat_id, scope):
+    # v9.4: traffic gets the same live-refresh row as status/resources
+    return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:traffic:%s" % scope}]
+            ] + back_kb(chat_id)
+
+
 def status_result_kb(chat_id, scope):
     # Lives under every status message: tapping refresh re-enters the
     # same m:status:<scope> callback, which re-fetches the reports and
@@ -4916,7 +4958,7 @@ def _fetch_role(role):
     return rep
 
 
-def get_reports(scope):
+def get_reports(scope, force=False):
     # v9.3: panels render from the monitor's cache so button taps return
     # in well under a second (a live report runs local probes + the full
     # remote pg-tunnel report over the tunnel = 5-15s sequential).
@@ -4928,7 +4970,9 @@ def get_reports(scope):
     missing = []
     for role in order:
         c = (STATE.get("rep_cache") or {}).get(role)
-        if c is not None and time.time() - c[0] <= (70 if role == "foreign" else 150):
+        # v9.4: force=True (the Refresh buttons) bypasses the cache and
+        # fetches live - the server-side 20s report cache keeps that fast
+        if not force and c is not None and time.time() - c[0] <= (70 if role == "foreign" else 150):
             out[role] = c[1]
             if time.time() - c[0] > 60:
                 threading.Thread(target=_fetch_role, args=(role,), daemon=True).start()
@@ -4949,11 +4993,11 @@ def get_reports(scope):
     return [(r, out.get(r)) for r in order]
 
 
-def status_text(chat_id, scope="both"):
+def status_text(chat_id, scope="both", force=False):
     sep = "\u2500" * 18
     out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
            sep, ""]
-    reps = get_reports(scope)
+    reps = get_reports(scope, force)
     for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
@@ -5020,10 +5064,10 @@ def status_text(chat_id, scope="both"):
         out.append("")
     return "\n".join(out)
 
-def traffic_text(chat_id, scope="both"):
+def traffic_text(chat_id, scope="both", force=False):
     out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"),
            "\u2500" * 18, ""]
-    for role, rep in get_reports(scope):
+    for role, rep in get_reports(scope, force):
         icon = "\U0001F30D" if role == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role)
         if rep is None:
@@ -5053,10 +5097,10 @@ def traffic_text(chat_id, scope="both"):
         out.append("")
     return "\n".join(out)
 
-def resources_text(chat_id, scope="both"):
+def resources_text(chat_id, scope="both", force=False):
     sep = "\u2500" * 18
     out = ["\U0001F5A5 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "res_h"), sep, ""]
-    reps = get_reports(scope)
+    reps = get_reports(scope, force)
     for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
@@ -5394,8 +5438,8 @@ def handle_update(upd):
             return
         if data.startswith("m:status:"):
             scope = data.split(":", 2)[2]
-            if not kb_edit(chat, mid, status_text(chat, scope), status_result_kb(chat, scope)):
-                kb_send(chat, status_text(chat, scope), status_result_kb(chat, scope))
+            if not kb_edit(chat, mid, status_text(chat, scope, force=True), status_result_kb(chat, scope)):
+                kb_send(chat, status_text(chat, scope, force=True), status_result_kb(chat, scope))
             return
         if data == "m:traffic":
             if not kb_edit(chat, mid, tr(chat, "choose_traffic"), scope_kb(chat, "traffic")):
@@ -5403,8 +5447,8 @@ def handle_update(upd):
             return
         if data.startswith("m:traffic:"):
             scope = data.split(":", 2)[2]
-            if not kb_edit(chat, mid, traffic_text(chat, scope), main_menu_kb(chat)):
-                send(chat, traffic_text(chat, scope))
+            if not kb_edit(chat, mid, traffic_text(chat, scope, force=True), traffic_result_kb(chat, scope)):
+                kb_send(chat, traffic_text(chat, scope, force=True), traffic_result_kb(chat, scope))
             return
         if data == "m:resources":
             if not kb_edit(chat, mid, tr(chat, "choose_resources"), scope_kb(chat, "resources")):
@@ -5412,8 +5456,8 @@ def handle_update(upd):
             return
         if data.startswith("m:resources:"):
             scope = data.split(":", 2)[2]
-            if not kb_edit(chat, mid, resources_text(chat, scope), resources_result_kb(chat, scope)):
-                kb_send(chat, resources_text(chat, scope), resources_result_kb(chat, scope))
+            if not kb_edit(chat, mid, resources_text(chat, scope, force=True), resources_result_kb(chat, scope)):
+                kb_send(chat, resources_text(chat, scope, force=True), resources_result_kb(chat, scope))
             return
         if data == "m:logs":
             if not kb_edit(chat, mid, tr(chat, "choose_logs"), logs_kb(chat)):
@@ -5671,6 +5715,13 @@ def process_autofix(rep, role):
             continue
         if now - ep < 60:
             continue  # the requested 1-minute delay
+        if now - ep > 600:
+            # v9.4: stale replay guard - events older than 10 minutes are
+            # history, not news; a bot restart (e.g. a script update) must
+            # not re-announce them (live case: the 04:30 refresh was
+            # replayed at 14:12 after the v9.3 update restart)
+            seen[key] = 1
+            continue
         seen[key] = 1
         if len(seen) > 200:
             for k in list(seen)[:-100]:
@@ -5906,6 +5957,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
