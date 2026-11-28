@@ -160,11 +160,21 @@
 #       at BOTH refresh slots (TUNNEL_REFRESH_HH and +12, server TZ,
 #       default 01+13 UTC = ~04:30 & ~16:30 Tehran), guarded by an
 #       epoch marker (refresh.last, min 11h spacing)
+# v9.1: RSS GUARD in the watchdog - live root cause of the recurring
+#       IRAN-UNREACHABLE blips: tls-server leaks memory (~80MB/h; 19MB
+#       at the 01:00 refresh -> 707MB by 09:35, PSI 85%, 315 unaccepted
+#       connections). Above the cgroup cap it is a live zombie: still
+#       listening + sessions>0, so the old watchdog said OK while every
+#       NEW connection starved (banner-exchange timeouts, mgmt included
+#       -> 'IRAN UNREACHABLE'). The guard restarts the unit when its
+#       cgroup RSS >= TLS_RSS_GUARD_MB (default 384, same 10-min
+#       cooldown, event -> AUTOFIX). Also: TLS handshake timeout (15s)
+#       and an mtime/TTL cache for the per-connection conf read
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="9.0"
+SCRIPT_VERSION="9.1"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -463,7 +473,20 @@ CONF_PATH = os.environ.get("PG_IRAN_CONF", "/etc/pg-tunnel/iran.conf")
 AUTH_LOCK = asyncio.Lock()
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+_CONF_CACHE = {"data": None, "mtime": -1.0, "ts": 0.0}
+
+
 def load_runtime_conf():
+    # v9.1: cached by conf mtime + 30s TTL - this runs on EVERY accepted
+    # connection (scanners complete the TLS handshake before auth), and
+    # a synchronous file read per connection stalls the event loop
+    _now = time.monotonic()
+    try:
+        _mt = os.path.getmtime(CONF_PATH)
+    except Exception:
+        _mt = -1.0
+    if _CONF_CACHE["data"] is not None and _CONF_CACHE["mtime"] == _mt and (_now - _CONF_CACHE["ts"]) < 30:
+        return _CONF_CACHE["data"]
     cfg = {
         "TLS_SECRET": "",
         "TLS_SECRET_OLD": "",
@@ -498,7 +521,9 @@ def load_runtime_conf():
         old_until = 0
     if not secret_old or (old_until and time.time() >= old_until):
         secret_old = ""
-    return cfg.get("TLS_SECRET", ""), secret_old, ports, fb, cfg.get("CERT_SRC", ""), cfg.get("KEY_SRC", "")
+    ret = (cfg.get("TLS_SECRET", ""), secret_old, ports, fb, cfg.get("CERT_SRC", ""), cfg.get("KEY_SRC", ""))
+    _CONF_CACHE.update({"data": ret, "mtime": _mt, "ts": _now})
+    return ret
 
 def release_zombie_ports(ports):
     if not ports:
@@ -806,7 +831,9 @@ async def main():
         pass
     ctx.load_cert_chain(CERT, KEY)
     asyncio.create_task(cert_reloader(ctx))
-    srv = await asyncio.start_server(handle, "0.0.0.0", LPORT, ssl=ctx, backlog=512)
+    # v9.1: handshake timeout - stalled TLS handshakes (scanner
+    # slowloris) must not sit on the server forever
+    srv = await asyncio.start_server(handle, "0.0.0.0", LPORT, ssl=ctx, backlog=512, ssl_handshake_timeout=15)
     async with srv:
         await srv.serve_forever()
 
@@ -1261,16 +1288,28 @@ write_watchdog_script() {
 # Monitors reverse-forward listeners + TLS sessions and self-heals the
 # TLS wrapper when the tunnel is fully wedged. Conservative by design:
 # healthy or partially-healthy states never trigger a restart.
-# PG-WD-REF: v8.21
+# v9.1 RSS guard: a memory-leaking tls-server becomes a LIVE ZOMBIE
+# above its cgroup cap (still listening, sessions>0, but PSI ~85% and
+# new connections starve) - listener/session checks alone call that
+# "OK". Restart when cgroup RSS >= TLS_RSS_GUARD_MB (default 384),
+# sharing the 10-min cooldown anchor; the restart is also appended to
+# autofix.events so the bot reports it with its outcome.
+# PG-WD-REF: v9.1
 set -u
 CONF="/etc/pg-tunnel/iran.conf"
 STATE_FILE="/etc/pg-tunnel/watchdog.state"
 [ -r "$CONF" ] || exit 0
-OUT_IP=""; NODE_PORT="62075"; DATA_PORTS=""; SEC_SSH=""; TLS_SNI=""; TLS_SECRET=""
+OUT_IP=""; NODE_PORT="62075"; DATA_PORTS=""; SEC_SSH=""; TLS_SNI=""; TLS_SECRET=""; TLS_RSS_GUARD_MB=""
 # shellcheck disable=SC1090
 source "$CONF"
 PORTS="${NODE_PORT:-62075},${DATA_PORTS:-}"
 SEC_SSH="${SEC_SSH:-2087}"
+RSS_GUARD_MB="${TLS_RSS_GUARD_MB:-384}"
+case "$RSS_GUARD_MB" in (*[!0-9]*|"") RSS_GUARD_MB=384;; esac
+RSS_GUARD_KB=$(( RSS_GUARD_MB * 1024 ))
+WD_SLEEP="${WD_SLEEP:-15}"
+CG_MEM="${WD_CGROUP_MEM:-/sys/fs/cgroup/system.slice/pg-tls-server.service/memory.current}"
+AUTOFIX_EVENTS="/etc/pg-tunnel/autofix.events"
 MISS=0
 LAST_TLS_RESTART=0
 LAST_RESTART_FILE="/etc/pg-tunnel/watchdog.last_restart"
@@ -1301,12 +1340,35 @@ while true; do
     done
     EST=$(ss -tn state established 2>/dev/null | awk -v sp=":${SEC_SSH}" '$3 ~ sp"$" {n++} END{print n+0}')
 
+    RSS_KB=0
+    _v=$(cat "$CG_MEM" 2>/dev/null | tr -dc '0-9')
+    [ -n "$_v" ] && RSS_KB=$(( _v / 1024 ))
+    RSS_MB=$(( RSS_KB / 1024 ))
+
+    # v9.1: RSS guard runs FIRST - it is the wedge detector the listener
+    # check cannot see. Shares the cooldown anchor with the wrapper path.
+    if (( RSS_KB > 0 && RSS_KB >= RSS_GUARD_KB )); then
+        _now=$(date +%s)
+        if (( _now - LAST_TLS_RESTART >= 600 )); then
+            LAST_TLS_RESTART=$_now
+            printf '%s\n' "$_now" > "$LAST_RESTART_FILE" 2>/dev/null || true
+            MISS=0
+            write_state "RESTARTING_TLS_RSS rss=${RSS_MB}MB"
+            printf '%s|%s|%s\n' "$_now" "iran" "pg-tls-server" >> "$AUTOFIX_EVENTS" 2>/dev/null || true
+            systemctl restart pg-tls-server.service >/dev/null 2>&1 || true
+        else
+            write_state "DEGRADED rss=${RSS_MB}MB cooldown"
+        fi
+        sleep "$WD_SLEEP"
+        continue
+    fi
+
     if (( LISTEN > 0 )); then
         MISS=0
-        write_state "OK listeners=${LISTEN} tls_sessions=${EST}"
+        write_state "OK listeners=${LISTEN} tls_sessions=${EST} rss=${RSS_MB}MB"
     else
         MISS=$(( MISS + 1 ))
-        write_state "DEGRADED cycles=${MISS} tls_sessions=${EST}"
+        write_state "DEGRADED cycles=${MISS} tls_sessions=${EST} rss=${RSS_MB}MB"
         if (( MISS >= 4 && EST == 0 )); then
             _now=$(date +%s)
             if (( _now - LAST_TLS_RESTART >= 600 )); then
@@ -2521,7 +2583,7 @@ migrate_existing_state() {
     # Refresh the watchdog script automatically after a script update so
     # fixes ship without requiring a manual Repair (restarts only the
     # monitor loop, never the tunnel itself).
-    if [[ -f "$IRAN_CONF" ]] && ! grep -q "PG-WD-REF: v8.21" "$WATCHDOG_SH" 2>/dev/null; then
+    if [[ -f "$IRAN_CONF" ]] && ! grep -q "PG-WD-REF: v9.1" "$WATCHDOG_SH" 2>/dev/null; then
         write_watchdog_script
         systemctl restart pg-tunnel-watchdog.service 2>/dev/null || true
     fi
@@ -4020,7 +4082,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "9.0"
+BOT_REV = "9.1"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4104,7 +4166,7 @@ STR = {
         "channel_down": "\U0001f6a8 <b>CHANNEL DOWN:</b> %s is not active (3 consecutive checks failed).",
         "tunnel_unreachable": "\U0001f6a8 <b>IRAN UNREACHABLE:</b> no report through the tunnel for 3 minutes.",
         "tunnel_back": "\u2705 Iran reachable again through the tunnel.",
-        "autofix_event": "\U0001F6E0 <b>AUTOFIX:</b> cron restarted <code>%s</code> (%s) at %s \u2014 %s",
+        "autofix_event": "\U0001F6E0 <b>AUTOFIX:</b> auto-repair restarted <code>%s</code> (%s) at %s \u2014 %s",
         "autofix_active": "active",
         "autofix_down": "STILL DOWN",
         "autofix_unknown": "status unknown",
@@ -4243,7 +4305,7 @@ STR = {
         "channel_down": "\U0001f6a8 <b>\u06a9\u0627\u0646\u0627\u0644 \u062e\u0627\u0645\u0648\u0634:</b> %s \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a (\u06f3 \u0686\u06a9 \u0645\u062a\u0648\u0627\u0644\u06cc \u0646\u0627\u0645\u0648\u0641\u0642).",
         "tunnel_unreachable": "\U0001f6a8 <b>\u0639\u062f\u0645 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646:</b> \u06f3 \u062f\u0642\u06cc\u0642\u0647 \u06af\u0632\u0627\u0631\u0634\u06cc \u0627\u0632 \u062a\u0627\u0646\u0644 \u0646\u0631\u0633\u06cc\u062f\u0647.",
         "tunnel_back": "\u2705 \u062f\u0633\u062a\u0631\u0633\u06cc \u0628\u0647 \u0627\u06cc\u0631\u0627\u0646 \u0627\u0632 \u0637\u0631\u06cc\u0642 \u062a\u0627\u0646\u0644 \u0628\u0631\u06af\u0634\u062a.",
-        "autofix_event": "\U0001F6E0 <b>\u0627\u0648\u062a\u0648\u0641\u06cc\u06a9\u0633:</b> \u06a9\u0631\u0648\u0646 \u0633\u0631\u0648\u06cc\u0633 <code>%s</code> (%s) \u0631\u0627 \u0633\u0627\u0639\u062a %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0631\u062f \u2014 %s",
+        "autofix_event": "\U0001F6E0 <b>\u0627\u0648\u062a\u0648\u0641\u06cc\u06a9\u0633:</b> \u062a\u0639\u0645\u06cc\u0631 \u062e\u0648\u062f\u06a9\u0627\u0631 \u0633\u0631\u0648\u06cc\u0633 <code>%s</code> (%s) \u0631\u0627 \u0633\u0627\u0639\u062a %s \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0631\u062f \u2014 %s",
         "autofix_active": "\u0641\u0639\u0627\u0644",
         "autofix_down": "\u0647\u0646\u0648\u0632 \u067e\u0627\u06cc\u06cc\u0646 \u0627\u0633\u062a",
         "autofix_unknown": "\u0648\u0636\u0639\u06cc\u062a \u0645\u0639\u0644\u0648\u0645 \u0646\u06cc\u0633\u062a",
