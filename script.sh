@@ -200,12 +200,26 @@
 #       guard: events older than 10 minutes are history, not news - a
 #       bot restart (script update) must not re-announce them (live
 #       case: the 04:30 refresh replayed at 14:12 after the v9.3
-#       update restart)
+#       re-announce them (live case: the 04:30 refresh replayed at
+#       14:12 after the v9.3 update restart)
+# v9.5: (a) scoped traffic-reset: 'pg-tunnel traffic-reset' zeroes the
+#       accounting counters + state (next sync recreates with a fresh
+#       'since'); the bot's traffic panel gains a Reset button that is
+#       scope-aware (iran panel -> iran only, foreign -> foreign only,
+#       both -> both) behind an OK/Cancel confirm
+#       (b) persistent settings DB (sqlite, /var/lib/pg-tunnel/tgbot.db):
+#       language per chat, per-report alert states and traffic samples
+#       survive bot restarts and script updates. ROOT CAUSE found: the
+#       engine only ever WROTE state.json and never loaded it - every
+#       restart (each script update) reset language/alerts to defaults
+#       and emptied the AUTOFIX seen-map (the 14:12 replay). state.json
+#       is now loaded at boot (runtime) and the settings DB is the
+#       authority for the persistent keys, with change-detected writes
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="9.4"
+SCRIPT_VERSION="9.5"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -2838,6 +2852,18 @@ handle_cli_subcommands() {
             fi
             exit 0
             ;;
+        traffic-reset)
+            check_root
+            if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
+                reset_traffic_accounting
+                ensure_accounting_rules 2>/dev/null || true
+                sync_traffic_state >/dev/null 2>&1 || true
+                echo "traffic accounting reset"
+            else
+                echo "no tunnel config found"
+            fi
+            exit 0
+            ;;
         acct-init|acct-sync)
             check_root
             if [[ -f "$IRAN_CONF" || -f "$FOREIGN_CONF" ]]; then
@@ -4132,6 +4158,10 @@ via setMyCommands; per-chat language (EN default, FA via /lang).
 import html
 import json
 import os
+try:
+    import sqlite3
+except Exception:
+    sqlite3 = None
 import re
 import subprocess
 import sys
@@ -4142,10 +4172,80 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "9.4"
+BOT_REV = "9.5"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+# v9.5: persistent settings database - survives bot restarts and script
+# updates (the manager never touches /var/lib/pg-tunnel). ROOT CAUSE of
+# settings loss: the engine only WROTE state.json and never loaded it,
+# so every restart reset language/alerts to defaults and emptied the
+# AUTOFIX seen-map. The DB is the authority for the persistent keys.
+SETTINGS_DB_DIR = "/var/lib/pg-tunnel"
+SETTINGS_DB = os.path.join(SETTINGS_DB_DIR, "tgbot.db")
+SETTINGS_KEYS = ("chats", "alerts", "samples")
+_DB_LAST = {}
+
+
+def _db_conn():
+    os.makedirs(SETTINGS_DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(SETTINGS_DB, timeout=10)
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.commit()
+    return conn
+
+
+def load_settings():
+    # Authority for persistent keys; migrates from state.json values on
+    # a first boot (or when the DB was wiped) so nothing is lost twice.
+    try:
+        conn = _db_conn()
+        rows = dict(conn.execute("SELECT key, value FROM settings").fetchall())
+        conn.close()
+    except Exception:
+        rows = {}
+    migrated = False
+    for k in SETTINGS_KEYS:
+        if k in rows:
+            try:
+                STATE[k] = json.loads(rows[k])
+            except Exception:
+                pass
+        elif STATE.get(k):
+            migrated = True
+    if migrated:
+        save_settings(force=True)
+
+
+def save_settings(force=False):
+    for k in SETTINGS_KEYS:
+        blob = json.dumps(STATE.get(k) or ({} if k != "samples" else {}))
+        if not force and _DB_LAST.get(k) == blob:
+            continue
+        try:
+            conn = _db_conn()
+            conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, blob))
+            conn.commit()
+            conn.close()
+            _DB_LAST[k] = blob
+        except Exception:
+            pass
+
+
+def load_runtime_state():
+    # v9.5: the runtime half of the state (offset, dedup windows, seen
+    # maps...) - previously NEVER loaded, which reset everything on
+    # every restart. Settings keys stay under the DB's authority.
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k not in SETTINGS_KEYS:
+                    STATE[k] = v
+    except Exception:
+        pass
 FOREIGN_CONF = "/etc/pg-tunnel/foreign.conf"
 KNOWN_HOSTS = "/etc/pg-tunnel/known_hosts"
 TLS_CLIENT = "/etc/pg-tunnel/tls_client.py"
@@ -4193,6 +4293,7 @@ def save_state():
         os.replace(tmp, STATE_FILE)
     except Exception:
         pass
+    save_settings()
 
 
 STR = {
@@ -4332,6 +4433,9 @@ STR = {
         "update_done": "\u2b05 <b>Update result:</b>\n%s",
         "btn_optimize": "\U0001f680 Optimize",
         "btn_refresh": "\U0001f504 Refresh",
+        "btn_reset_traffic": "\u267B Reset traffic",
+        "traffic_reset_done": "\u2705 Traffic counters reset (%s).",
+        "reset_traffic_desc": "reset traffic counters on %s (irreversible)",
         "choose_optimize": "\U0001f680 Run the optimizer on which server?",
         "optimize_done": "\U0001f680 <b>Optimizer result:</b>\n%s",
         "help": "\U0001f916 <b>PG Tunnel Bot</b>\n\n/menu \u2014 button panel\n/status [both|iran|foreign] \u2014 full status\n/traffic [both|iran|foreign] \u2014 usage, per-IP and cap\n/logs [iran|foreign] [n] \u2014 recent logs\n/restart &lt;port|mgmt|all&gt; \u2014 restart channel(s)\n/repair [iran|foreign|both] \u2014 revive dead services\n/shield &lt;on|off&gt; \u2014 Iran port-22 shield\n/ipcheck &lt;ip&gt; [ip2 ...] \u2014 test IP(s) from Iranian nodes\n/mute [min] \xb7 /unmute \u2014 alert control\n/lang \u2014 switch language\n/update [ref] [both|iran|foreign] \u2014 update script from GitHub\n/optimize [both|iran|foreign] \u2014 apply kernel tuning\n/resources [both|iran|foreign] \u2014 RAM/CPU/disk usage\n/help \u2014 this message",
@@ -4472,6 +4576,9 @@ STR = {
         "update_done": "\u2b05 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0622\u067e\u062f\u06cc\u062a:</b>\n%s",
         "btn_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc",
         "btn_refresh": "\U0001f504 \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06cc",
+        "btn_reset_traffic": "\u267B \u0631\u06cc\u0633\u062a \u062a\u0631\u0627\u0641\u06cc\u06a9",
+        "traffic_reset_done": "\u2705 \u0634\u0645\u0627\u0631\u0646\u062f\u0647\u200c\u0647\u0627\u06cc \u062a\u0631\u0627\u0641\u06cc\u06a9 \u0631\u06cc\u0633\u062a \u0634\u062f (%s).",
+        "reset_traffic_desc": "\u0631\u06cc\u0633\u062a \u0634\u0645\u0627\u0631\u0646\u062f\u0647\u200c\u0647\u0627\u06cc \u062a\u0631\u0627\u0641\u06cc\u06a9 %s (\u063a\u06cc\u0631\u0642\u0627\u0628\u0644 \u0628\u0627\u0632\u06af\u0634\u062a)",
         "choose_optimize": "\U0001f680 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u0631\u0648\u06cc \u06a9\u062f\u0627\u0645 \u0633\u0631\u0648\u0631 \u0627\u062c\u0631\u0627 \u0634\u0648\u062f\u061f",
         "optimize_done": "\U0001f680 <b>\u0646\u062a\u06cc\u062c\u0647\u06cc \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc:</b>\n%s",
         "help": "\U0001f916 <b>\u0631\u0628\u0627\u062a \u062a\u0627\u0646\u0644 PG</b>\n\n/menu \u2014 \u067e\u0646\u0644 \u062f\u06a9\u0645\u0647\u200c\u0627\u06cc\n/status [both|iran|foreign] \u2014 \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0645\u0644\n/traffic [both|iran|foreign] \u2014 \u0645\u0635\u0631\u0641\u060c \u062a\u0641\u06a9\u06cc\u06a9 IP \u0648 \u0633\u0642\u0641\n/logs [iran|foreign] [n] \u2014 \u0644\u0627\u06af\u200c\u0647\u0627\u06cc \u0627\u062e\u06cc\u0631\n/restart &lt;port|mgmt|all&gt; \u2014 \u0631\u06cc\u200c\u0627\u0633\u062a\u0627\u0631\u062a \u06a9\u0627\u0646\u0627\u0644(\u200c\u0647\u0627)\n/repair [iran|foreign|both] \u2014 \u0627\u062d\u06cc\u0627\u06cc \u0633\u0631\u0648\u06cc\u0633\u200c\u0647\u0627\u06cc \u0645\u0631\u062f\u0647\n/shield &lt;on|off&gt; \u2014 \u0633\u067e\u0631 \u067e\u0648\u0631\u062a \u06f2\u06f2 \u0627\u06cc\u0631\u0627\u0646\n/ipcheck &lt;ip&gt; [ip2 ...] \u2014 \u062a\u0633\u062a IP(\u0647\u0627) \u0627\u0632 \u0646\u0648\u062f\u0647\u0627\u06cc \u0627\u06cc\u0631\u0627\u0646\u06cc\n/mute [\u062f\u0642\u06cc\u0642\u0647] \xb7 /unmute \u2014 \u06a9\u0646\u062a\u0631\u0644 \u0647\u0634\u062f\u0627\u0631\u0647\u0627\n/lang \u2014 \u062a\u063a\u06cc\u06cc\u0631 \u0632\u0628\u0627\u0646\n/update [ref] [both|iran|foreign] \u2014 \u0622\u067e\u062f\u06cc\u062a \u0627\u0633\u06a9\u0631\u06cc\u067e\u062a \u0627\u0632 GitHub\n/optimize [both|iran|foreign] \u2014 \u0628\u0647\u06cc\u0646\u0647\u200c\u0633\u0627\u0632\u06cc \u06a9\u0631\u0646\u0644\n/resources [both|iran|foreign] \u2014 \u0631\u0645/CPU/\u062f\u06cc\u0633\u06a9\n/help \u2014 \u0647\u0645\u06cc\u0646 \u067e\u06cc\u0627\u0645",
@@ -4709,7 +4816,10 @@ def scope_kb(chat_id, kind):
 
 def traffic_result_kb(chat_id, scope):
     # v9.4: traffic gets the same live-refresh row as status/resources
-    return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:traffic:%s" % scope}]
+    # v9.5: + a scope-aware Reset button (iran panel resets only iran,
+    # foreign only foreign, both resets both) behind a confirm
+    return [[{"text": trb(chat_id, "btn_refresh"), "callback_data": "m:traffic:%s" % scope},
+             {"text": trb(chat_id, "btn_reset_traffic"), "callback_data": "m:resettraffic:%s" % scope}]
             ] + back_kb(chat_id)
 
 
@@ -5397,6 +5507,29 @@ def run_action(chat_id, action, arg, mid=None, meta=None):
         run_update(chat_id, arg, (meta or {}).get("ref", "main"), mid)
     elif action == "optimize":
         run_optimize(chat_id, arg, mid)
+    elif action == "resettraffic":
+        done = []
+        if arg in ("foreign", "both"):
+            try:
+                r = subprocess.run([LOCAL_CMD, "traffic-reset"], capture_output=True,
+                                   text=True, timeout=60)
+                if r.returncode == 0:
+                    done.append("foreign")
+            except Exception:
+                pass
+        if arg in ("iran", "both"):
+            out = ssh_iran(LOCAL_CMD + " traffic-reset", timeout=90)
+            if out is not None and "reset" in (out or ""):
+                done.append("iran")
+        # invalidate the report cache for the reset roles so the next
+        # render/refresh shows the real zeroed counters, not stale data
+        cache = STATE.setdefault("rep_cache", {})
+        for r in ("foreign", "iran"):
+            if r in done:
+                cache.pop(r, None)
+        STATE["samples"] = {}
+        finish_panel(chat_id, mid, tr(chat_id, "traffic_reset_done",
+                                      s=", ".join(done) or arg))
     elif action == "shield":
         out = ssh_iran(LOCAL_CMD + (" shield-on" if arg == "on" else " shield-off"))
         finish_panel(chat_id, mid, tr(chat_id, "shield_done", s=arg) if out is not None
@@ -5449,6 +5582,14 @@ def handle_update(upd):
             scope = data.split(":", 2)[2]
             if not kb_edit(chat, mid, traffic_text(chat, scope, force=True), traffic_result_kb(chat, scope)):
                 kb_send(chat, traffic_text(chat, scope, force=True), traffic_result_kb(chat, scope))
+            return
+        if data.startswith("m:resettraffic:"):
+            # v9.5: scope-aware traffic reset behind an OK/Cancel confirm
+            scope = data.split(":", 2)[2]
+            if scope not in ("iran", "foreign", "both"):
+                scope = "both"
+            confirm_inline(chat, "resettraffic", scope,
+                           tr(chat, "reset_traffic_desc", s=tr(chat, scope)), mid)
             return
         if data == "m:resources":
             if not kb_edit(chat, mid, tr(chat, "choose_resources"), scope_kb(chat, "resources")):
@@ -5930,6 +6071,8 @@ def main():
         os.makedirs(STATE_DIR, exist_ok=True)
     except Exception:
         pass
+    load_runtime_state()
+    load_settings()
     set_commands()
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=daily_loop, daemon=True).start()
@@ -5957,6 +6100,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
