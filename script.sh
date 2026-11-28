@@ -178,11 +178,22 @@
 #       SILENTLY instead of dropped (a RAM-low warning swallowed at
 #       06:45 was never re-sent - user saw nothing before the incident)
 #       (c) hourly cron revives a dead pg-tgbot unit (foreign)
+# v9.3: (a) the 00-08 Tehran night rule is REMOVED - the Alerts
+#       settings panel (on/silent/off per report) is now the single
+#       control over delivery, at every hour (user directive)
+#       (b) instant panels: /status /traffic /resources rendered from
+#       the monitor's report cache (foreign TTL 70s / iran 150s, i.e.
+#       within the 60s/120s monitor cadence) instead of running the
+#       full local + over-tunnel report chain (5-15s) on every tap;
+#       cold cache -> both servers fetched CONCURRENTLY; a hit older
+#       than 60s is refreshed in the background (stale-while-revalidate);
+#       a failed fetch invalidates the cache so panels never show
+#       stale-good data during an outage
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="9.2"
+SCRIPT_VERSION="9.3"
 GITHUB_REPO_SLUG="XiliService/pg-node-ssh-tunnel"
 GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO_SLUG}"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}"
@@ -4095,7 +4106,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-BOT_REV = "9.2"
+BOT_REV = "9.3"
 CONF_FILE = "/etc/pg-tunnel/tgbot.conf"
 STATE_DIR = "/etc/pg-tunnel/tgbot"
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -4109,7 +4120,7 @@ TEHRAN = timezone(timedelta(hours=3, minutes=30))
 CFG = {}
 STATE = {"chats": {}, "fail": {}, "prev": {}, "win": {}, "pending": {},
          "mute": {}, "samples": {}, "last_sha": "", "offset": 0,
-         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {}, "autofix_pending": [], "alerts": {},
+         "daily_done": "", "warn_day": {}, "await": {}, "iran_tick": 0, "autofix_seen": {}, "autofix_pending": [], "alerts": {}, "rep_cache": {},
          "iran_last_ok": 0, "iran_down": False}
 
 
@@ -4817,13 +4828,10 @@ def broadcast(text, critical=False, kind=""):
             continue
         silent = (st == "mute")
         if not critical and not silent:
+            # v9.3: no night-hour rule anymore - the Alerts panel
+            # (on / silent / off per report) is the single control
             if STATE["mute"].get(str(cid), 0) > now:
                 continue
-            if datetime.now(TEHRAN).hour < 8:
-                # v9.2: night hours deliver SILENTLY instead of dropping -
-                # a RAM-low warning swallowed at 06:45 (before the 09:26
-                # incident) was never re-sent after 08:00
-                silent = True
         key = re.sub(r"<[^>]+>", "", text)[:60]
         if STATE["win"].get(key, 0) > now - 300:
             continue
@@ -4891,16 +4899,61 @@ def label(chat_id, role):
     return tr(chat_id, "iran" if role == "iran" else "foreign")
 
 
+def _cache_role(role, rep):
+    # v9.3: report cache shared by the monitor and the button panels.
+    # A failed fetch (None) INVALIDATES the entry so panels show the
+    # real state (failed / unreachable) instead of stale good data.
+    cache = STATE.setdefault("rep_cache", {})
+    if rep is None:
+        cache.pop(role, None)
+    else:
+        cache[role] = (time.time(), rep)
+
+
+def _fetch_role(role):
+    rep = local_report() if role == "foreign" else iran_report()
+    _cache_role(role, rep)
+    return rep
+
+
+def get_reports(scope):
+    # v9.3: panels render from the monitor's cache so button taps return
+    # in well under a second (a live report runs local probes + the full
+    # remote pg-tunnel report over the tunnel = 5-15s sequential).
+    # foreign TTL 70s / iran 150s match the monitor's 60s/120s cadence;
+    # on a miss both roles are fetched CONCURRENTLY; a hit older than
+    # 60s is refreshed in the background (stale-while-revalidate)
+    order = [r for r in ("foreign", "iran") if scope in ("both", r)]
+    out = {}
+    missing = []
+    for role in order:
+        c = (STATE.get("rep_cache") or {}).get(role)
+        if c is not None and time.time() - c[0] <= (70 if role == "foreign" else 150):
+            out[role] = c[1]
+            if time.time() - c[0] > 60:
+                threading.Thread(target=_fetch_role, args=(role,), daemon=True).start()
+        else:
+            missing.append(role)
+    if missing:
+        got = {}
+
+        def _grab(r):
+            got[r] = _fetch_role(r)
+
+        ths = [threading.Thread(target=_grab, args=(r,), daemon=True) for r in missing]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(75)
+        out.update(got)
+    return [(r, out.get(r)) for r in order]
+
+
 def status_text(chat_id, scope="both"):
-    now = datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M")
     sep = "\u2500" * 18
     out = ["\U0001F4CA <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "status_h"),
            sep, ""]
-    reps = []
-    if scope in ("both", "foreign"):
-        reps.append(("foreign", local_report()))
-    if scope in ("both", "iran"):
-        reps.append(("iran", iran_report()))
+    reps = get_reports(scope)
     for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
@@ -4970,13 +5023,7 @@ def status_text(chat_id, scope="both"):
 def traffic_text(chat_id, scope="both"):
     out = ["\U0001F4C8 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "traffic_h"),
            "\u2500" * 18, ""]
-    roles = []
-    if scope in ("both", "foreign"):
-        roles.append("foreign")
-    if scope in ("both", "iran"):
-        roles.append("iran")
-    for role in roles:
-        rep = local_report() if role == "foreign" else iran_report()
+    for role, rep in get_reports(scope):
         icon = "\U0001F30D" if role == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role)
         if rep is None:
@@ -5009,11 +5056,7 @@ def traffic_text(chat_id, scope="both"):
 def resources_text(chat_id, scope="both"):
     sep = "\u2500" * 18
     out = ["\U0001F5A5 <b>PG Tunnel \u2014 %s</b>" % tr(chat_id, "res_h"), sep, ""]
-    reps = []
-    if scope in ("both", "foreign"):
-        reps.append(("foreign", local_report()))
-    if scope in ("both", "iran"):
-        reps.append(("iran", iran_report()))
+    reps = get_reports(scope)
     for role_key, rep in reps:
         icon = "\U0001F30D" if role_key == "foreign" else "\U0001F1EE\U0001F1F7"
         name = tr(chat_id, role_key)
@@ -5669,6 +5712,9 @@ def check_once():
     STATE["iran_tick"] = int(STATE.get("iran_tick", 0)) + 1
     if STATE["iran_tick"] % every == 1:
         irn = iran_report()
+    _cache_role("foreign", loc)
+    if irn is not None:
+        _cache_role("iran", irn)
     process_autofix(loc, "foreign")
     if irn is not None:
         process_autofix(irn, "iran")
@@ -5860,6 +5906,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
